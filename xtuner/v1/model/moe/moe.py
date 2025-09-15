@@ -604,6 +604,7 @@ class MoE(BaseModel):
             for module in self.modules():
                 for p_name, param in module.named_parameters(recurse=False):
                     if param.requires_grad:
+                        # param_fp32 is meta device tensor, too
                         param_fp32 = torch.nn.Parameter(param.to(dtype=torch.float32))
                         setattr(module, p_name, param_fp32)
         else:
@@ -615,6 +616,7 @@ class MoE(BaseModel):
 
         self.rotary_emb = self.build_rotary_embedding(self.config)
 
+        # todo: replicate typo?
         mp_policy = MixedPrecisionPolicy(
             param_dtype=self.fsdp_config.param_dtype, reduce_dtype=fsdp_config.reduce_dtype
         )
@@ -719,6 +721,7 @@ class MoE(BaseModel):
                 mesh_dim_names=(f"{self.fsdp_config.mesh_prefix}.fsdp", f"{self.fsdp_config.mesh_prefix}.ep"),
             )
             if self.ep_mesh is not None:
+                # ep_mesh.mesh is Tensor of shape (fsdp_size, ep_size)
                 assert torch.equal(self.ep_mesh.mesh, model_mesh[f"{self.fsdp_config.mesh_prefix}.ep"].mesh), (
                     "FSDP enabled, it requires the `ep_size` of model config equals to the `ep_size` of FSDPConfig."
                 )
