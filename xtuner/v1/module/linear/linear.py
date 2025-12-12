@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
@@ -33,6 +34,18 @@ def build_linear(
     float8_cfg=None,
 ) -> nn.Module:
     """Build a linear layer with optional float8 support."""
+    if os.environ.get("XTUNER_USE_HIF8_CUDA", "0") == "1":
+        from quant_cy import QType
+        from quant_cy.layers.QLinear import QLinear
+        new_mod = QLinear(in_features, out_features, bias=bias, device=device, dtype=dtype)
+        qtype_str = 'hif8'
+        quant_type = QType(qtype_str)  # .dim(0)
+        new_mod.assign_qparams(quant_type)
+        quant_grad: bool=True
+        new_mod.set_quant_grad(quant_grad)
+        print(f"Use HiF8 CUDA QLinear with quant_grad: {quant_grad} and qtype: {quant_type}")
+        return new_mod
+
     if float8_cfg is None:
         return _Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
     elif float8_cfg.scaling_granularity_gemm is ScalingGranularity.TILEWISE:
