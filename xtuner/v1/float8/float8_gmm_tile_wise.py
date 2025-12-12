@@ -96,6 +96,7 @@ class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
         ) = trans_per_block_quant_expand_128x(x, tokens_per_expert, group_size=128, dtype=torch.float8_e4m3fn)
 
         out = m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(
+     #[seq,din] [seq,din/128] [ne,dout,din] [ne,dout/128,din/128] [tokens_per_expert] -> [seq,dout]
             (x_fp8, x_scale), (w_fp8._data, w_fp8._scale), tokens_per_expert
         )
 
@@ -115,13 +116,13 @@ class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
         seq, dout = grad_output_hp.shape
         grad_out_fp8, grad_out_scale = per_tile_quant(grad_output_hp)
         dx = m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(
-            (grad_out_fp8, grad_out_scale),
+            (grad_out_fp8, grad_out_scale),  # grad_out_fp8: [seq,dout], grad_out_scale: [seq,dout/128]
             (
-                w_fp8._data.transpose(1, 2).contiguous(),
-                w_fp8._scale.transpose(1, 2).contiguous(),
+                w_fp8._data.transpose(1, 2).contiguous(),  # [ne,dout,din] -> [ne,din,dout]
+                w_fp8._scale.transpose(1, 2).contiguous(),  # [ne,dout/128,din/128] -> [ne,din/128,dout/128]
             ),
             tokens_per_expert,
-        )
+        )  # dx: [seq,din]
 
         (
             grad_out_trans_fp8,
@@ -130,11 +131,11 @@ class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
         ) = trans_per_tile_quant_expand_128x(grad_output_hp, tokens_per_expert)
         dw = grad_output_hp.new_empty((ne, dout, din))
         k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
-            grad_out_trans_fp8,
-            grad_out_trans_scale,
-            x_trans_quant_fp8,
-            x_trans_quant_scale,
-            dw,
+            grad_out_trans_fp8,    # [dout,seq]
+            grad_out_trans_scale,  # [dout,seq/128]
+            x_trans_quant_fp8,     # [din,seq]
+            x_trans_quant_scale,   # [din/128,seq/128]
+            dw,                    # [dout, din]
             tokens_per_expert_expand.int(),
         )
 

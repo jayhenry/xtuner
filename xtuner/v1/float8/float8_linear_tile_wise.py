@@ -80,14 +80,15 @@ class fp8_matmul_weight_per_block_act_per_tile(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w_fp8):
         assert x.shape[0] == 1
-        x = x.squeeze(0)
+        x = x.squeeze(0)  # [batch, seq, din] -> [seq, din]
         seq, din = x.shape
 
-        x_fp8, x_scale = per_tile_quant(x)
-        x_trans_fp8, x_trans_scale = trans_per_block_quant_gemm(x)
+        x_fp8, x_scale = per_tile_quant(x)  # x_fp8: [seq, din] (row-major), x_scale: [seq, din//128]
+        x_trans_fp8, x_trans_scale = trans_per_block_quant_gemm(x) # x_trans_fp8: [din, seq] (row-major), x_trans_scale: [din//128, seq//128]
 
-        dout = w_fp8._data.shape[0]
+        dout = w_fp8._data.shape[0] # w_fp8._data: [dout, din] (row-major), w_fp8._scale: [dout//128, din//128]
         out = x.new_empty((seq, dout))
+        #            [seq, din] [seq,din//128] [dout, din] [dout//128,din//128] -> out: [seq, dout]
         gemm_fp8_fp8_bf16_nt((x_fp8, x_scale), (w_fp8._data, w_fp8._scale), out)
 
         ctx.save_for_backward(
@@ -116,16 +117,20 @@ class fp8_matmul_weight_per_block_act_per_tile(torch.autograd.Function):
             w_fp8_data = torch.nn.functional.pad(w_fp8._data.transpose(0, 1).contiguous(), (0, dout_pad - dout, 0, 0))
         else:
             grad_output_hp_pad = grad_output_hp
-            w_fp8_data = w_fp8._data.transpose(0, 1).contiguous()
-        w_fp8_scale = w_fp8._scale.transpose(0, 1).contiguous()
+            w_fp8_data = w_fp8._data.transpose(0, 1).contiguous() # [dout, din] -> [din, dout]
+        w_fp8_scale = w_fp8._scale.transpose(0, 1).contiguous() # [dout//128, din//128] -> [din//128, dout//128]
 
+        # grad_output_hp_pad: [seq, dout] (row-major), grad_out_pad_fp8: [seq, dout], grad_out_pad_scale: [seq, dout//128]
         grad_out_pad_fp8, grad_out_pad_scale = per_tile_quant(grad_output_hp_pad)
         dx = grad_output_hp_pad.new_empty((seq, din))
+        #                     [seq, dout]      [seq, dout//128]      [din, dout]  [din//128, dout//128] -> dx: [seq, din]
         gemm_fp8_fp8_bf16_nt((grad_out_pad_fp8, grad_out_pad_scale), (w_fp8_data, w_fp8_scale), dx)
         dx = dx.unsqueeze(0)
 
+        # grad_out_trans_fp8: [dout, seq] (row-major), grad_out_trans_scale: [dout, seq//128]
         grad_out_trans_fp8, grad_out_trans_scale = trans_per_tile_quant_gemm(grad_output_hp)
         dw = grad_output_hp.new_empty((dout, din))
+        #                         [dout, seq]      [dout, seq//128]      [din, seq]  [din//128, seq//128] -> dw: [dout, din]
         gemm_fp8_fp8_bf16_nt((grad_out_trans_fp8, grad_out_trans_scale), (x_trans_fp8, x_trans_scale.contiguous()), dw)
 
         return dx, dw
