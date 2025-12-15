@@ -34,6 +34,9 @@ class weight_to_per_tensor_float8_dynamic(torch.autograd.Function):
         w: torch.Tensor,
         float8_dtype: torch.dtype = torch.float8_e4m3fn,
     ):
+        # Q: quant在操作w时需要设置 torch.no_grad()，否则会影响梯度计算？
+        # A: 在Function的forward中会自动设置 torch.no_grad()，不会影响梯度计算
+        # ref: https://docs.pytorch.org/tutorials/intermediate/custom_function_double_backward_tutorial.html
         w_bits_fp8, scales = per_tensor_fp8_quant(w, float8_dtype)
         w_fp8 = Float8Tensor(
             w_bits_fp8,

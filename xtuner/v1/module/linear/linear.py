@@ -1,4 +1,5 @@
 import os
+
 import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
@@ -37,13 +38,21 @@ def build_linear(
     if os.environ.get("XTUNER_USE_HIF8_CUDA", "0") == "1":
         from quant_cy import QType
         from quant_cy.layers.QLinear import QLinear
+
+        # xTODO: TensorwiseHif8QLinear.pad_for_fsdp() 不需要做 pad，因为 scale 是 per-tensor 的
+        # xTODO: TensorwiseHif8QLinear support module._precomputed_scale, 不做 pre compute,而是直接在 forward/backward 中做 scale 和 descale
+        # xTODO: TensorwiseHif8QLinear support forward with scale and descale
         new_mod = QLinear(in_features, out_features, bias=bias, device=device, dtype=dtype)
-        qtype_str = 'hif8'
+        qtype_str = "hif8"
         quant_type = QType(qtype_str)  # .dim(0)
         new_mod.assign_qparams(quant_type)
-        quant_grad: bool=True
+        quant_grad: bool = True
         new_mod.set_quant_grad(quant_grad)
-        print(f"Use HiF8 CUDA QLinear with quant_grad: {quant_grad} and qtype: {quant_type}")
+        if os.environ.get("XTUNER_USE_HIF8_TENSORWISE_SCALE", "0") == "1":
+            new_mod.tensorwise_scale = True
+        print(
+            f"Use HiF8 CUDA QLinear with tensorwise_scale: {new_mod.tensorwise_scale}, quant_grad: {quant_grad}, qtype: {quant_type}"
+        )
         return new_mod
 
     if float8_cfg is None:
