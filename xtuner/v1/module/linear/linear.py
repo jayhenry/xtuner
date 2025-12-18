@@ -50,6 +50,8 @@ def build_linear(
         new_mod.set_quant_grad(quant_grad)
         if os.environ.get("XTUNER_USE_HIF8_TENSORWISE_SCALE", "0") == "1":
             new_mod.tensorwise_scale = True
+        if os.environ.get("XTUNER_USE_HIF8_FAST", "0") == "1":
+            new_mod._fast_forward = True
         print(
             f"Use HiF8 CUDA QLinear with tensorwise_scale: {new_mod.tensorwise_scale}, quant_grad: {quant_grad}, qtype: {quant_type}"
         )
