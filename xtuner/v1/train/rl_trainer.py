@@ -792,11 +792,12 @@ class RLTrainer:
         # mismatch_token_ids_count = 0
         # response_len_list = []
         for group in data_groups:
-            if not is_valid_for_training(group):
+            group_valid = is_valid_for_training(group)
+            if not group_valid:
                 self.logger.error(f"Skip one data group {group} due to rollout failed or empty response.")
-                continue
             for data in group:
-                rewards.append(data.env.judger.reward["score"])
+                if group_valid:
+                    rewards.append(data.env.judger.reward["score"])
                 if data.env.rollout.response_ids is not None:
                     if isinstance(data.env.rollout.response_ids, torch.Tensor):
                         response_ids = data.env.rollout.response_ids.flatten().tolist()
@@ -851,6 +852,7 @@ class RLTrainer:
                         "action_id": data.uid.action_id,
                         "prompt": data.data.extra_info["raw_prompt"],
                         "response": data.env.rollout.response,
+                        # invalid group of data will also dump here
                         "response_len": rollout_response_len_list[_count],
                         "label": data.data.reward_model["ground_truth"],
                         "reward": data.env.judger.reward["score"],
