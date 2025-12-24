@@ -79,6 +79,9 @@ def pg_loss_fn(
     clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
     pg_losses3 = -clip_ratio_c * advantages
     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    # Here use dual-clip policy loss: https://github.com/opendilab/PPOxFamily/blob/78f781115681ebb245b7c56675d64db7cd732323/chapter1_overview/ppo.py#L48
+    # Verl also use dual-clip policy loss: https://github.com/volcengine/verl/blob/3ecef438c4004d911832bbad89539ff4f1fd742a/verl/trainer/ppo/core_algos.py#L997
+    # Trl use standard ppo loss: https://github.com/huggingface/trl/blob/20691d0bd16ccdc015654f18866f8e037f408403/trl/experimental/ppo/ppo_trainer.py#L828
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
     loss = (pg_losses * loss_weights.to(pg_losses.dtype)).sum()
     return loss
