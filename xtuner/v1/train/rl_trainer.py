@@ -709,7 +709,12 @@ class RLTrainer:
             rewards = [data.env.judger.reward["score"] for data in group]
             rewards_list.extend(rewards)
             rewards = torch.tensor(rewards, dtype=torch.float32)
-            advantages = (rewards - rewards.mean(0)) / (rewards.std(0) + 1e-8)
+            # 支持 DrGRPO 的 advantage 计算方式
+            if os.getenv("DRGRPO_ADVANTAGE", "0") == "0":  # GRPO
+                advantages = (rewards - rewards.mean(0)) / (rewards.std(0) + 1e-8)
+            else:  # DrGRPO: https://arxiv.org/abs/2503.20783
+                print("Use DrGRPO advantage calculation: do not divide by reward's std")
+                advantages = rewards - rewards.mean(0)
 
             prompt_repeat_k = len(group)
             for i in range(prompt_repeat_k):
