@@ -193,6 +193,10 @@ class SGLangWorker(RolloutWorker):
         else:
             sglang_server_args.node_rank = 0
 
+        if self.config.enable_float8:
+            self.logger.info("Enable float8 quantization for SGLang worker.")
+            sglang_server_args.quantization = "fp8"
+
         return sglang_server_args
 
     def _transform_sample_params(self, sample_params: Dict):
