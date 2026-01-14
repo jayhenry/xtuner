@@ -386,7 +386,7 @@ class RolloutWorker(SingleAcceleratorWorker):
 
             elif http_result.is_retryable and cur_retry_times >= self.config.max_retry_per_sample:
                 self.logger.warning(
-                    "rollout request {uid} to {http_result.url} was skipped due to max retries reached"
+                    f"rollout request {uid} to {http_result.url} was skipped due to max retries reached"
                 )
                 return RLRolloutResponseItem(state=RolloutState.SKIPPED)
             elif http_result.is_client_error:
