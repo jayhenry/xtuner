@@ -62,6 +62,7 @@ def pg_loss_fn(
     advantages: torch.Tensor,
     loss_weights: torch.Tensor,
     policy_loss_cfg: dict,
+    rollout_logprobs: torch.Tensor | None = None,
 ) -> torch.Tensor:
     check_config(["cliprange_low", "cliprange_high"], policy_loss_cfg)
     cliprange_low = policy_loss_cfg["cliprange_low"]
@@ -83,6 +84,44 @@ def pg_loss_fn(
     # Verl also use dual-clip policy loss: https://github.com/volcengine/verl/blob/3ecef438c4004d911832bbad89539ff4f1fd742a/verl/trainer/ppo/core_algos.py#L997
     # Trl use standard ppo loss: https://github.com/huggingface/trl/blob/20691d0bd16ccdc015654f18866f8e037f408403/trl/experimental/ppo/ppo_trainer.py#L828
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    loss = (pg_losses * loss_weights.to(pg_losses.dtype)).sum()
+    return loss
+
+
+@register_policy_loss("minirl")
+def minirl_pg_loss_fn(
+    log_prob: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_weights: torch.Tensor,
+    policy_loss_cfg: dict,
+    rollout_logprobs: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # print(f"Using minirl policy loss with rollout_logprobs: {rollout_logprobs.shape}, {rollout_logprobs.dtype}, {rollout_logprobs.device}")
+    assert rollout_logprobs is not None, "rollout_logprobs is required for minirl policy loss"
+
+    # check_config(["cliprange_low", "cliprange_high"], policy_loss_cfg)
+    # cliprange_low = policy_loss_cfg["cliprange_low"]
+    # cliprange_high = policy_loss_cfg["cliprange_high"]
+    # clip_ratio_c = policy_loss_cfg.get("clip_ratio_c", 3.0)
+    log_prob_diff_min = policy_loss_cfg.get("log_prob_diff_min", -20.0)
+    log_prob_diff_max = policy_loss_cfg.get("log_prob_diff_max", 20.0)
+    advantages = advantages.to(log_prob.dtype)
+    # negative_approx_kl = log_prob - old_log_prob.detach()
+    negative_approx_kl = log_prob - rollout_logprobs.detach()
+    # Clamp negative_approx_kl for stability
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=log_prob_diff_min, max=log_prob_diff_max)
+    ratio = torch.exp(negative_approx_kl)
+    pg_losses1 = -ratio * advantages
+    # pg_losses2 = -torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high) * advantages
+    # clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+    # pg_losses3 = -clip_ratio_c * advantages
+    # clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    # Here use dual-clip policy loss: https://github.com/opendilab/PPOxFamily/blob/78f781115681ebb245b7c56675d64db7cd732323/chapter1_overview/ppo.py#L48
+    # Verl also use dual-clip policy loss: https://github.com/volcengine/verl/blob/3ecef438c4004d911832bbad89539ff4f1fd742a/verl/trainer/ppo/core_algos.py#L997
+    # Trl use standard ppo loss: https://github.com/huggingface/trl/blob/20691d0bd16ccdc015654f18866f8e037f408403/trl/experimental/ppo/ppo_trainer.py#L828
+    # pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    pg_losses = pg_losses1
     loss = (pg_losses * loss_weights.to(pg_losses.dtype)).sum()
     return loss
 

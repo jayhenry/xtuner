@@ -55,6 +55,7 @@ class GRPOLossKwargs(BaseLossKwargs):
     policy_loss_weight: torch.Tensor
     ref_logprobs: torch.Tensor | None = None
     kl_loss_weight: torch.Tensor | None = None
+    rollout_logprobs: torch.Tensor | None = None
 
 
 class GRPOLossContext(BaseLossContext[RLLossContextInputItem]):
@@ -119,6 +120,7 @@ class GRPOLossContext(BaseLossContext[RLLossContextInputItem]):
                 policy_loss_weight=policy_loss_weight,
                 ref_logprobs=ref_logprobs,
                 kl_loss_weight=kl_loss_weight,
+                rollout_logprobs=item.rollout_logprobs,
             )
             batches_loss_kwargs.append(loss_kwargs)
         return batches_loss_kwargs
@@ -140,6 +142,7 @@ class GRPOLossContext(BaseLossContext[RLLossContextInputItem]):
         old_logprobs = loss_kwargs.old_logprobs
         advantages = loss_kwargs.advantages
         policy_loss_weight = loss_kwargs.policy_loss_weight
+        rollout_logprobs = loss_kwargs.rollout_logprobs
 
         logprobs = gather_logprobs(logits, shifted_labels)
         loss = self.policy_loss_fn(
@@ -148,6 +151,7 @@ class GRPOLossContext(BaseLossContext[RLLossContextInputItem]):
             advantages,
             policy_loss_weight,
             self.loss_cfg.policy_loss_cfg,
+            rollout_logprobs=rollout_logprobs,
         )
 
         ratio = (logprobs - old_logprobs.detach()).exp()
