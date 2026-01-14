@@ -146,6 +146,7 @@ class SGLangWorker(RolloutWorker):
         )  # for intern-s1 series models, have to set the grammar_backend to "none"
         log_level = sglang_config_kwargs.get("log_level", "critical")
         log_level_http = sglang_config_kwargs.get("log_level_http", "critical")
+        decode_log_interval = sglang_config_kwargs.get("decode_log_interval", 1000)
         enable_deterministic_inference = sglang_config_kwargs.get("enable_deterministic_inference", False)
 
         sglang_server_args = ServerArgs(model_path=self.config.model_path, trust_remote_code=True)
@@ -173,7 +174,9 @@ class SGLangWorker(RolloutWorker):
         sglang_server_args.max_running_requests = self.config.rollout_max_batch_size_per_instance
         sglang_server_args.log_level = log_level
         sglang_server_args.log_level_http = log_level_http
+        sglang_server_args.decode_log_interval = decode_log_interval
         sglang_server_args.enable_deterministic_inference = enable_deterministic_inference
+        sglang_server_args.disable_cuda_graph = sglang_config_kwargs.get("disable_cuda_graph", False)
 
         if self.config.expert_parallel_size > 1:
             sglang_server_args.tp_size = num_gpus_per_engine
