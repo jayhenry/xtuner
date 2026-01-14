@@ -663,6 +663,9 @@ class TrainingWorker(SingleAcceleratorWorker):
     @ray_method
     def update_weights(self):
         """Update the model weights."""
+        if os.getenv("XTUNER_SKIP_UPDATE_WEIGHTS", "0") == "1":
+            self.logger.info("Skip update weights for debug.")
+            return
         if self.rollout_cfg_info.get("backend") == "turbomind":
             self._update_weights_by_layer()
         else:
@@ -733,8 +736,8 @@ class TrainingWorker(SingleAcceleratorWorker):
             self.request_update_params(state_dict, finished=False)
             del state_dict, name_list, param_list
 
-        if self.rollout_cfg_info["backend"] == "pytorch":
-            self.request_update_params({}, finished=True)
+        # if self.rollout_cfg_info["backend"] == "pytorch":
+        self.request_update_params({}, finished=True)
 
         dist.barrier()
         DEVICE_MODULE.empty_cache()
@@ -1092,15 +1095,17 @@ class TrainingWorker(SingleAcceleratorWorker):
             try:
                 from sglang.srt.model_executor.model_runner import FlattenedTensorBucket
 
-                use_flattened_tensor_bucket = True
+                use_flattened_tensor_bucket = False  # True
             except Exception:
                 use_flattened_tensor_bucket = False
 
             # NOTE: xtuner目前去掉sglang的patch也不会出问题，但为了保险起见，还是保留patch逻辑，并且在update_weights结束后unpatch
             monkey_patch_torch_reductions()
-            state_dict = state_dict.items()
+            # self.logger.info(f"tensor_dtypes in request_update_params: {tensor_dtypes}")  # bfloat16
+
+            state_dict = list(state_dict.items())
             if self.rollout_cfg_info["tp"] == 1:
-                if use_flattened_tensor_bucket:
+                if use_flattened_tensor_bucket and len(state_dict) > 0:
                     flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=state_dict)
                     metadata = flattened_tensor_bucket.get_metadata()
 
@@ -1115,7 +1120,7 @@ class TrainingWorker(SingleAcceleratorWorker):
                 serialized_data = [serialized_data]
             else:
                 serialized_data = [None] * self.rollout_cfg_info["tp"]
-                if use_flattened_tensor_bucket:
+                if use_flattened_tensor_bucket and len(state_dict) > 0:
                     flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=state_dict)
                     metadata = flattened_tensor_bucket.get_metadata()
 
@@ -1145,17 +1150,25 @@ class TrainingWorker(SingleAcceleratorWorker):
                 "Authorization": f"Bearer {self.rollout_cfg_info['api_key']}",
             }
             if self.rollout_cfg_info["backend"] == "sglang":
+                # Ensure all serialized data is JSON serializable
+                processed_serialized_data = serialized_data
+                # processed_serialized_data = []
+                # for item in serialized_data:
+                #     if isinstance(item, bytes):
+                #         processed_serialized_data.append(item.decode('utf-8'))
+                #     else:
+                #         processed_serialized_data.append(item)
                 payload = {
-                    "serialized_named_tensors": serialized_data,
+                    "serialized_named_tensors": processed_serialized_data,
                     "flush_cache": False,
                 }
                 try:
                     from sglang.srt.model_executor.model_runner import FlattenedTensorBucket
 
-                    use_flattened_tensor_bucket = True
+                    use_flattened_tensor_bucket = False  # True
                 except Exception:
                     use_flattened_tensor_bucket = False
-                if use_flattened_tensor_bucket:
+                if use_flattened_tensor_bucket and len(state_dict) > 0:
                     payload["load_format"] = "flattened_bucket"
 
                 url = f"{self.rollout_url}/update_weights_from_tensor"
