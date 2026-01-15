@@ -126,6 +126,51 @@ def minirl_pg_loss_fn(
     return loss
 
 
+@register_policy_loss("mini_rl")
+def mini_rl_pg_loss_fn(
+    log_prob: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_weights: torch.Tensor,
+    policy_loss_cfg: dict,
+    rollout_logprobs: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # ref: Stabilizing Reinforcement Learning with LLMs: Formulation and Practices
+    # print(f"Using minirl policy loss with rollout_logprobs: {rollout_logprobs.shape}, {rollout_logprobs.dtype}, {rollout_logprobs.device}")
+    assert rollout_logprobs is not None, "rollout_logprobs is required for minirl policy loss"
+
+    check_config(["cliprange_low", "cliprange_high"], policy_loss_cfg)
+    cliprange_low = policy_loss_cfg["cliprange_low"]
+    cliprange_high = policy_loss_cfg["cliprange_high"]
+    log_prob_diff_min = policy_loss_cfg.get("log_prob_diff_min", -20.0)
+    log_prob_diff_max = policy_loss_cfg.get("log_prob_diff_max", 20.0)
+    clip_ratio_c = policy_loss_cfg.get("clip_ratio_c", None)
+    advantages = advantages.to(log_prob.dtype)
+
+    raw_negative_approx_kl = log_prob.detach() - old_log_prob.detach()
+    raw_negative_approx_kl = torch.clamp(raw_negative_approx_kl, min=log_prob_diff_min, max=log_prob_diff_max)
+    raw_ratio = torch.exp(raw_negative_approx_kl)
+
+    negative_approx_kl = log_prob.detach() - rollout_logprobs.detach()
+    # Clamp negative_approx_kl for stability
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=log_prob_diff_min, max=log_prob_diff_max)
+    ratio = torch.exp(negative_approx_kl)
+
+    pg_losses = -ratio * advantages * log_prob
+    # decoupled ppo mask
+    mask1 = (advantages > 0) & (raw_ratio > 1 + cliprange_high)
+    mask2 = (advantages < 0) & (raw_ratio < 1 - cliprange_low)
+    mask = mask1 | mask2
+    if clip_ratio_c is not None:
+        # dual clip policy loss: https://github.com/opendilab/PPOxFamily/blob/78f781115681ebb245b7c56675d64db7cd732323/chapter1_overview/ppo.py#L48
+        mask3 = (advantages < 0) & (raw_ratio > clip_ratio_c)
+        mask = mask | mask3
+    mask = ~mask
+
+    loss = (mask * pg_losses * loss_weights.to(pg_losses.dtype)).sum()
+    return loss
+
+
 def sft_loss_fn(
     logits: torch.Tensor,  # [1, seq_len, vocab_size]
     shifted_labels: torch.Tensor,  # [1, seq_len]
