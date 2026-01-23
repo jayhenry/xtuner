@@ -323,6 +323,11 @@ class RLTrainer:
             ray.get(self._cpu_pg.ready(), timeout=PG_READY_TIMEOUT)
         else:
             self._cpu_pg = AutoCPUWorkers.build_placement_group(cpu_resources)
+
+        assert rollout_steps is not None, "rollout_steps must be set"
+        self._rollout_steps = rollout_steps
+        train_worker_cfg.rollout_steps = self._rollout_steps
+
         # We need to build train controller first, and then build rollout dataflow to make
         # inference engines know how much memory they can utilize.
         self._train_controller = self._build_train_controller(train_worker_cfg)
@@ -360,14 +365,14 @@ class RLTrainer:
             pass
 
         self._global_batch_size = dataflow_config.global_batch_size
-        self._rollout_steps = (
-            ray.get(self._rollout_dataflow.get_train_dataset_length.remote())  # type: ignore[attr-defined]
-            // dataflow_config.global_batch_size
-            * total_epochs
-        )
-        if rollout_steps is not None:
-            self._rollout_steps = rollout_steps
-            self.logger.info(f"Set rollout steps to {self._rollout_steps} according to rollout_steps arg")
+        # self._rollout_steps = (
+        #     ray.get(self._rollout_dataflow.get_train_dataset_length.remote())  # type: ignore[attr-defined]
+        #     // dataflow_config.global_batch_size
+        #     * total_epochs
+        # )
+        # if rollout_steps is not None:
+        #     self._rollout_steps = rollout_steps
+        #     self.logger.info(f"Set rollout steps to {self._rollout_steps} according to rollout_steps arg")
 
         bind_train_rollout(train_controller=self._train_controller, env_controller=self._rollout_env_controller)
         # update weights if rollout_config.skip_load_weights == True
@@ -433,6 +438,7 @@ class RLTrainer:
             work_dir=config.work_dir,
             log_dir=config.log_dir,
             total_epochs=config.total_epochs,
+            rollout_steps=config.rollout_steps,
             auto_resume=config.auto_resume,
             load_checkpoint_cfg=config.load_checkpoint_cfg,
             strict_load=config.strict_load,

@@ -34,8 +34,10 @@ class AdamWConfig(OptimConfig):
 
 class LRConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    lr_type: Annotated[Literal["cosine", "linear", "constant"], Parameter(help="Type of learning rate schedule")] = (
-        "constant"
-    )
+    lr_type: Annotated[
+        Literal["cosine", "linear", "constant", "step"], Parameter(help="Type of learning rate schedule")
+    ] = "constant"
     warmup_ratio: Annotated[float, Parameter(help="Ratio of warmup steps to total training steps")] = 0.03
     lr_min: Annotated[float, Parameter(help="Minimum learning rate for optimization")] = 1e-6
+    step_size: Annotated[int, Parameter(help="Step size for step learning rate schedule")] = 100
+    gamma: Annotated[float, Parameter(help="Gamma for step learning rate schedule")] = 0.5

@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict
 from ray.actor import ActorClass, ActorProxy
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, LinearLR, SequentialLR
 from typing_extensions import NotRequired
 
 from xtuner.v1.config.fsdp import FSDPConfig
@@ -133,6 +134,7 @@ class WorkerConfig(BaseModel):
     ref_model_fsdp_cfg: FSDPConfig | None = None
     log_dir: str | Path | None = None
     update_weight_bucket_size_in_gb: float = 0.5  # 512MB
+    rollout_steps: int = 1
 
 
 class WorkerInputItem(TypedDict):
@@ -150,6 +152,7 @@ class RLOtherLog(TypedDict):
     max_ratio: NotRequired[float]
     loss: NotRequired[float]
     grad_norm: NotRequired[float]
+    lr: NotRequired[float]
 
 
 class WorkerTrainLogItem(TypedDict):
@@ -208,6 +211,8 @@ class TrainingWorker(SingleAcceleratorWorker):
         self.data_mesh = self._init_data_mesh(sp_size=worker_cfg.sp_size)
         self.sp_mesh = self.data_mesh["sp"]
         self._optimizer_steps = worker_cfg.optimizer_steps
+        total_step = worker_cfg.rollout_steps * worker_cfg.optimizer_steps
+        self._lr_scheduler = self.build_lr_scheduler(worker_cfg.lr_cfg, total_step)
 
         # Used to update weight to rollout engine
         self.rollout_device_mesh: DeviceMesh | None = None
@@ -215,6 +220,63 @@ class TrainingWorker(SingleAcceleratorWorker):
         self.rollout_cfg_info: dict = dict()
         self.endpoints: dict[str, str] = dict()
         self.endpoints["update_weights"] = "update_weights"
+
+    def build_lr_scheduler(self, lr_cfg: LRConfig, scheduler_step: int) -> torch.optim.lr_scheduler.LRScheduler:
+        """Build the learning rate scheduler.
+
+        Args:
+            lr_cfg (LRConfig): Configuration for the learning rate scheduler.
+
+        Returns:
+            torch.optim.lr_scheduler.LRScheduler: Configured learning rate scheduler.
+        """
+        if lr_cfg.warmup_ratio < 1:
+            warmup_steps = int(lr_cfg.warmup_ratio * scheduler_step)
+        else:
+            warmup_steps = int(lr_cfg.warmup_ratio)
+
+        def warmup_fn(x):
+            return x / warmup_steps if x < warmup_steps else 1
+
+        warmup_scheduler = LambdaLR(self._engine.optimizer, warmup_fn)
+
+        scheduler: torch.optim.lr_scheduler.LRScheduler
+        if lr_cfg.lr_type == "linear":
+            scheduler = LinearLR(
+                self._engine.optimizer,
+                start_factor=1.0,
+                end_factor=lr_cfg.lr_min / self._engine.optimizer.defaults["lr"],
+                total_iters=scheduler_step - warmup_steps,
+            )
+        elif lr_cfg.lr_type == "cosine":
+            scheduler = CosineAnnealingLR(
+                self._engine.optimizer, T_max=scheduler_step - warmup_steps, eta_min=lr_cfg.lr_min
+            )
+        elif lr_cfg.lr_type == "constant":
+            scheduler = LambdaLR(self._engine.optimizer, lambda x: 1.0)
+        elif lr_cfg.lr_type == "step":
+            step_size = lr_cfg.step_size
+            gamma = lr_cfg.gamma
+            end_factor = lr_cfg.lr_min / self._engine.optimizer.defaults["lr"]
+
+            def step_fn(x):
+                """Step decay just like StepLR with step_size and gamma.
+
+                But the accumulated gamma factor must be greater than or equal to end_factor. This function will be
+                used in the LambdaLR scheduler.
+                """
+                accumulated_gamma = gamma ** (x // step_size)
+                return max(accumulated_gamma, end_factor)
+
+            scheduler = LambdaLR(self._engine.optimizer, step_fn)
+        else:
+            raise ValueError(f"Unsupported lr type: {lr_cfg.lr_type}")
+        lr_scheduler = SequentialLR(
+            optimizer=self._engine.optimizer,
+            schedulers=[warmup_scheduler, scheduler],
+            milestones=[warmup_steps],
+        )
+        return lr_scheduler
 
     def _build_engine(self, worker_cfg: WorkerConfig) -> TrainEngine | VisionComposeTrainEngine:
         if isinstance(worker_cfg.model_cfg, BaseComposeConfig):
@@ -573,16 +635,21 @@ class TrainingWorker(SingleAcceleratorWorker):
             grad_norm = self._engine.clip_grad_norm()
             self._engine.step_optimizer(grad_norm)
             rl_other_log = self._get_rl_other_log(other_log)  # type: ignore[arg-type]
+
             rl_other_log["grad_norm"] = grad_norm.item()
+            lr = self._lr_scheduler.get_last_lr()[0]
+            rl_other_log["lr"] = lr
+
             worker_log_item["train_metrics"].append(WorkerTrainLogItem(loss_log=loss_log, rl_other_log=rl_other_log))
 
             log_info = {**loss_log, **rl_other_log}
             log_str = ", ".join(
-                f"{key}={value:.4f}" if isinstance(value, float) else f"{key}={value}"
+                f"{key}={value:.4e}" if isinstance(value, float) else f"{key}={value}"
                 for key, value in log_info.items()
             )
             log_str = f"Rollout {rollout_idx} Step {i}: " + log_str
             self.logger.info(log_str)
+            self._lr_scheduler.step()
 
         return worker_log_item
 
@@ -736,8 +803,8 @@ class TrainingWorker(SingleAcceleratorWorker):
             self.request_update_params(state_dict, finished=False)
             del state_dict, name_list, param_list
 
-        # if self.rollout_cfg_info["backend"] == "pytorch":
-        self.request_update_params({}, finished=True)
+        if self.rollout_cfg_info["backend"] == "pytorch":
+            self.request_update_params({}, finished=True)
 
         dist.barrier()
         DEVICE_MODULE.empty_cache()
@@ -1095,7 +1162,7 @@ class TrainingWorker(SingleAcceleratorWorker):
             try:
                 from sglang.srt.model_executor.model_runner import FlattenedTensorBucket
 
-                use_flattened_tensor_bucket = False  # True
+                use_flattened_tensor_bucket = True
             except Exception:
                 use_flattened_tensor_bucket = False
 
@@ -1165,7 +1232,7 @@ class TrainingWorker(SingleAcceleratorWorker):
                 try:
                     from sglang.srt.model_executor.model_runner import FlattenedTensorBucket
 
-                    use_flattened_tensor_bucket = False  # True
+                    use_flattened_tensor_bucket = True
                 except Exception:
                     use_flattened_tensor_bucket = False
                 if use_flattened_tensor_bucket and len(state_dict) > 0:
