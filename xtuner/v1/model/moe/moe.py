@@ -725,6 +725,7 @@ class MoE(BaseModel):
 
         for layer_idx, layer in tqdm(self.layers.items(), desc="[FSDP Sharding]"):
             layer_idx = int(layer_idx)
+            # gate = layer.gate
             if layer_idx < num_recompute_layers - 1:
                 layer = checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.REENTRANT)
 
@@ -733,6 +734,19 @@ class MoE(BaseModel):
                 reshard_after_forward = False
             else:
                 reshard_after_forward = self.fsdp_config.reshard_after_forward
+
+            if self.fsdp_config.router_fp32:
+                logger.info(f"FSDP Sharding router in layer {layer_idx} using FP32")
+                fp32_mp_policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
+                # assert isinstance(layer, MoEDecoderLayer)
+                fully_shard(
+                    layer.gate,
+                    mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
+                    mp_policy=fp32_mp_policy,
+                    reshard_after_forward=reshard_after_forward,
+                    offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+                )
+
             fully_shard(
                 layer,
                 mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
@@ -763,10 +777,15 @@ class MoE(BaseModel):
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
         )
 
+        lm_head_mp_policy = mp_policy
+        if self.fsdp_config.lm_head_fp32:
+            logger.info("FSDP Sharding LM head using FP32")
+            lm_head_mp_policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
+
         fully_shard(
             self.lm_head,
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
-            mp_policy=mp_policy,
+            mp_policy=lm_head_mp_policy,
             reshard_after_forward=self.fsdp_config.reshard_after_forward,
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
         )
