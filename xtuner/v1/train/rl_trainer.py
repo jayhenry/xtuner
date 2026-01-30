@@ -324,9 +324,10 @@ class RLTrainer:
         else:
             self._cpu_pg = AutoCPUWorkers.build_placement_group(cpu_resources)
 
-        assert rollout_steps is not None, "rollout_steps must be set"
-        self._rollout_steps = rollout_steps
-        train_worker_cfg.rollout_steps = self._rollout_steps
+        if train_worker_cfg.lr_cfg.lr_type != "constant":
+            assert rollout_steps is not None, "rollout_steps must be set for non-constant lr type"
+            self._rollout_steps = rollout_steps
+            train_worker_cfg.rollout_steps = self._rollout_steps  # for build lr scheduler
 
         # We need to build train controller first, and then build rollout dataflow to make
         # inference engines know how much memory they can utilize.
@@ -365,14 +366,15 @@ class RLTrainer:
             pass
 
         self._global_batch_size = dataflow_config.global_batch_size
-        # self._rollout_steps = (
-        #     ray.get(self._rollout_dataflow.get_train_dataset_length.remote())  # type: ignore[attr-defined]
-        #     // dataflow_config.global_batch_size
-        #     * total_epochs
-        # )
-        # if rollout_steps is not None:
-        #     self._rollout_steps = rollout_steps
-        #     self.logger.info(f"Set rollout steps to {self._rollout_steps} according to rollout_steps arg")
+        self._rollout_steps = (
+            ray.get(self._rollout_dataflow.get_train_dataset_length.remote())  # type: ignore[attr-defined]
+            // dataflow_config.global_batch_size
+            * total_epochs
+        )
+        self.logger.info(f"Set rollout steps to {self._rollout_steps} according to total_epochs={total_epochs}")
+        if rollout_steps is not None:
+            self._rollout_steps = rollout_steps
+            self.logger.info(f"Set rollout steps to {self._rollout_steps} according to rollout_steps={rollout_steps}")
 
         bind_train_rollout(train_controller=self._train_controller, env_controller=self._rollout_env_controller)
         # update weights if rollout_config.skip_load_weights == True

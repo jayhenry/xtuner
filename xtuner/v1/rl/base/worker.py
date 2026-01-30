@@ -208,6 +208,7 @@ class TrainingWorker(SingleAcceleratorWorker):
                 worker_cfg.model_cfg, worker_cfg.ref_load_from, worker_cfg.ref_model_fsdp_cfg
             )
 
+        self.logger.info(f"sp_size: {worker_cfg.sp_size}")
         self.data_mesh = self._init_data_mesh(sp_size=worker_cfg.sp_size)
         self.sp_mesh = self.data_mesh["sp"]
         self._optimizer_steps = worker_cfg.optimizer_steps
