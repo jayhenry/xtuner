@@ -15,6 +15,7 @@ Two levels of tests:
 """
 
 import json
+import os
 import re
 import tempfile
 import types
@@ -26,6 +27,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from xtuner._testing import DeterministicDDPTestCase
+from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.loss.ce_loss import CELossConfig
 from xtuner.v1.model.moe.qwen3_5_text import Qwen3_5_VLTextMoE35BA3BConfig
@@ -34,6 +36,7 @@ from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.module.attention.mha import MultiHeadAttention
 from xtuner.v1.profiler.prober import AccProber, ProberList
 from xtuner.v1.profiler.prober_utils import register_prober_list
+from xtuner.v1.model.moe.moe import MoEModelOutputs
 
 
 # ---------------------------------------------------------------------------
@@ -51,10 +54,10 @@ def _make_small_model_config() -> Qwen3_5_VLTextMoE35BA3BConfig:
     """
     return Qwen3_5_VLTextMoE35BA3BConfig(
         num_hidden_layers=4,
-        rope_scaling_cfg=RopeScalingConfig(type="default"),  # standard RotaryEmbedding, no mrope
-        balancing_loss_cfg=None,
-        z_loss_cfg=None,
-        compile_cfg=False,
+        # rope_scaling_cfg=RopeScalingConfig(type="default"),  # standard RotaryEmbedding, no mrope
+        # balancing_loss_cfg=None,
+        # z_loss_cfg=None,
+        # compile_cfg=False,
     )
 
 
@@ -185,7 +188,7 @@ class TestCompiledMHAGradNumerics(DeterministicDDPTestCase):
         torch._dynamo.reset()
 
         SEQ_LEN = 1024
-        loss_cfg = CELossConfig()
+        loss_cfg = CELossConfig(mode="chunk")
         LossCtx = loss_cfg.loss_ctx_cls
 
         def _run(model) -> float:
@@ -242,6 +245,100 @@ class TestCompiledMHAGradNumerics(DeterministicDDPTestCase):
             f"run1={compiled_run1}, run2={compiled_run2}",
         )
 
+        del model_eager, model_compiled
+        torch.cuda.empty_cache()
+        torch._dynamo.reset()
+
+    def test_fsdp_compiled_mha_grad_nondeterminism(self):
+        """Verify gradient non-determinism for compiled MHA under FSDP.
+
+        The training script (zdev/sft_qwen35.sh + sft_qwen35_from_hf.py) with
+        torch.compile=True and NUM_HIDDEN_LAYERS=4 exhibits slightly different
+        k_proj.weight.grad sums between steps even when inputs are identical
+        (e.g. 1.7948172 vs 1.794816).  Eager (non-compiled) FSDP is stable.
+
+        Root cause: FSDP2's reshard_after_forward frees and re-allocates the
+        all-gathered parameter buffer for each layer during forward.  The CUDA
+        memory allocator returns different base addresses on successive calls,
+        which changes the thread-block→data mapping in flash-attn's backward
+        kernel.  flash-attn backward uses atomic adds across thread blocks, so
+        different mappings produce different floating-point accumulation
+        order → different final gradient values.  torch.compile amplifies this
+        by fusing ops and changing CUDA launch order, widening the effect.
+
+        This test mimics the production setup: FSDP with reshard_after_forward,
+        bfloat16 parameters, and seq_len=65536 (matching production pack_max_length)
+        with grad_accumulation_steps=2 (matching global_batch_size=16 / 8 GPUs).
+        """
+        self.create_pg("cuda")
+        torch.accelerator.set_device_index(int(os.environ["LOCAL_RANK"]))
+        torch._dynamo.reset()
+
+        # Mirror zdev/sft_qwen35_from_hf.py:
+        #   pack_max_length=65536, global_batch_size=16, 8 GPUs
+        #   → 2 micro-batches per GPU per step (grad_accumulation_steps=2).
+        # 65536 tokens → 512 flash-attn tiles → high probability of atomic
+        # non-determinism in the backward pass.
+        SEQ_LEN = 65536
+        GRAD_ACCUM_STEPS = 2
+        loss_cfg = CELossConfig(mode="chunk")
+        LossCtx = loss_cfg.loss_ctx_cls
+
+        QWEN35_MOE_PATH = os.getenv("QWEN35_MOE_PATH")
+        assert QWEN35_MOE_PATH is not None, "QWEN35_MOE_PATH is not set"
+
+        def _build_fsdp_model():
+            cfg = _make_small_model_config()
+            cfg.compile_cfg = True
+            with torch.device("meta"):
+                model = cfg.build()
+            # Mirror sft_qwen35_from_hf.py: cpu_offload=False, ep_size=1.
+            # reshard_after_forward=True (default) is the key: it frees and
+            # re-allocates all-gathered parameter buffers every layer, giving
+            # flash-attn backward different memory addresses on each call.
+            fsdp_cfg = FSDPConfig(cpu_offload=False, ep_size=1)
+            model.fully_shard(fsdp_config=fsdp_cfg)
+            model.from_hf(QWEN35_MOE_PATH, strict=False)
+            return model
+
+        def _run(model) -> float:
+            """Gradient-accumulate over GRAD_ACCUM_STEPS micro-batches; return local grad shard sum."""
+            model.zero_grad()
+            vocab_size = model.config.vocab_size
+            for micro in range(GRAD_ACCUM_STEPS):
+                torch.manual_seed(dist.get_rank() * GRAD_ACCUM_STEPS + micro)
+                input_ids = torch.randint(0, vocab_size, (1, SEQ_LEN), device="cuda")
+                shifted_labels = input_ids[:, 1:].clone()
+                shift_input_ids = input_ids[:, :-1]
+                seq_ctx = SequenceContext.from_input_ids(input_ids=(shift_input_ids,))
+                loss_ctx = loss_cfg.build(shifted_labels=shifted_labels, sp_mesh=None)
+                loss_ctx = LossCtx.build_batches([loss_ctx])[0]
+                outputs = model(seq_ctx=seq_ctx, loss_ctx=loss_ctx)
+                assert isinstance(outputs, MoEModelOutputs), "outputs must be a MoEModelOutputs"
+                loss = outputs.loss
+                loss += outputs.balancing_loss
+                loss.backward()
+            # k_proj.weight.grad is a DTensor shard after FSDP reduce-scatter.
+            # .to_local() gives the local portion owned by this rank.
+            grad = model.layers["3"].self_attn.k_proj.weight.grad
+            local_grad = grad.to_local().float() if hasattr(grad, "to_local") else grad.float()
+            return local_grad.sum().item()
+
+        model = _build_fsdp_model()
+        run1 = _run(model)
+        run2 = _run(model)
+
+        if dist.get_rank() == 0:
+            print(
+                f"\n[FSDP compiled] k_proj.weight.grad.sum() (rank-0 shard): "
+                f"run1={run1:.10f}  run2={run2:.10f}  diff={abs(run2 - run1):.2e}"
+            )
+
+        self.assertNotEqual(
+            run1, run2,
+            f"Expected FSDP+compiled MHA to produce non-deterministic gradients "
+            f"across runs (rank {dist.get_rank()}), but got identical value ({run1} vs {run2}).",
+        )
         torch._dynamo.reset()
 
 
