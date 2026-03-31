@@ -762,8 +762,9 @@ class AccProber(BaseProber):
     _skip_flag: ClassVar[bool] = True
 
     forward_records: ClassVar[list] = []
-    # Tensors buffered during the forward pass; serialized in after_micro_iter_forward
-    # so that no Python string / JSON ops occur inside torch.compile regions.
+    # Tensors buffered during the compiled forward; flushed to forward_records
+    # at each decoder-layer boundary (after_layer, always in eager mode) and
+    # finally at after_micro_iter_forward() for modules outside decoder layers.
     _pending_tensors: ClassVar[list] = []
 
     @classmethod
@@ -778,10 +779,11 @@ class AccProber(BaseProber):
         """Buffer compact tensor stats for deferred serialization.
 
         Only light tensor ops happen here so this method is compatible with
-        torch.compile.  Expensive Python ops (.item(), .tolist(), str) are
-        deferred to after_micro_iter_forward(), which always runs in eager mode.
+        torch.compile.  Expensive Python ops (.item(), .tolist(), json.dumps)
+        are deferred to _flush_pending_to_records(), which is called from
+        after_layer() (always in eager mode) and after_micro_iter_forward().
 
-        What is stored per tensor:
+        What is stored per tensor (all kept on the original device):
           - tensor_sum  : scalar tensor (float32)
           - shape       : torch.Size  (compile-time constant in static-shape mode)
           - dtype_str   : str of tensor.dtype (compile-time constant)
@@ -827,6 +829,10 @@ class AccProber(BaseProber):
     @classmethod
     def after_layer(cls, name: str | int, hidden_states: torch.Tensor):
         cls.record_tensor(hidden_states, f"[{name}][after]hidden_states")
+        # The decoder-layer wrapper always runs in eager mode (outside any
+        # compiled region), so flush here to convert GPU tensors → CPU JSON
+        # strings and release _pending_tensors after every layer.
+        cls._flush_pending_to_records()
 
     @classmethod
     def before_rms_norm(cls, name: str, hidden_states: torch.Tensor):
@@ -1001,15 +1007,16 @@ class AccProber(BaseProber):
     def after_z_loss(cls, name: str, z_loss: torch.Tensor):
         cls.record_tensor(z_loss, f"[{name}][after]z_loss")
 
-    ############################## hooks for step and iter #################################
     @classmethod
-    def after_micro_iter_forward(cls):
-        if cls.skip():
-            return
-        assert cls.initialized, "AccProber is not initialized, please call setup() first"
-        # Serialize buffered tensors here — outside any compiled region, so full
-        # Python / string ops are safe.  tensor_info (str(tensor)) is included
-        # because we are in eager mode at this point.
+    def _flush_pending_to_records(cls):
+        """Convert buffered tensors to CPU JSON strings and clear
+        _pending_tensors.
+
+        Must be called from eager mode (not inside a compiled region) because it uses .item(), .tolist(), and
+        json.dumps().  The primary call site is after_layer(), which runs in the decoder-layer wrapper (always eager).
+        after_micro_iter_forward() calls it again for any tensors from modules outside decoder layers (embedding,
+        LMHead, losses).
+        """
         for name, tensor_sum, shape, dtype_str, first_10 in cls._pending_tensors:
             cur_json = {
                 "name": name,
@@ -1023,13 +1030,23 @@ class AccProber(BaseProber):
             cls.forward_records.append(json.dumps(cur_json, ensure_ascii=False))
         cls._pending_tensors = []
 
+    ############################## hooks for step and iter #################################
+    @classmethod
+    def after_micro_iter_forward(cls):
+        if cls.skip():
+            return
+        assert cls.initialized, "AccProber is not initialized, please call setup() first"
+        # Final flush for modules not covered by a decoder-layer wrapper
+        # (e.g., embedding, LMHead, losses).  Most tensors were already
+        # flushed per-layer in after_layer().
+        cls._flush_pending_to_records()
+
         dump_file = cls.dump_dir.joinpath(
             f"Step_{cls.cur_step}_MicroIter_{cls.cur_micro_batch_iter}_RANK_{dist.get_rank()}_forward_records.jsonl"
         )
         with open(dump_file, "w", encoding="utf-8") as f:
             for record in cls.forward_records:
                 f.write(record + "\n")
-        # logger.info(f"[AccProber] Dump forward records to {dump_file}")
         cls.forward_records = []
 
     ############################## hooks for gradient #################################
