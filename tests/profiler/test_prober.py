@@ -153,6 +153,99 @@ class TestAccProberForwardRecords(DeterministicDDPTestCase):
 
 
 # ---------------------------------------------------------------------------
+# Compiled MHA gradient numerical-difference test
+# IMPORTANT: this test must run BEFORE any test that calls config.build() with
+# compile_cfg=True, because torch.compile on MultiHeadAttention.forward is
+# applied at the class level and cannot be undone.  Pytest runs classes in
+# file order by default, so keep this class before all compiled-mode tests.
+# ---------------------------------------------------------------------------
+
+class TestCompiledMHAGradNumerics(DeterministicDDPTestCase):
+    """Diagnostic test for gradient numerics: compiled vs eager MHA.
+
+    Background: in 8-GPU FSDP training, compiled MHA produces slightly
+    different k_proj.weight.grad sums between steps even when the inputs are
+    identical (e.g. grad_sum=1.7948172 vs 1.7948160).  Eager mode does not
+    show this drift.  The root cause is floating-point non-associativity in
+    NCCL all-reduce combined with operation-order changes introduced by
+    torch.compile kernel fusion.
+
+    This single-GPU test verifies the determinism of both eager and compiled
+    modes locally (where FSDP all-reduce non-associativity is absent) and
+    prints the gradient sums so they can be compared manually.
+
+    NOTE: this test must remain BEFORE all compiled-mode tests in this file.
+    torch.compile on MultiHeadAttention.forward is applied at the class level
+    and cannot be undone; building with compile_cfg=False here only works if
+    no prior test has already triggered class-level compilation.
+    """
+
+    def test_compiled_mha_grad_numerics(self):
+        self.create_pg("cuda")
+        torch._dynamo.reset()
+
+        SEQ_LEN = 1024
+        loss_cfg = CELossConfig()
+        LossCtx = loss_cfg.loss_ctx_cls
+
+        def _run(model) -> float:
+            """Zero grads, forward+backward with a fixed seed, return grad sum."""
+            model.zero_grad()
+            torch.manual_seed(0)
+            input_ids = torch.randint(0, model.config.vocab_size, (1, SEQ_LEN), device="cuda")
+            shifted_labels = input_ids[:, 1:].clone()
+            shift_input_ids = input_ids[:, :-1]
+            seq_ctx = SequenceContext.from_input_ids(input_ids=(shift_input_ids,))
+            loss_ctx = loss_cfg.build(shifted_labels=shifted_labels, sp_mesh=None)
+            loss_ctx = LossCtx.build_batches([loss_ctx])[0]
+            outputs = model(seq_ctx=seq_ctx, loss_ctx=loss_ctx)
+            outputs.loss.backward()
+            # Layer 3 is MHA in the 4-layer config.
+            return model.layers["3"].self_attn.k_proj.weight.grad.float().sum().item()
+
+        config = _make_small_model_config()
+
+        # ---- Non-compiled: two identical runs → same gradient ----
+        config.compile_cfg = False
+        model_eager = config.build().to(torch.bfloat16).cuda()
+        eager_run1 = _run(model_eager)
+        eager_run2 = _run(model_eager)
+
+        # ---- Compiled: two identical runs ----
+        config.compile_cfg = True
+        model_compiled = config.build().to(torch.bfloat16).cuda()
+        compiled_run1 = _run(model_compiled)
+        compiled_run2 = _run(model_compiled)
+
+        print(
+            f"\n[INFO] Non-compiled k_proj.weight.grad.sum(): "
+            f"run1={eager_run1:.10f}  run2={eager_run2:.10f}"
+        )
+        print(
+            f"[INFO] Compiled     k_proj.weight.grad.sum(): "
+            f"run1={compiled_run1:.10f}  run2={compiled_run2:.10f}  "
+            f"diff={abs(compiled_run2 - compiled_run1):.2e}"
+        )
+
+        # Single-GPU mode: both eager and compiled are deterministic because
+        # FSDP allreduce non-associativity is absent.  The non-determinism
+        # observed in 8-GPU FSDP training comes from NCCL allreduce ordering
+        # differences that torch.compile can amplify.
+        self.assertEqual(
+            eager_run1, eager_run2,
+            f"Non-compiled MHA should be deterministic: "
+            f"run1={eager_run1}, run2={eager_run2}",
+        )
+        self.assertEqual(
+            compiled_run1, compiled_run2,
+            f"Single-GPU compiled MHA should be deterministic: "
+            f"run1={compiled_run1}, run2={compiled_run2}",
+        )
+
+        torch._dynamo.reset()
+
+
+# ---------------------------------------------------------------------------
 # Compiled-mode integration test
 # ---------------------------------------------------------------------------
 
