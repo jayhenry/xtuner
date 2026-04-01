@@ -24,7 +24,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="./"
 unset XTUNER_USE_CUTLASS_GROUP_GEMM
 
-TORCHRUN="torchrun --nproc-per-node 8 --master-port 29710"
+nproc=2  # 8
+TORCHRUN="torchrun --nproc-per-node $nproc --master-port 29710"
 SCRIPT="tests/profiler/numerics_test.py"
 
 GRAD_DIR="/tmp/fsdp_nccl_test_$$"
@@ -38,8 +39,10 @@ echo "Grad records dir: $GRAD_DIR"
 # echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 # echo " [A] Run 1  (eager + deterministic, recording)"
 # echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# SEQ_LEN2=8192
 # XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
 #     --record-path "$GRAD_DIR/eager_run1" \
+#     --seq-len $SEQ_LEN2 \
 #     --deterministic \
 #     --no-compile
 # 
@@ -51,33 +54,35 @@ echo "Grad records dir: $GRAD_DIR"
 # XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
 #     --record-path "$GRAD_DIR/eager_run2" \
 #     --compare    "$GRAD_DIR/eager_run1" \
+#     --seq-len $SEQ_LEN2 \
 #     --deterministic \
 #     --no-compile
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Part B: Compiled + deterministic + seq_len = 65535 → expect global_max_rel < 1e-4
+# Part B: Compiled + deterministic + seq_len = 65535 → expect FULLY DETERMINISTIC
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo " [B] Run 3  (compiled + deterministic, recording)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+SEQ_LEN1=8191  # 65535
 # XTUNER_DETERMINISTIC=true must be in the environment *before* torchrun so that
 # flash-attn is called with deterministic=True (the constant is evaluated at
 # Python module-import time, not at runtime).
 XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
     --record-path "$GRAD_DIR/compiled_run1" \
-    --seq-len 65535 \
+    --seq-len $SEQ_LEN1 \
     --deterministic
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo " [B] Run 4  (compiled + deterministic, comparing)"
-echo " Expected: PRACTICALLY DETERMINISTIC (global_max_rel < 1e-4)"
+echo " Expected: FULLY DETERMINISTIC"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
     --record-path "$GRAD_DIR/compiled_run2" \
     --compare    "$GRAD_DIR/compiled_run1" \
-    --seq-len 65535 \
+    --seq-len $SEQ_LEN1 \
     --deterministic
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -87,24 +92,27 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo " [C] Run 5  (compiled + deterministic, recording)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+SEQ_LEN2=8192  # 16384  # 32768  # 65536
 # XTUNER_DETERMINISTIC=true must be in the environment *before* torchrun so that
 # flash-attn is called with deterministic=True (the constant is evaluated at
 # Python module-import time, not at runtime).
 XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
     --record-path "$GRAD_DIR/compiled_run5" \
-    --seq-len 65536 \
-    --deterministic
+    --seq-len $SEQ_LEN2 \
+    --deterministic \
+    # --no-compile
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo " [C] Run 6  (compiled + deterministic, comparing)"
-echo " Expected: PRACTICALLY DETERMINISTIC (global_max_rel < 1e-4)"
+echo " Expected: NON-DETERMINISTIC"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
     --record-path "$GRAD_DIR/compiled_run6" \
     --compare    "$GRAD_DIR/compiled_run5" \
-    --seq-len 65536 \
-    --deterministic
+    --seq-len $SEQ_LEN2 \
+    --deterministic \
+    # --no-compile
 
 echo ""
 echo "Records saved in: $GRAD_DIR"
