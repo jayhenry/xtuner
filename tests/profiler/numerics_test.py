@@ -30,6 +30,7 @@ import time
 
 import torch
 import torch.distributed as dist
+from mmengine.runner import set_random_seed
 
 from xtuner.v1.utils.misc import monkey_patch_hf_modules_cache
 
@@ -38,17 +39,18 @@ from xtuner.v1.utils.misc import monkey_patch_hf_modules_cache
 # Model + run helpers (mirroring TestFSDPCompiledMHAGradNumerics)
 # ---------------------------------------------------------------------------
 
-def _make_model_config(num_hidden_layers: int = 4):
+def _make_model_config(num_hidden_layers: int = 4, compile: bool = True):
     from xtuner.v1.model.moe.qwen3_5_text import Qwen3_5_VLTextMoE35BA3BConfig
     cfg = Qwen3_5_VLTextMoE35BA3BConfig(num_hidden_layers=num_hidden_layers)
-    cfg.compile_cfg = True  # match production: TORCH_COMPILE=1
+    cfg.compile_cfg = compile  # match production: TORCH_COMPILE=1
     return cfg
 
 
-def _build_fsdp_model(hf_path: str, num_hidden_layers: int = 4, reduce_dtype=torch.bfloat16):
+def _build_fsdp_model(hf_path: str, num_hidden_layers: int = 4, reduce_dtype=torch.bfloat16,
+                      compile: bool = True):
     from xtuner.v1.config import FSDPConfig
 
-    cfg = _make_model_config(num_hidden_layers)
+    cfg = _make_model_config(num_hidden_layers, compile=compile)
     with torch.device("meta"):
         model = cfg.build()
     fsdp_cfg = FSDPConfig(cpu_offload=False, ep_size=1, reduce_dtype=reduce_dtype)
@@ -163,6 +165,10 @@ def main():
             "Must be set before dist.init_process_group."
         ),
     )
+    parser.add_argument(
+        "--no-compile", action="store_true",
+        help="Disable torch.compile (use eager mode). Default: compile is ON.",
+    )
     args = parser.parse_args()
 
     # --- HF module cache patch (required for from_hf()) ---
@@ -180,6 +186,11 @@ def main():
         os.environ.setdefault("NCCL_PROTO", "Simple")
         os.environ.setdefault("NCCL_NUM_CHANNELS", "1")
 
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+    set_random_seed(0, deterministic=args.deterministic)
+
     # --- Distributed init ---
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
@@ -196,6 +207,7 @@ def main():
         sys.exit(1)
 
     from xtuner.v1.utils import XTUNER_DETERMINISTIC
+    compile_mode = not args.no_compile
     if rank == 0:
         if args.deterministic:
             det = (
@@ -206,7 +218,8 @@ def main():
             )
         else:
             det = f"  deterministic=False  XTUNER_DETERMINISTIC={XTUNER_DETERMINISTIC}"
-        print(f"[numerics_test] world_size={world_size}  record_path={args.record_path}{det}")
+        compile_str = "compile=ON" if compile_mode else "compile=OFF (eager)"
+        print(f"[numerics_test] world_size={world_size}  {compile_str}  record_path={args.record_path}{det}")
         if args.compare:
             print(f"[numerics_test] comparing against: {args.compare}")
 
@@ -216,7 +229,12 @@ def main():
         print("[numerics_test] building FSDP+compiled model ...")
     reduce_dtype = torch.float32 if args.deterministic else torch.bfloat16
     torch._dynamo.reset()
-    model = _build_fsdp_model(hf_path, num_hidden_layers=args.num_hidden_layers, reduce_dtype=reduce_dtype)
+    model = _build_fsdp_model(
+        hf_path,
+        num_hidden_layers=args.num_hidden_layers,
+        reduce_dtype=reduce_dtype,
+        compile=compile_mode,
+    )
 
     if rank == 0:
         print("[numerics_test] running forward+backward ...")
@@ -239,12 +257,25 @@ def main():
 
         # Print per-rank diff details (only if there are diffs on this rank)
         if diffs:
-            lines = [f"[Rank {rank}] {len(diffs)}/{len(new_grads)} params differ:"]
-            for name, nv, ov in diffs[:10]:
+            col_w = max(len(name) for name, _, _ in diffs)
+            col_w = max(col_w, 10)
+            header = (
+                f"{'param name':<{col_w}}  {'old_grad':>16}  {'new_grad':>16}"
+                f"  {'diff':>12}  {'rel_diff':>10}"
+            )
+            sep = "-" * len(header)
+            lines = [
+                f"[Rank {rank}] {len(diffs)}/{len(new_grads)} params differ:",
+                sep, header, sep,
+            ]
+            for name, nv, ov in diffs:
+                d = abs(nv - ov)
+                rel = d / (abs(ov) + 1e-12)
                 lines.append(
-                    f"  {name}: run1={ov:.12f}  run2={nv:.12f}  "
-                    f"diff={abs(nv - ov):.4e}  rel={abs(nv-ov)/(abs(ov)+1e-12):.4e}"
+                    f"{name:<{col_w}}  {ov:>16.8e}  {nv:>16.8e}"
+                    f"  {d:>12.4e}  {rel:>10.4e}"
                 )
+            lines.append(sep)
             print("\n".join(lines))
         else:
             print(f"[Rank {rank}] all {len(new_grads)} grad shard sums identical to run 1")

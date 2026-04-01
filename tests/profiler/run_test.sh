@@ -1,11 +1,15 @@
 #!/bin/bash
-# Run numerics_test.py twice (non-deterministic) then twice (deterministic)
-# to verify that NCCL_ALGO=Ring + NCCL_PROTO=Simple eliminates the cross-process
-# reduce-scatter non-determinism observed in 8-GPU FSDP training.
+# Two-part determinism verification for FSDP+compiled Qwen3.5-35B-A3B.
 #
-# Expected outcome:
-#   Non-deterministic pair: some params differ between run1 and run2
-#   Deterministic pair    : all params identical between run3 and run4
+# Part A — Non-compiled (eager) + deterministic:
+#   Expected: FULLY DETERMINISTIC (total_diffs=0)
+#   Confirms that XTUNER_DETERMINISTIC + float32 reduce + NCCL Ring/Simple
+#   eliminates all non-determinism when torch.compile is NOT involved.
+#
+# Part B — Compiled + deterministic:
+#   Expected: PRACTICALLY DETERMINISTIC (global_max_rel < 1e-4)
+#   Confirms that the same settings keep compiled training "good enough";
+#   residual differences come from causal_conv1d backward (no deterministic mode).
 
 set -e
 
@@ -28,40 +32,51 @@ mkdir -p "$GRAD_DIR"
 echo "Grad records dir: $GRAD_DIR"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Part A: Non-deterministic baseline (default NCCL settings)
+# Part A: Eager (non-compiled) + deterministic → expect total_diffs=0
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " [A] Run 1  (non-deterministic, recording)"
+echo " [A] Run 1  (eager + deterministic, recording)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-$TORCHRUN $SCRIPT --record-path "$GRAD_DIR/nd_run1"
+XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
+    --record-path "$GRAD_DIR/eager_run1" \
+    --deterministic \
+    --no-compile
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " [A] Run 2  (non-deterministic, comparing)"
+echo " [A] Run 2  (eager + deterministic, comparing)"
+echo " Expected: FULLY DETERMINISTIC (total_diffs=0)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-$TORCHRUN $SCRIPT --record-path "$GRAD_DIR/nd_run2" \
-                  --compare    "$GRAD_DIR/nd_run1" || true   # exit 2 = not reproduced, still continue
+XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
+    --record-path "$GRAD_DIR/eager_run2" \
+    --compare    "$GRAD_DIR/eager_run1" \
+    --deterministic \
+    --no-compile
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Part B: Deterministic (NCCL_ALGO=Ring + NCCL_PROTO=Simple)
+# Part B: Compiled + deterministic → expect global_max_rel < 1e-4
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " [B] Run 3  (deterministic, recording)"
+echo " [B] Run 3  (compiled + deterministic, recording)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 # XTUNER_DETERMINISTIC=true must be in the environment *before* torchrun so that
 # flash-attn is called with deterministic=True (the constant is evaluated at
 # Python module-import time, not at runtime).
-XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT --record-path "$GRAD_DIR/det_run1" --deterministic
+XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
+    --record-path "$GRAD_DIR/compiled_run1" \
+    --deterministic
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " [B] Run 4  (deterministic, comparing)"
+echo " [B] Run 4  (compiled + deterministic, comparing)"
+echo " Expected: PRACTICALLY DETERMINISTIC (global_max_rel < 1e-4)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT --record-path "$GRAD_DIR/det_run2" \
-                                            --compare    "$GRAD_DIR/det_run1" \
-                                            --deterministic
+XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
+    --record-path "$GRAD_DIR/compiled_run2" \
+    --compare    "$GRAD_DIR/compiled_run1" \
+    --deterministic
 
 echo ""
 echo "Records saved in: $GRAD_DIR"
