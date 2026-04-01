@@ -52,7 +52,7 @@ from xtuner.v1.utils.misc import monkey_patch_hf_modules_cache
 # Model + run helpers (mirroring TestFSDPCompiledMHAGradNumerics)
 # ---------------------------------------------------------------------------
 
-NUMERICS_SEQ_LEN = 65536
+NUMERICS_SEQ_LEN = 65535  # 65536 will fail
 NUMERICS_GRAD_ACCUM_STEPS = 2
 
 # Set from `--batch-style` in main(); used when `_precompute_micro_batches` omits `realistic`.
@@ -143,10 +143,12 @@ def _build_simple_packed_batch(
     from xtuner.v1.data_proto import SequenceContext
 
     full = torch.randint(0, vocab_size, (1, seq_len + 1), generator=g, dtype=torch.long)
+    print(f"---------------- generate simple full.shape: {full.shape}")
     full = full.to(device)
     shifted_labels = full[:, 1:].clone()
     shift_input_ids = full[:, :-1]
     seq_ctx = SequenceContext.from_input_ids(input_ids=(shift_input_ids,), device=str(device))
+    assert seq_ctx.input_ids.shape[-1] == seq_len
     return seq_ctx, shifted_labels
 
 
@@ -230,6 +232,10 @@ def _run_forward_backward(
     GRAD_ACCUM_STEPS = len(micro_batches)
     model.zero_grad()
     for micro, (seq_ctx, shifted_labels) in enumerate(micro_batches):
+        # Move to CUDA here (after model construction) so CUDA input-tensor allocations
+        # are anchored just above model params — same position in both runs.
+        # seq_ctx = seq_ctx.to("cuda")
+        # shifted_labels = shifted_labels.cuda()
         torch.manual_seed(rank * GRAD_ACCUM_STEPS + micro)
         loss_ctx = loss_cfg.build(shifted_labels=shifted_labels, sp_mesh=None)
         loss_ctx = LossCtx.build_batches([loss_ctx])[0]
@@ -375,9 +381,14 @@ def main():
 
     vocab_size = 248320
     padding_token_idx = 0
+    # Precompute on CPU: CUDA allocations for input data must happen AFTER model
+    # construction to anchor causal_conv1d backward workspace addresses consistently.
+    # Allocating CUDA tensors here (before model params) shifts the workspace into the
+    # unanchored high-address free pool, which NCCL's direct cudaMalloc can fragment
+    # differently between process invocations → non-deterministic atomicAdd ordering.
     micro_batches = _precompute_micro_batches(
         rank=rank,
-        device=torch.device("cuda"),
+        device=torch.device("cuda"), # ("cpu"),
         vocab_size=vocab_size,
         padding_token_idx=padding_token_idx,
         seq_len=NUMERICS_SEQ_LEN,
