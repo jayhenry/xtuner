@@ -55,7 +55,7 @@ echo "Grad records dir: $GRAD_DIR"
 #     --no-compile
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Part B: Compiled + deterministic → expect global_max_rel < 1e-4
+# Part B: Compiled + deterministic + seq_len = 65535 → expect global_max_rel < 1e-4
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -66,6 +66,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 # Python module-import time, not at runtime).
 XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
     --record-path "$GRAD_DIR/compiled_run1" \
+    --seq-len 65535 \
     --deterministic
 
 echo ""
@@ -76,6 +77,33 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
     --record-path "$GRAD_DIR/compiled_run2" \
     --compare    "$GRAD_DIR/compiled_run1" \
+    --seq-len 65535 \
+    --deterministic
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Part C: Compiled + deterministic + seq_len = 65536 → expect failure: RESULT: NON-DETERMINISTIC
+# ══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo " [C] Run 5  (compiled + deterministic, recording)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# XTUNER_DETERMINISTIC=true must be in the environment *before* torchrun so that
+# flash-attn is called with deterministic=True (the constant is evaluated at
+# Python module-import time, not at runtime).
+XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
+    --record-path "$GRAD_DIR/compiled_run5" \
+    --seq-len 65536 \
+    --deterministic
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo " [C] Run 6  (compiled + deterministic, comparing)"
+echo " Expected: PRACTICALLY DETERMINISTIC (global_max_rel < 1e-4)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
+    --record-path "$GRAD_DIR/compiled_run6" \
+    --compare    "$GRAD_DIR/compiled_run5" \
+    --seq-len 65536 \
     --deterministic
 
 echo ""

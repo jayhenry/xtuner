@@ -52,7 +52,6 @@ from xtuner.v1.utils.misc import monkey_patch_hf_modules_cache
 # Model + run helpers (mirroring TestFSDPCompiledMHAGradNumerics)
 # ---------------------------------------------------------------------------
 
-NUMERICS_SEQ_LEN = 65535  # 65536 will fail
 NUMERICS_GRAD_ACCUM_STEPS = 2
 
 # Set from `--batch-style` in main(); used when `_precompute_micro_batches` omits `realistic`.
@@ -222,7 +221,7 @@ def _run_forward_backward(
     model,
     micro_batches: list[tuple[Any, torch.Tensor]],
 ) -> dict[str, float]:
-    """Run precomputed micro-batches (packed length NUMERICS_SEQ_LEN), return grad shard sums."""
+    """Run precomputed micro-batches (packed length fixed at precompute), return grad shard sums."""
     from xtuner.v1.loss.ce_loss import CELossConfig
 
     loss_cfg = CELossConfig(mode="chunk")
@@ -342,6 +341,17 @@ def main():
             "'realistic' follows collator packing, padding, and partial label masking (SFT-like)."
         ),
     )
+    NUMERICS_SEQ_LEN = 65535  # default for --seq-len; 65536 can break determinism under compile
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=NUMERICS_SEQ_LEN,
+        help=(
+            "Packed sequence length per micro-batch (token dim of input_ids / labels). "
+            f"Default: {NUMERICS_SEQ_LEN}. Larger values (e.g. 65536) may show non-deterministic "
+            "gradients under FSDP+compile even with XTUNER_DETERMINISTIC."
+        ),
+    )
     args = parser.parse_args()
 
     global _NUMERICS_BATCH_STYLE_REALISTIC
@@ -391,7 +401,7 @@ def main():
         device=torch.device("cuda"), # ("cpu"),
         vocab_size=vocab_size,
         padding_token_idx=padding_token_idx,
-        seq_len=NUMERICS_SEQ_LEN,
+        seq_len=args.seq_len,
         num_steps=NUMERICS_GRAD_ACCUM_STEPS,
     )
 
@@ -404,6 +414,7 @@ def main():
     if args.skip_train:
         print(
             f"[numerics_test] skip_train=True  world_size={world_size}  "
+            f"seq_len={args.seq_len}  "
             f"record_path={args.record_path}  compare={args.compare}"
         )
         t0 = time.time()
@@ -435,7 +446,8 @@ def main():
             compile_str = "compile=ON" if compile_mode else "compile=OFF (eager)"
             print(
                 f"[numerics_test] world_size={world_size}  {compile_str}  "
-                f"batch_style={args.batch_style}  record_path={args.record_path}{det}"
+                f"seq_len={args.seq_len}  batch_style={args.batch_style}  "
+                f"record_path={args.record_path}{det}"
             )
             if args.compare:
                 print(f"[numerics_test] comparing against: {args.compare}")
@@ -469,6 +481,7 @@ def main():
             print(f"[numerics_test] saved records to {args.record_path}_rank*.json")
 
     # --- Compare against previous run (if requested) ---
+    exit_code = 0
     if args.compare:
         old_grads = load_record(args.compare, rank)
         diffs = compare_records(new_grads, old_grads, rank)
@@ -515,22 +528,23 @@ def main():
                     "RESULT: FULLY DETERMINISTIC — all gradient shard sums identical\n"
                     "across both process invocations on every rank."
                 )
-                sys.exit(0)
+                exit_code = 0
             elif global_max_rel < 1e-4:
                 print(
                     f"RESULT: PRACTICALLY DETERMINISTIC — {total_diffs} param shards differ\n"
                     f"across all ranks but max relative difference is {global_max_rel:.2e} (<1e-4),\n"
                     "which is negligible for training."
                 )
-                sys.exit(0)
+                exit_code = 0
             else:
                 print(
                     f"RESULT: NON-DETERMINISTIC — {total_diffs} param shards differ across\n"
                     f"all ranks with max relative difference {global_max_rel:.2e}."
                 )
-                sys.exit(2)  # exit 2 = non-determinism still present
+                exit_code = 2  # exit 2 = non-determinism still present
 
     dist.destroy_process_group()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
