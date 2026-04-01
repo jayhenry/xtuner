@@ -12,6 +12,9 @@ Usage (called by run_test.sh):
     torchrun --nproc-per-node 8 numerics_test.py --record-path /tmp/grads/run2 \
         --compare /tmp/grads/run1 --skip-train
 
+    # Dense random sequence instead of packed collator-style batch:
+    torchrun ... numerics_test.py ... --batch-style simple
+
 Each rank writes its own JSON file:  <record-path>_rank<N>.json
 The comparison is done per-rank (same rank sees its own shard of the reduce-scattered
 gradient), then the per-rank "any_diff" flags are reduced across all ranks so the
@@ -26,24 +29,164 @@ Hypothesis being verified:
     one rank.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.distributed as dist
 from mmengine.runner import set_random_seed
 
 from xtuner.v1.profiler.prober_utils import setup_prober_list
+from xtuner.v1.utils import IGNORE_INDEX
 from xtuner.v1.utils.misc import monkey_patch_hf_modules_cache
 
 
 # ---------------------------------------------------------------------------
 # Model + run helpers (mirroring TestFSDPCompiledMHAGradNumerics)
 # ---------------------------------------------------------------------------
+
+NUMERICS_SEQ_LEN = 65536
+NUMERICS_GRAD_ACCUM_STEPS = 2
+
+# Set from `--batch-style` in main(); used when `_precompute_micro_batches` omits `realistic`.
+_NUMERICS_BATCH_STYLE_REALISTIC: bool | None = None
+
+
+def _randint(g: torch.Generator, low: int, high: int) -> int:
+    """Inclusive low, exclusive high (same as torch.randint)."""
+    return int(torch.randint(low, high, (1,), generator=g).item())
+
+
+def _random_partition(g: torch.Generator, total: int, k: int, min_part: int) -> list[int]:
+    assert total >= k * min_part
+    parts = [min_part] * k
+    for _ in range(total - k * min_part):
+        parts[_randint(g, 0, k)] += 1
+    return parts
+
+
+def _build_realistic_packed_batch(
+    *,
+    g: torch.Generator,
+    device: torch.device,
+    vocab_size: int,
+    pack_max_length: int,
+    padding_token_idx: int,
+    pad_chunk_size: int = 256,
+) -> tuple[Any, torch.Tensor]:
+    """Mimic `build_text_ctx_labels` + SFT masking (ftdp-style).
+
+    - Several logical samples concatenated; `num_tokens` / `cu_seq_lens` follow collator.
+    - Padded to `pack_max_length` (labels padded with IGNORE_INDEX).
+    - Within each sample: first label -100; a contiguous \"user\" span also -100.
+    """
+    from xtuner.v1.datasets.collator import build_text_ctx_labels
+
+    min_seg = 8
+    k = _randint(g, 3, 9)
+    t_lower = k * min_seg + 2
+    if t_lower > pack_max_length:
+        k = max(2, pack_max_length // (2 * min_seg))
+        t_lower = k * min_seg + 2
+    # t_total <= pack_max_length => shifted len <= pack_max_length - 1 => always some pad.
+    t_total = _randint(g, t_lower, pack_max_length + 1)
+
+    seg_lens = _random_partition(g, t_total, k, min_seg)
+
+    instances: list[dict] = []
+    for L in seg_lens:
+        tok = torch.randint(0, vocab_size, (L,), generator=g)
+        labels = tok.tolist()
+        labels[0] = IGNORE_INDEX
+        # Contiguous prefix (after BOS slot) masked like template \"user\" / no-loss regions in ftdp.
+        max_user = max(1, L - 2)
+        user_len = _randint(g, 1, max_user + 1)
+        for j in range(1, 1 + user_len):
+            labels[j] = IGNORE_INDEX
+        instances.append(
+            {
+                "input_ids": tok.tolist(),
+                "labels": labels,
+                "num_tokens": L,
+            }
+        )
+
+    seq_ctx, shifted_labels, _ = build_text_ctx_labels(
+        instances,
+        pack_max_length,
+        padding_token_idx,
+        pack_to_max_length=True,
+        pad_chunk_size=pad_chunk_size,
+    )
+    seq_ctx = seq_ctx.to(device)
+    shifted_labels = shifted_labels.to(device)
+    assert seq_ctx.input_ids.shape[-1] == pack_max_length
+    assert shifted_labels.shape == seq_ctx.input_ids.shape
+    return seq_ctx, shifted_labels
+
+
+def _build_simple_packed_batch(
+    *,
+    g: torch.Generator,
+    device: torch.device,
+    vocab_size: int,
+    seq_len: int,
+) -> tuple[Any, torch.Tensor]:
+    """Dense random sequence + `from_input_ids` (single segment), full next-token loss."""
+    from xtuner.v1.data_proto import SequenceContext
+
+    full = torch.randint(0, vocab_size, (1, seq_len + 1), generator=g, dtype=torch.long)
+    full = full.to(device)
+    shifted_labels = full[:, 1:].clone()
+    shift_input_ids = full[:, :-1]
+    seq_ctx = SequenceContext.from_input_ids(input_ids=(shift_input_ids,), device=str(device))
+    return seq_ctx, shifted_labels
+
+
+def _precompute_micro_batches(
+    *,
+    rank: int,
+    device: torch.device,
+    vocab_size: int,
+    padding_token_idx: int,
+    seq_len: int,
+    num_steps: int,
+    realistic: bool | None = None,
+) -> list[tuple[Any, torch.Tensor]]:
+    """Build all `(seq_ctx, shifted_labels)` for this rank before any forward."""
+    use_realistic = _NUMERICS_BATCH_STYLE_REALISTIC if realistic is None else realistic
+    assert use_realistic is not None, "--batch-style must be set"
+    batches: list[tuple[Any, torch.Tensor]] = []
+    for micro in range(num_steps):
+        g = torch.Generator(device="cpu")
+        g.manual_seed(rank * num_steps + micro)
+        if use_realistic:
+            print("Building realistic packed batch")
+            seq_ctx, shifted_labels = _build_realistic_packed_batch(
+                g=g,
+                device=device,
+                vocab_size=vocab_size,
+                pack_max_length=seq_len,
+                padding_token_idx=padding_token_idx,
+            )
+        else:
+            print("Building simple dense batch")
+            seq_ctx, shifted_labels = _build_simple_packed_batch(
+                g=g,
+                device=device,
+                vocab_size=vocab_size,
+                seq_len=seq_len,
+            )
+        batches.append((seq_ctx, shifted_labels))
+    return batches
+
 
 def _make_model_config(num_hidden_layers: int = 4, compile: bool = True):
     # from xtuner.v1.model.moe.qwen3_5_text import Qwen3_5_VLTextMoE35BA3BConfig
@@ -73,27 +216,21 @@ def _build_fsdp_model(hf_path: str, num_hidden_layers: int = 4, reduce_dtype=tor
     return model
 
 
-def _run_forward_backward(model) -> dict[str, float]:
-    """Run 2 micro-batches of seq_len=65536, return rank-local grad shard sums."""
-    from xtuner.v1.data_proto import SequenceContext
+def _run_forward_backward(
+    model,
+    micro_batches: list[tuple[Any, torch.Tensor]],
+) -> dict[str, float]:
+    """Run precomputed micro-batches (packed length NUMERICS_SEQ_LEN), return grad shard sums."""
     from xtuner.v1.loss.ce_loss import CELossConfig
-
-    SEQ_LEN = 65536
-    GRAD_ACCUM_STEPS = 2
 
     loss_cfg = CELossConfig(mode="chunk")
     LossCtx = loss_cfg.loss_ctx_cls
 
     rank = dist.get_rank()
-    vocab_size = model.config.text_config.vocab_size
-
+    GRAD_ACCUM_STEPS = len(micro_batches)
     model.zero_grad()
-    for micro in range(GRAD_ACCUM_STEPS):
+    for micro, (seq_ctx, shifted_labels) in enumerate(micro_batches):
         torch.manual_seed(rank * GRAD_ACCUM_STEPS + micro)
-        input_ids = torch.randint(0, vocab_size, (1, SEQ_LEN), device="cuda")
-        shifted_labels = input_ids[:, 1:].clone()
-        shift_input_ids = input_ids[:, :-1]
-        seq_ctx = SequenceContext.from_input_ids(input_ids=(shift_input_ids,))
         loss_ctx = loss_cfg.build(shifted_labels=shifted_labels, sp_mesh=None)
         loss_ctx = LossCtx.build_batches([loss_ctx])[0]
         outputs = model(seq_ctx=seq_ctx, loss_ctx=loss_ctx)
@@ -190,7 +327,19 @@ def main():
             "and compare against --compare (requires --compare). No writes."
         ),
     )
+    parser.add_argument(
+        "--batch-style",
+        choices=("simple", "realistic"),
+        default="simple",
+        help=(
+            "Training micro-batch layout: 'simple' is dense random ids + from_input_ids; "
+            "'realistic' follows collator packing, padding, and partial label masking (SFT-like)."
+        ),
+    )
     args = parser.parse_args()
+
+    global _NUMERICS_BATCH_STYLE_REALISTIC
+    _NUMERICS_BATCH_STYLE_REALISTIC = args.batch_style == "realistic"
 
     if args.skip_train and not args.compare:
         print("ERROR: --skip-train requires --compare", file=sys.stderr)
@@ -223,6 +372,19 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
     torch.cuda.set_device(local_rank)
     torch.accelerator.set_device_index(local_rank)
+
+    vocab_size = 248320
+    padding_token_idx = 0
+    micro_batches = _precompute_micro_batches(
+        rank=rank,
+        device=torch.device("cuda"),
+        vocab_size=vocab_size,
+        padding_token_idx=padding_token_idx,
+        seq_len=NUMERICS_SEQ_LEN,
+        num_steps=NUMERICS_GRAD_ACCUM_STEPS,
+    )
+
+    set_random_seed(0, deterministic=args.deterministic)
 
     from xtuner.v1.utils import XTUNER_DETERMINISTIC
     compile_mode = not args.no_compile
@@ -260,7 +422,10 @@ def main():
             else:
                 det = f"  deterministic=False  XTUNER_DETERMINISTIC={XTUNER_DETERMINISTIC}"
             compile_str = "compile=ON" if compile_mode else "compile=OFF (eager)"
-            print(f"[numerics_test] world_size={world_size}  {compile_str}  record_path={args.record_path}{det}")
+            print(
+                f"[numerics_test] world_size={world_size}  {compile_str}  "
+                f"batch_style={args.batch_style}  record_path={args.record_path}{det}"
+            )
             if args.compare:
                 print(f"[numerics_test] comparing against: {args.compare}")
         # --- Build model and run ---
@@ -280,7 +445,7 @@ def main():
 
         if rank == 0:
             print("[numerics_test] running forward+backward ...")
-        new_grads = _run_forward_backward(model)
+        new_grads = _run_forward_backward(model, micro_batches)
         elapsed = time.time() - t0
         if rank == 0:
             print(f"[numerics_test] done in {elapsed:.1f}s  ({len(new_grads)} params with grad)")
