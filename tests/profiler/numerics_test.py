@@ -8,6 +8,10 @@ Usage (called by run_test.sh):
     torchrun --nproc-per-node 8 numerics_test.py --record-path /tmp/grads/run2 \
         --compare /tmp/grads/run1
 
+    # Compare two existing recordings only (no forward/backward):
+    torchrun --nproc-per-node 8 numerics_test.py --record-path /tmp/grads/run2 \
+        --compare /tmp/grads/run1 --skip-train
+
 Each rank writes its own JSON file:  <record-path>_rank<N>.json
 The comparison is done per-rank (same rank sees its own shard of the reduce-scattered
 gradient), then the per-rank "any_diff" flags are reduced across all ranks so the
@@ -169,7 +173,18 @@ def main():
         "--no-compile", action="store_true",
         help="Disable torch.compile (use eager mode). Default: compile is ON.",
     )
+    parser.add_argument(
+        "--skip-train", action="store_true",
+        help=(
+            "Skip model build and forward/backward; load JSON from --record-path "
+            "and compare against --compare (requires --compare). No writes."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.skip_train and not args.compare:
+        print("ERROR: --skip-train requires --compare", file=sys.stderr)
+        sys.exit(2)
 
     # --- HF module cache patch (required for from_hf()) ---
     monkey_patch_hf_modules_cache()
@@ -199,56 +214,71 @@ def main():
     torch.cuda.set_device(local_rank)
     torch.accelerator.set_device_index(local_rank)
 
-    hf_path = args.hf_path or os.environ.get("QWEN35_MOE_PATH")
-    if not hf_path:
-        if rank == 0:
-            print("ERROR: QWEN35_MOE_PATH env var or --hf-path must be set", file=sys.stderr)
-        dist.destroy_process_group()
-        sys.exit(1)
-
     from xtuner.v1.utils import XTUNER_DETERMINISTIC
     compile_mode = not args.no_compile
-    if rank == 0:
-        if args.deterministic:
-            det = (
-                f"  deterministic=True  XTUNER_DETERMINISTIC={XTUNER_DETERMINISTIC}"
-                f"  NCCL_ALGO={os.environ.get('NCCL_ALGO','(default)')}"
-                f"  NCCL_NUM_CHANNELS={os.environ.get('NCCL_NUM_CHANNELS','(default)')}"
-                f"  reduce_dtype=float32"
+
+    hf_path = None
+    if args.skip_train:
+        print(
+            f"[numerics_test] skip_train=True  world_size={world_size}  "
+            f"record_path={args.record_path}  compare={args.compare}"
+        )
+        t0 = time.time()
+        new_grads = load_record(args.record_path, rank)
+        elapsed = time.time() - t0
+        if rank == 0:
+            print(
+                f"[numerics_test] loaded {len(new_grads)} params from {args.record_path} "
+                f"in {elapsed:.2f}s"
             )
-        else:
-            det = f"  deterministic=False  XTUNER_DETERMINISTIC={XTUNER_DETERMINISTIC}"
-        compile_str = "compile=ON" if compile_mode else "compile=OFF (eager)"
-        print(f"[numerics_test] world_size={world_size}  {compile_str}  record_path={args.record_path}{det}")
-        if args.compare:
-            print(f"[numerics_test] comparing against: {args.compare}")
+    else:
+        hf_path = args.hf_path or os.environ.get("QWEN35_MOE_PATH")
+        if not hf_path:
+            if rank == 0:
+                print("ERROR: QWEN35_MOE_PATH env var or --hf-path must be set", file=sys.stderr)
+            dist.destroy_process_group()
+            sys.exit(1)
 
-    # --- Build model and run ---
-    t0 = time.time()
-    if rank == 0:
-        print("[numerics_test] building FSDP+compiled model ...")
-    reduce_dtype = torch.float32 if args.deterministic else torch.bfloat16
-    torch._dynamo.reset()
-    model = _build_fsdp_model(
-        hf_path,
-        num_hidden_layers=args.num_hidden_layers,
-        reduce_dtype=reduce_dtype,
-        compile=compile_mode,
-    )
+        if rank == 0:
+            if args.deterministic:
+                det = (
+                    f"  deterministic=True  XTUNER_DETERMINISTIC={XTUNER_DETERMINISTIC}"
+                    f"  NCCL_ALGO={os.environ.get('NCCL_ALGO','(default)')}"
+                    f"  NCCL_NUM_CHANNELS={os.environ.get('NCCL_NUM_CHANNELS','(default)')}"
+                    f"  reduce_dtype=float32"
+                )
+            else:
+                det = f"  deterministic=False  XTUNER_DETERMINISTIC={XTUNER_DETERMINISTIC}"
+            compile_str = "compile=ON" if compile_mode else "compile=OFF (eager)"
+            print(f"[numerics_test] world_size={world_size}  {compile_str}  record_path={args.record_path}{det}")
+            if args.compare:
+                print(f"[numerics_test] comparing against: {args.compare}")
+        # --- Build model and run ---
+        t0 = time.time()
+        if rank == 0:
+            print("[numerics_test] building FSDP+compiled model ...")
+        reduce_dtype = torch.float32 if args.deterministic else torch.bfloat16
+        torch._dynamo.reset()
+        model = _build_fsdp_model(
+            hf_path,
+            num_hidden_layers=args.num_hidden_layers,
+            reduce_dtype=reduce_dtype,
+            compile=compile_mode,
+        )
 
-    if rank == 0:
-        print("[numerics_test] running forward+backward ...")
-    new_grads = _run_forward_backward(model)
-    elapsed = time.time() - t0
-    if rank == 0:
-        print(f"[numerics_test] done in {elapsed:.1f}s  ({len(new_grads)} params with grad)")
+        if rank == 0:
+            print("[numerics_test] running forward+backward ...")
+        new_grads = _run_forward_backward(model)
+        elapsed = time.time() - t0
+        if rank == 0:
+            print(f"[numerics_test] done in {elapsed:.1f}s  ({len(new_grads)} params with grad)")
 
-    # --- Save this run's records ---
-    dist.barrier()
-    save_record(new_grads, args.record_path, rank)
-    dist.barrier()
-    if rank == 0:
-        print(f"[numerics_test] saved records to {args.record_path}_rank*.json")
+        # --- Save this run's records ---
+        dist.barrier()
+        save_record(new_grads, args.record_path, rank)
+        dist.barrier()
+        if rank == 0:
+            print(f"[numerics_test] saved records to {args.record_path}_rank*.json")
 
     # --- Compare against previous run (if requested) ---
     if args.compare:

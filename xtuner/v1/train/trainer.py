@@ -1286,7 +1286,8 @@ class Trainer:
             #     self._fsdp_config.reduce_dtype = torch.float32
 
     def _set_random_seed(self, seed: int):
-        set_random_seed(seed)
+        logger.info(f"Setting mmengine's set_random_seed(seed={seed}, deterministic={XTUNER_DETERMINISTIC})")
+        set_random_seed(seed, deterministic=XTUNER_DETERMINISTIC)
 
     def _try_bind_numa(self):
         if str(DEVICE) != "cuda":
