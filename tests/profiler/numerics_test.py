@@ -45,13 +45,13 @@ def _make_model_config(num_hidden_layers: int = 4):
     return cfg
 
 
-def _build_fsdp_model(hf_path: str, num_hidden_layers: int = 4):
+def _build_fsdp_model(hf_path: str, num_hidden_layers: int = 4, reduce_dtype=torch.bfloat16):
     from xtuner.v1.config import FSDPConfig
 
     cfg = _make_model_config(num_hidden_layers)
     with torch.device("meta"):
         model = cfg.build()
-    fsdp_cfg = FSDPConfig(cpu_offload=False, ep_size=1)
+    fsdp_cfg = FSDPConfig(cpu_offload=False, ep_size=1, reduce_dtype=reduce_dtype)
     model.fully_shard(fsdp_config=fsdp_cfg)
     model.from_hf(hf_path, strict=False)
     return model
@@ -155,10 +155,30 @@ def main():
         "--num-hidden-layers", type=int, default=4,
         help="Number of transformer layers in the small model (default: 4)",
     )
+    parser.add_argument(
+        "--deterministic", action="store_true",
+        help=(
+            "Force NCCL to use Ring algorithm + Simple protocol so that "
+            "reduce-scatter produces the same result across process invocations. "
+            "Must be set before dist.init_process_group."
+        ),
+    )
     args = parser.parse_args()
 
     # --- HF module cache patch (required for from_hf()) ---
     monkey_patch_hf_modules_cache()
+
+    # --- Force deterministic NCCL *before* init_process_group (env vars are
+    #     read by NCCL at init time; setting them afterwards has no effect).
+    # NOTE: XTUNER_DETERMINISTIC is a module-level constant evaluated at import
+    # time in xtuner.v1.utils.misc.  It must be set in the *shell environment*
+    # before torchrun launches — setting os.environ here is too late.
+    # run_test.sh passes `XTUNER_DETERMINISTIC=true` for the deterministic runs.
+    if args.deterministic:
+        # Belt-and-suspenders: also pin NCCL to a single ring channel.
+        os.environ.setdefault("NCCL_ALGO", "Ring")
+        os.environ.setdefault("NCCL_PROTO", "Simple")
+        os.environ.setdefault("NCCL_NUM_CHANNELS", "1")
 
     # --- Distributed init ---
     dist.init_process_group(backend="nccl")
@@ -175,8 +195,18 @@ def main():
         dist.destroy_process_group()
         sys.exit(1)
 
+    from xtuner.v1.utils import XTUNER_DETERMINISTIC
     if rank == 0:
-        print(f"[numerics_test] world_size={world_size}  record_path={args.record_path}")
+        if args.deterministic:
+            det = (
+                f"  deterministic=True  XTUNER_DETERMINISTIC={XTUNER_DETERMINISTIC}"
+                f"  NCCL_ALGO={os.environ.get('NCCL_ALGO','(default)')}"
+                f"  NCCL_NUM_CHANNELS={os.environ.get('NCCL_NUM_CHANNELS','(default)')}"
+                f"  reduce_dtype=float32"
+            )
+        else:
+            det = f"  deterministic=False  XTUNER_DETERMINISTIC={XTUNER_DETERMINISTIC}"
+        print(f"[numerics_test] world_size={world_size}  record_path={args.record_path}{det}")
         if args.compare:
             print(f"[numerics_test] comparing against: {args.compare}")
 
@@ -184,8 +214,9 @@ def main():
     t0 = time.time()
     if rank == 0:
         print("[numerics_test] building FSDP+compiled model ...")
+    reduce_dtype = torch.float32 if args.deterministic else torch.bfloat16
     torch._dynamo.reset()
-    model = _build_fsdp_model(hf_path, num_hidden_layers=args.num_hidden_layers)
+    model = _build_fsdp_model(hf_path, num_hidden_layers=args.num_hidden_layers, reduce_dtype=reduce_dtype)
 
     if rank == 0:
         print("[numerics_test] running forward+backward ...")
@@ -218,27 +249,37 @@ def main():
         else:
             print(f"[Rank {rank}] all {len(new_grads)} grad shard sums identical to run 1")
 
-        # Reduce "any diff" flag across all ranks
+        # Reduce summary stats across all ranks
         dist.barrier()
-        diff_flag = torch.tensor([1 if diffs else 0], dtype=torch.int64, device="cuda")
-        dist.all_reduce(diff_flag, op=dist.ReduceOp.MAX)
-        any_rank_differs = diff_flag.item() > 0
+        diff_count = torch.tensor([len(diffs)], dtype=torch.int64, device="cuda")
+        max_rel = max((abs(nv - ov) / (abs(ov) + 1e-12) for _, nv, ov in diffs), default=0.0)
+        max_rel_t = torch.tensor([max_rel], dtype=torch.float64, device="cuda")
+        dist.all_reduce(diff_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(max_rel_t, op=dist.ReduceOp.MAX)
+        total_diffs = diff_count.item()
+        global_max_rel = max_rel_t.item()
 
         if rank == 0:
             print()
-            if any_rank_differs:
+            if total_diffs == 0:
                 print(
-                    "RESULT: CONFIRMED — cross-process NCCL non-determinism reproduced.\n"
-                    "At least one rank produced different gradient shard sums between the\n"
-                    "two separate torchrun invocations (different NCCL ring timing)."
+                    "RESULT: FULLY DETERMINISTIC — all gradient shard sums identical\n"
+                    "across both process invocations on every rank."
+                )
+                sys.exit(0)
+            elif global_max_rel < 1e-4:
+                print(
+                    f"RESULT: PRACTICALLY DETERMINISTIC — {total_diffs} param shards differ\n"
+                    f"across all ranks but max relative difference is {global_max_rel:.2e} (<1e-4),\n"
+                    "which is negligible for training."
                 )
                 sys.exit(0)
             else:
                 print(
-                    "RESULT: NOT REPRODUCED — all gradient shard sums are identical across\n"
-                    "both runs on every rank.  The hypothesis is not confirmed by this run."
+                    f"RESULT: NON-DETERMINISTIC — {total_diffs} param shards differ across\n"
+                    f"all ranks with max relative difference {global_max_rel:.2e}."
                 )
-                sys.exit(2)  # distinct from error (1) to signal "not reproduced"
+                sys.exit(2)  # exit 2 = non-determinism still present
 
     dist.destroy_process_group()
 

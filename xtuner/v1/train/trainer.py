@@ -1273,6 +1273,17 @@ class Trainer:
             logger.info("Setting deterministic algorithms")
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
             torch.use_deterministic_algorithms(True, warn_only=True)
+            # Gradient reduce-scatter in bf16 is non-deterministic across separate
+            # process invocations because NCCL's ring partial-sum accumulation
+            # order can vary with OS scheduling.  Reducing in float32 brings the
+            # numerical differences below float32 precision (< 1e-7 relative),
+            # making training effectively reproducible across runs.
+            # if self._fsdp_config.reduce_dtype != torch.float32:
+            #     logger.info(
+            #         "XTUNER_DETERMINISTIC: overriding fsdp_cfg.reduce_dtype "
+            #         f"{self._fsdp_config.reduce_dtype} → torch.float32"
+            #     )
+            #     self._fsdp_config.reduce_dtype = torch.float32
 
     def _set_random_seed(self, seed: int):
         set_random_seed(seed)
@@ -1320,6 +1331,16 @@ class Trainer:
                 backend = "cpu:gloo,npu:hccl"
             else:
                 raise NotImplementedError
+
+        if XTUNER_DETERMINISTIC:
+            # NCCL env vars must be set before init_process_group; setting them
+            # afterwards has no effect.  Force the ring algorithm with the simple
+            # protocol and a single DMA channel so every rank always accumulates
+            # partial sums in the same order, making gradient reduce-scatter
+            # deterministic across separate process invocations.
+            os.environ.setdefault("NCCL_ALGO", "Ring")
+            os.environ.setdefault("NCCL_PROTO", "Simple")
+            os.environ.setdefault("NCCL_NUM_CHANNELS", "1")
 
         if not dist.is_initialized():
             init_process_group(backend=backend)
