@@ -24,6 +24,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="./"
 unset XTUNER_USE_CUTLASS_GROUP_GEMM
 
+export XTUNER_USE_FA3=0
+
 nproc=2  # 8
 TORCHRUN="torchrun --nproc-per-node $nproc --master-port 29710"
 SCRIPT="tests/profiler/numerics_test.py"
