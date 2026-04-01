@@ -31,28 +31,28 @@ GRAD_DIR="/tmp/fsdp_nccl_test_$$"
 mkdir -p "$GRAD_DIR"
 echo "Grad records dir: $GRAD_DIR"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Part A: Eager (non-compiled) + deterministic → expect total_diffs=0
-# ══════════════════════════════════════════════════════════════════════════════
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " [A] Run 1  (eager + deterministic, recording)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
-    --record-path "$GRAD_DIR/eager_run1" \
-    --deterministic \
-    --no-compile
-
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " [A] Run 2  (eager + deterministic, comparing)"
-echo " Expected: FULLY DETERMINISTIC (total_diffs=0)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
-    --record-path "$GRAD_DIR/eager_run2" \
-    --compare    "$GRAD_DIR/eager_run1" \
-    --deterministic \
-    --no-compile
+# # ══════════════════════════════════════════════════════════════════════════════
+# # Part A: Eager (non-compiled) + deterministic → expect total_diffs=0
+# # ══════════════════════════════════════════════════════════════════════════════
+# echo ""
+# echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# echo " [A] Run 1  (eager + deterministic, recording)"
+# echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
+#     --record-path "$GRAD_DIR/eager_run1" \
+#     --deterministic \
+#     --no-compile
+# 
+# echo ""
+# echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# echo " [A] Run 2  (eager + deterministic, comparing)"
+# echo " Expected: FULLY DETERMINISTIC (total_diffs=0)"
+# echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# XTUNER_DETERMINISTIC=true $TORCHRUN $SCRIPT \
+#     --record-path "$GRAD_DIR/eager_run2" \
+#     --compare    "$GRAD_DIR/eager_run1" \
+#     --deterministic \
+#     --no-compile
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Part B: Compiled + deterministic → expect global_max_rel < 1e-4

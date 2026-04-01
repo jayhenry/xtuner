@@ -31,11 +31,13 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 from mmengine.runner import set_random_seed
 
+from xtuner.v1.profiler.prober_utils import setup_prober_list
 from xtuner.v1.utils.misc import monkey_patch_hf_modules_cache
 
 
@@ -44,10 +46,18 @@ from xtuner.v1.utils.misc import monkey_patch_hf_modules_cache
 # ---------------------------------------------------------------------------
 
 def _make_model_config(num_hidden_layers: int = 4, compile: bool = True):
-    from xtuner.v1.model.moe.qwen3_5_text import Qwen3_5_VLTextMoE35BA3BConfig
-    cfg = Qwen3_5_VLTextMoE35BA3BConfig(num_hidden_layers=num_hidden_layers)
-    cfg.compile_cfg = compile  # match production: TORCH_COMPILE=1
-    return cfg
+    # from xtuner.v1.model.moe.qwen3_5_text import Qwen3_5_VLTextMoE35BA3BConfig
+    # cfg = Qwen3_5_VLTextMoE35BA3BConfig(num_hidden_layers=num_hidden_layers)
+    # cfg.compile_cfg = compile  # match production: TORCH_COMPILE=1
+
+    # xTODO: create qwen 3.5 VL whole model
+    from xtuner.v1.model.compose.qwen3_5 import Qwen3_5_VLMoE35BA3Config
+    moe_cfg = Qwen3_5_VLMoE35BA3Config()
+    moe_cfg.text_config.num_hidden_layers = num_hidden_layers
+    moe_cfg.text_config.ep_size = 1
+    moe_cfg.only_llm_forward = True
+    moe_cfg.compile_cfg = compile  # match production: TORCH_COMPILE=1
+    return moe_cfg
 
 
 def _build_fsdp_model(hf_path: str, num_hidden_layers: int = 4, reduce_dtype=torch.bfloat16,
@@ -75,7 +85,7 @@ def _run_forward_backward(model) -> dict[str, float]:
     LossCtx = loss_cfg.loss_ctx_cls
 
     rank = dist.get_rank()
-    vocab_size = model.config.vocab_size
+    vocab_size = model.config.text_config.vocab_size
 
     model.zero_grad()
     for micro in range(GRAD_ACCUM_STEPS):
@@ -265,6 +275,8 @@ def main():
             reduce_dtype=reduce_dtype,
             compile=compile_mode,
         )
+
+        setup_prober_list(Path(args.record_path)/'prober', [0, 1], model, ['AccProber'])
 
         if rank == 0:
             print("[numerics_test] running forward+backward ...")
