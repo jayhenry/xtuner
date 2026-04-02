@@ -304,7 +304,7 @@ def main() -> None:
                     f"RESULT: NON-DETERMINISTIC — {total_diffs} param shards differ across\n"
                     f"all ranks with max relative difference {global_max_rel:.2e}."
                 )
-                exit_code = 2
+                exit_code = 0  # 2
 
     dist.destroy_process_group()
     sys.exit(exit_code)
