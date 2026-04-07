@@ -21,25 +21,25 @@ OUT="/tmp/mha_determinism_fsdp_$$"
 mkdir -p "$OUT"
 echo "Output dir: $OUT  (NPROC=${NPROC})"
 
-SEQ_LEN1=${SEQ_LEN1:-"65535"}  #16383  # 32767  # 8191  # 65535
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " [A] Record ($SEQ_LEN1, FSDP + compile + deterministic)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-XTUNER_DETERMINISTIC=true $TORCHRUN "$SCRIPT" \
-    --record-path "$OUT/run_${SEQ_LEN1}_v1" \
-    --seq-len $SEQ_LEN1 \
-    --deterministic
-
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " [A] Compare (expect: deterministic)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-XTUNER_DETERMINISTIC=true $TORCHRUN "$SCRIPT" \
-    --record-path "$OUT/run_${SEQ_LEN1}_v2" \
-    --compare "$OUT/run_${SEQ_LEN1}_v1" \
-    --seq-len $SEQ_LEN1 \
-    --deterministic
+# SEQ_LEN1=${SEQ_LEN1:-"65535"}  #16383  # 32767  # 8191  # 65535
+# echo ""
+# echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# echo " [A] Record ($SEQ_LEN1, FSDP + compile + deterministic)"
+# echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# XTUNER_DETERMINISTIC=true $TORCHRUN "$SCRIPT" \
+#     --record-path "$OUT/run_${SEQ_LEN1}_v1" \
+#     --seq-len $SEQ_LEN1 \
+#     --deterministic
+# 
+# echo ""
+# echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# echo " [A] Compare (expect: deterministic)"
+# echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# XTUNER_DETERMINISTIC=true $TORCHRUN "$SCRIPT" \
+#     --record-path "$OUT/run_${SEQ_LEN1}_v2" \
+#     --compare "$OUT/run_${SEQ_LEN1}_v1" \
+#     --seq-len $SEQ_LEN1 \
+#     --deterministic
 
 SEQ_LEN2=${SEQ_LEN2:-"65536"}  # 16348  # 32768  # 8192  # 65536
 echo ""
@@ -60,6 +60,28 @@ XTUNER_DETERMINISTIC=true $TORCHRUN "$SCRIPT" \
     --compare "$OUT/run_${SEQ_LEN2}_v1" \
     --seq-len $SEQ_LEN2 \
     --deterministic
+
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo " [C] Record ($SEQ_LEN2, FSDP + compile + deterministic + no-inplace-buffers)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+XTUNER_DETERMINISTIC=true $TORCHRUN "$SCRIPT" \
+    --record-path "$OUT/run_${SEQ_LEN2}_v3" \
+    --seq-len $SEQ_LEN2 \
+    --deterministic \
+    --no-inplace-buffers
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo " [C] Compare (FULLY DETERMINISTIC)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+XTUNER_DETERMINISTIC=true $TORCHRUN "$SCRIPT" \
+    --record-path "$OUT/run_${SEQ_LEN2}_v4" \
+    --compare "$OUT/run_${SEQ_LEN2}_v3" \
+    --seq-len $SEQ_LEN2 \
+    --deterministic \
+    --no-inplace-buffers
 
 echo ""
 echo "Done. Per-rank JSON under: $OUT"

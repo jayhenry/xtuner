@@ -31,6 +31,8 @@ from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.model.moe.qwen3_5_text import Qwen3_5_VLTextMoE35BA3BConfig
 from xtuner.v1.module.rope.rope import get_rope_embedding
 
+import torch._inductor.config as inductor_cfg
+
 
 def _record_path_for_rank(base: str, rank: int) -> str:
     return f"{base}_rank{rank}.json"
@@ -155,7 +157,15 @@ def main() -> None:
         help="Load JSON from --record-path and compare to --compare (requires torchrun; no forward).",
     )
     parser.add_argument("--seed", type=int, default=0, help="Seed for init and per-rank input noise.")
+    parser.add_argument(
+        "--no-inplace-buffers",
+        action="store_true",
+        help="Disable TorchInductor inplace_buffers only (minimal fix candidate)",
+    )
     args = parser.parse_args()
+
+    if args.no_inplace_buffers:
+        inductor_cfg.inplace_buffers = False
 
     if args.skip_train and not args.compare:
         print("ERROR: --skip-train requires --compare", file=sys.stderr)
