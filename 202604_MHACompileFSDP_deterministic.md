@@ -1,184 +1,399 @@
-# MHA + torch.compile + FSDP2 Non-Determinism: Root Cause & Fix
+# MHA + torch.compile + FSDP2 Non-Determinism: Updated Findings
 
 ## Problem Statement
 
 Training with `torch.compile(mha, fullgraph=True)` + FSDP2 (multi-GPU) produces
-non-deterministic gradients across runs. Observed in Qwen3.5-35B-A3B MoE model.
+non-deterministic gradients across launches in the MHA path of
+`Qwen3_5_VLTextMoE35BA3BConfig`.
 
-**Empirical fingerprint (original observations):**
-- `--no-compile`: always deterministic
-- `NPROC=1`: always deterministic (compile or not)
-- `compile + NPROC>1 + seq_len=65535`: deterministic
-- `compile + NPROC>1 + seq_len=65536`: **NON-DETERMINISTIC**
-- Only `k_proj.weight.grad` affected — not `q_proj`, `v_proj`, `o_proj`, `q_norm`, `k_norm`
+**Stable fingerprint so far:**
+- `--no-compile`: deterministic
+- single-GPU: deterministic
+- `compile + multi-GPU + seq_len=65535`: deterministic in the existing repro
+- `compile + multi-GPU + seq_len=65536`: can become **NON-DETERMINISTIC**
+- the drift is concentrated in `k_proj.weight`
+
+The minimal mitigation is still:
+
+```python
+import torch._inductor.config as inductor_cfg
+inductor_cfg.inplace_buffers = False
+```
+
+That fix is confirmed. What changed is the confidence level of the mechanism below.
 
 ---
 
-## Root Cause
+## Current Best Explanation
 
-**TorchInductor `inplace_buffers=True` (default) + FSDP2 pre-backward all-gather = race condition.**
+The strongest evidence now points to:
 
-### Mechanism
+**TorchInductor `inplace_buffers=True` causes the compiled backward to mutate saved
+K-path activation storage in-place; under FSDP2 multi-GPU execution, that reuse
+becomes non-deterministic.**
 
-1. `torch.compile` compiles the MHA forward+backward into a TorchInductor graph.
-2. TorchInductor's memory planner (`inplace_buffers=True`) decides to **reuse the forward
-   input buffer for `k_proj.weight`** (the FSDP2 all-gather workspace) as a backward
-   intermediate tensor — e.g. the buffer holding `dk` or some reshape thereof.
-3. FSDP2's pre-backward hook simultaneously writes the **next all-gather of `k_proj.weight`**
-   into that same buffer, on a **separate CUDA stream**.
-4. The compiled backward reads/writes that buffer concurrently → race → non-deterministic
-   `k_proj.weight.grad`.
+What is solidly established:
 
-### Why only k_proj?
+1. `torch.compile` generates a buggy backward plan only in the problematic mode.
+2. In that buggy plan, the K-path backward reuses saved `mm_1` in-place.
+3. In the forward trace, that saved value corresponds to the `k_proj` matmul output.
+4. Setting `inplace_buffers=False` changes the reuse target from `mm_1` to `buf3`
+   and removes all backward `in_out_ptr*` kernels.
+5. With that change, the repro becomes deterministic again.
 
-TorchInductor's memory plan specifically aliases the k_proj buffer with a backward
-intermediate in the k-path. v_proj, q_proj, o_proj use a different plan (different
-tensor sizes or lifetimes in the compiled graph).
+What is **not** yet proven:
 
-### Why seq_len=65536 but not 65535?
+- We have **not** directly captured a runtime same-address alias between:
+  - the FSDP2 pre-backward all-gather buffer for `k_proj.weight`, and
+  - the compiled backward buffer that is reused in-place.
 
-At exactly `65536` (2^16), TorchInductor's heuristics pick a memory plan that aliases
-the k_proj all-gather buffer. At `65535` the sizes differ slightly, leading to a
-different plan that avoids the alias.
+So the older, stronger claim
 
-### Why only NPROC>1?
+> "FSDP2 all-gather writes the exact same GPU address that the compiled backward
+> reuses in-place"
 
-With a single rank, FSDP2 does not shard parameters → no all-gather → no concurrent
-write to the buffer.
+should currently be treated as an **unconfirmed hypothesis**, not as proven fact.
+
+---
+
+## What We Verified
+
+### 1. `inplace_buffers=False` is the real switch
+
+Using `tests/profiler/mha_determ.py`:
+
+- `compile + FSDP2 + seq_len=65536`: repeatedly non-deterministic
+- `compile + FSDP2 + seq_len=65536 + --no-inplace-buffers`: fully deterministic
+
+Using `tests/profiler/mha_backend_repro.py`:
+
+- `backend=fa2`: mostly non-deterministic across repeated compares
+- `backend=fake_attn`: also reproducible, but less frequently
+- `backend=fa2 + --no-inplace-buffers`: deterministic
+- `backend=fake_attn + --no-inplace-buffers`: deterministic
+
+This narrows the issue to **compiled inplace buffer reuse**, not to FA2 alone.
+
+### 2. FA2 is not required
+
+The earlier suspicion was:
+
+> remove FA2 or replace FA2 with fake attention -> no non-determinism
+
+That no longer holds as a general conclusion in this environment.
+
+Repeated sampling with `tests/profiler/mha_backend_repro.py` showed:
+
+- `backend=fa2`: 4/5 compare runs were non-deterministic
+- `backend=fake_attn`: 1/5 compare runs was non-deterministic. But I cannot reproduce it now for some reason.
+
+So FA2 is **not necessary** for the issue. It may still increase the trigger rate,
+but it is not the root switch.
+
+### 3. The key codegen difference is now explicit
+
+Using `tests/profiler/mha_fsdp_inplace_addr_demo.py`:
+
+- buggy mode:
+  - `in_out_ptr_count=6`
+  - `k_norm_reuse_source=mm_1`
+- fixed mode (`--no-inplace-buffers`):
+  - `in_out_ptr_count=0`
+  - `k_norm_reuse_source=buf3`
+
+This pattern was observed for both:
+
+- `--backend fa2`
+- `--backend fake_attn`
+
+So the backend changes the trigger probability, but both backends can hit the same
+compiled backward reuse shape.
+
+### 4. `mm_1` is the saved `k_proj` activation path
+
+From the forward trace:
+
+- `buf1` is the `k_proj` matmul output
+- that value is saved into backward as `mm_1`
+
+From the backward trace:
+
+- buggy mode reinterprets `mm_1` as the reuse target
+- fixed mode reinterprets `buf3` as the reuse target and keeps `mm_1` as an input
+
+So the most concrete phrasing today is:
+
+**buggy mode mutates saved K-path activation storage in-place during backward**
+
+rather than:
+
+**buggy mode is proven to mutate the FSDP weight all-gather buffer itself**
+
+### 5. FSDP2 is still part of the picture
+
+The issue still depends on FSDP2 multi-GPU execution:
+
+- single-GPU does not reproduce
+- FSDP2 pre-backward runs with separate communication streams
+- the nondeterminism only shows up in multi-rank compiled runs
+
+That strongly suggests FSDP2 concurrent activity is what makes the buggy reuse unsafe.
+But the exact storage alias between FSDP-managed buffers and the reused backward buffer
+has not been directly demonstrated yet.
+
+### 6. Pointer evidence is suggestive, but not sufficient
+
+The pointer probe shows:
+
+- FSDP2 pre-backward uses side streams (`all_gather_stream`, `all_gather_copy_in_stream`)
+- `k_proj.weight` often has
+  `pre_bwd_ptr == unsharded_accumulated_grad.data_ptr()`
+
+However, that particular pointer equality appears in both buggy and fixed modes, so it
+does **not** distinguish the failure mechanism by itself.
+
+We also tried to capture saved tensor addresses with
+`torch.autograd.graph.saved_tensors_hooks`, but we did **not** obtain a direct runtime
+pointer match between:
+
+- `k_proj.weight`'s FSDP pre-backward buffer, and
+- a saved forward tensor.
+
+So this remains an open gap.
+
+### 7. The existing race demo still hints at memory corruption
+
+Running `tests/profiler/demo_race_condition.py` in the buggy mode sometimes triggered
+an illegal memory access when reading `_unsharded_param` after backward.
+
+That supports "something around backward-time storage reuse is unsafe", but it still
+does not prove the exact same-address all-gather alias claim.
+
+---
+
+## Refined Mechanism
+
+The current best-supported mechanism is:
+
+1. `torch.compile` lowers MHA forward+backward into an Inductor graph.
+2. With `inplace_buffers=True`, Inductor chooses a backward plan that reuses saved
+   `mm_1` in-place on the K path.
+3. In the forward graph, that saved value comes from the `k_proj` matmul output.
+4. In multi-GPU FSDP2 runs, pre-backward communication happens on side CUDA streams.
+5. That combination makes the in-place backward reuse non-deterministic.
+6. Setting `inplace_buffers=False` forces a different plan:
+   - no backward `in_out_ptr*` kernels
+   - reuse source changes from `mm_1` to `buf3`
+   - determinism is restored
+
+This is strong evidence for an **Inductor memory-planning bug or unsupported aliasing
+assumption in the presence of FSDP2**, even though the exact storage collision is still
+not fully pinned down.
+
+---
+
+## Why The Existing Fingerprint Makes Sense
 
 ### Why only with compile?
 
-Eager PyTorch never reuses forward input buffers as backward intermediates.
+Because the problematic in-place reuse is introduced by TorchInductor codegen.
+Eager execution does not produce this compiled memory plan.
 
-### Investigation path (how we got here)
+### Why only multi-GPU / FSDP2?
 
-1. Verified FA2 `deterministic` flag IS passed correctly (monkey-patch probe).
-2. Verified FA2's dK/dV CUDA writes are non-atomic → FA2 kernel itself is deterministic.
-3. Verified `at::sum_out` for GQA group reduction is deterministic.
-4. Ruled out NCCL reduce-scatter (non-det persists with `--no-reduce-scatter`).
-5. Ruled out Triton RMSNorm autotuning (simple k_proj+k_norm without FA2 is deterministic
-   with proper seeding; the `@triton.autotune` result is persistent within a run).
-6. **Key experiment**: setting `torch._inductor.config.allow_buffer_reuse = False` AND
-   `inplace_buffers = False` → FULLY DETERMINISTIC.
-7. **Minimal fix confirmed**: `inplace_buffers = False` alone is sufficient.
+Because the failure seems to require FSDP2's pre-backward communication behavior.
+Single-GPU runs do not have the same sharded parameter orchestration and do not
+reproduce the issue.
+
+### Why `seq_len=65536` but not `65535` in the repro?
+
+The exact threshold is still best understood as **shape-dependent codegen / memory
+planning**. For the current environment:
+
+- `65536` consistently hits the buggy plan
+- `65535` does not in the same repro
+
+We should avoid overstating this as a universal TorchInductor heuristic beyond the
+tested version and shapes.
+
+### Why only `k_proj.weight`?
+
+The compiled backward reuse pattern we observed is on the **K path** specifically.
+That matches the empirical symptom that only `k_proj.weight` drifts.
 
 ---
 
 ## Fix
 
-**File**: `xtuner/v1/model/base.py`, method `_maybe_enable_compile` (around line 1789).
+The practical fix remains:
 
 ```python
-def _maybe_enable_compile(self, compile_cfg: dict[str, TorchCompileOption]):
-    if compile_cfg:
-        torch._dynamo.config.cache_size_limit = 256
-        # When the compiled forward/backward runs inside FSDP2-sharded modules,
-        # TorchInductor's `inplace_buffers` optimization causes a race condition:
-        # the compiled backward reuses a forward input buffer (the FSDP2 all-gather
-        # workspace for a parameter such as k_proj.weight) for a backward
-        # intermediate, while FSDP2's pre-backward all-gather simultaneously writes
-        # into that same buffer on a side CUDA stream.  The result is non-deterministic
-        # gradients (empirically observed in k_proj.weight.grad).
-        # Disabling inplace_buffers removes the aliasing and restores determinism.
-        import torch._inductor.config as inductor_cfg
-        inductor_cfg.inplace_buffers = False
-
-    for target, option in compile_cfg.items():
-        self._compile_overwrite(target, option)
+import torch._inductor.config as inductor_cfg
+inductor_cfg.inplace_buffers = False
 ```
 
-**The setting must be applied before `torch.compile` is called**, because TorchInductor
-bakes it into the compiled graph at first trace time.
+This must be set **before** `torch.compile(...)` runs, because Inductor bakes the
+decision into the generated graph during trace/compile time.
 
-### Alternative (more conservative, higher memory cost)
+### Recommended comment
+
+```python
+# When compiled modules run under FSDP2, TorchInductor's default
+# `inplace_buffers=True` can choose a backward memory plan that mutates saved
+# K-path activation storage in-place. In multi-GPU runs this has been observed to
+# cause non-deterministic `k_proj.weight` gradients. Disabling `inplace_buffers`
+# changes the generated backward plan and restores determinism.
+import torch._inductor.config as inductor_cfg
+inductor_cfg.inplace_buffers = False
+```
+
+### More conservative option
 
 ```python
 inductor_cfg.allow_buffer_reuse = False
 inductor_cfg.inplace_buffers = False
 ```
 
-`allow_buffer_reuse=False` additionally prevents reuse of intermediate buffers between
-ops, which is more aggressive but higher memory overhead. `inplace_buffers=False` alone
-is sufficient.
+This is more aggressive and may cost more memory. So far, `inplace_buffers=False`
+alone is sufficient.
 
 ---
 
-## Verification
+## Repro / Verification Commands
+
+Environment used in this investigation:
 
 ```bash
-export PYTHONPATH="./"
+source ~/.bashrc
+conda activate fla
+
+export PYTHONPATH=./
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export OMP_NUM_THREADS=1 XTUNER_USE_FA3=0
+export OMP_NUM_THREADS=1
+export XTUNER_USE_FA3=0
 export XTUNER_DETERMINISTIC=true
-export NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_NUM_CHANNELS=1
+export NCCL_ALGO=Ring
+export NCCL_PROTO=Simple
+export NCCL_NUM_CHANNELS=1
 export CUBLAS_WORKSPACE_CONFIG=:16:8
-
-TORCHRUN="torchrun --nproc-per-node 8 --master-port 29732"
-SCRIPT="tests/profiler/debug_nondeterminism.py"
-
-# Baseline: non-deterministic
-$TORCHRUN $SCRIPT --record-path /tmp/r1 --seq-len 65536 --deterministic
-$TORCHRUN $SCRIPT --record-path /tmp/r2 --seq-len 65536 --deterministic --compare /tmp/r1
-# → RESULT: NON-DETERMINISTIC — 7-8 param shards differ
-
-# Fixed (inplace_buffers=False):
-$TORCHRUN $SCRIPT --record-path /tmp/f1 --seq-len 65536 --deterministic --no-inplace-buffers
-$TORCHRUN $SCRIPT --record-path /tmp/f2 --seq-len 65536 --deterministic --no-inplace-buffers --compare /tmp/f1
-# → RESULT: FULLY DETERMINISTIC
 ```
+
+### Full MHA repro
+
+```bash
+bash tests/profiler/run_mha_determ.sh
+```
+
+Observed:
+
+- baseline `compile + FSDP2 + seq_len=65536`: non-deterministic
+- `--no-inplace-buffers`: fully deterministic
+
+### Backend comparison
+
+```bash
+torchrun --nproc-per-node 4 tests/profiler/mha_backend_repro.py \
+  --record-path /tmp/mha_backend_fa2_base \
+  --backend fa2 --seq-len 65536 --deterministic
+
+torchrun --nproc-per-node 4 tests/profiler/mha_backend_repro.py \
+  --record-path /tmp/mha_backend_fake_base \
+  --backend fake_attn --seq-len 65536 --deterministic
+```
+
+And then compare repeatedly against the baseline. Result:
+
+- `fa2`: reproduces frequently
+- `fake_attn`: also reproduces, but less frequently
+- both become deterministic with `--no-inplace-buffers`
+
+### Pointer + codegen probe
+
+```bash
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_inplace_addr_demo.py \
+  --backend fa2 --seq-len 65536 --deterministic \
+  --trace-dir /tmp/mha_addr_fa2_buggy
+
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_inplace_addr_demo.py \
+  --backend fa2 --seq-len 65536 --deterministic \
+  --no-inplace-buffers \
+  --trace-dir /tmp/mha_addr_fa2_fixed
+
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_inplace_addr_demo.py \
+  --backend fake_attn --seq-len 65536 --deterministic \
+  --trace-dir /tmp/mha_addr_fake_buggy
+
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_inplace_addr_demo.py \
+  --backend fake_attn --seq-len 65536 --deterministic \
+  --no-inplace-buffers \
+  --trace-dir /tmp/mha_addr_fake_fixed
+```
+
+Expected signature:
+
+- buggy:
+  - `in_out_ptr_count=6`
+  - `k_norm_reuse_source=mm_1`
+- fixed:
+  - `in_out_ptr_count=0`
+  - `k_norm_reuse_source=buf3`
 
 ---
 
-## Test Scripts
+## Investigation Scripts
 
 | File | Purpose |
 |------|---------|
-| `tests/profiler/debug_nondeterminism.py` | Full MHA (FA2 + all projections) non-determinism test. New flags: `--no-inplace-buffers`, `--no-buffer-reuse` |
-| `tests/profiler/run_debug_nondeterminism.sh` | Shell runner for the full MHA test |
-| `tests/profiler/debug_kproj_nondeterminism.py` | **New**: minimal reproducer — `k_proj + k_norm` only (no FA2). Confirms simple path is deterministic; FA2 interaction is needed to trigger the bug |
-| `tests/profiler/run_kproj_nondeterminism.sh` | **New**: shell runner for the minimal reproducer |
-
-### Key flag added to `debug_nondeterminism.py`
-
-```
---no-inplace-buffers   Sets torch._inductor.config.inplace_buffers = False (minimal fix)
---no-buffer-reuse      Sets both inplace_buffers=False and allow_buffer_reuse=False
-```
+| `tests/profiler/mha_determ.py` | Main compiled MHA determinism repro |
+| `tests/profiler/run_mha_determ.sh` | Shell runner for the main repro |
+| `tests/profiler/mha_backend_repro.py` | Same MHA wrapper path, but attention backend can be switched between `fa2` and `fake_attn` |
+| `tests/profiler/demo_race_condition.py` | Older pointer/race probe; can trigger illegal memory access in buggy mode |
+| `tests/profiler/mha_fsdp_inplace_addr_demo.py` | Updated backend-aware pointer + codegen probe for the current hypothesis |
 
 ---
 
-## Model Config Context
+## Model Context
 
 | Field | Value |
 |-------|-------|
 | Model | `Qwen3_5_VLTextMoE35BA3BConfig` |
 | `hidden_size` | 2048 |
 | `num_attention_heads` | 16 |
-| `num_key_value_heads` | 2 (GQA 8:1) |
+| `num_key_value_heads` | 2 |
 | `head_dim` | 256 |
-| `qk_norm` | True (Triton RMSNorm on Q and K) |
+| `qk_norm` | True |
 | `with_gate` | True |
 | `sliding_window` | 1024 |
 
-k_proj weight gradient matmul: `(512, seq_len) @ (seq_len, 2048)`.
-At seq_len=65536 the K dimension (65536 = 2^16) triggers the specific TorchInductor
-memory plan that aliases the buffer.
+The K-path shape is:
+
+- `k_proj`: `(seq_len, 2048) x (2048, 512) -> (seq_len, 512)`
+
+At `seq_len=65536`, the current PyTorch build consistently produces the problematic
+compiled plan in this repro.
 
 ---
 
-## Follow-up / Open Questions
+## Open Questions
 
-1. **Upstream bug report**: This is a genuine PyTorch bug — TorchInductor should not
-   alias an FSDP2-managed all-gather buffer with a backward intermediate. Worth reporting
-   to PyTorch with a minimal repro.
+1. Can we capture a **direct same-address runtime alias** between the FSDP2
+   pre-backward buffer and the in-place reused backward buffer?
 
-2. **Memory overhead of fix**: `inplace_buffers=False` increases peak activation memory
-   during the compiled backward. Measure the overhead on large runs.
+2. Is the exact unsafe interaction:
+   - true storage aliasing with an FSDP-managed buffer, or
+   - an ordering / lifetime bug around saved activation reuse under FSDP2?
 
-3. **Other models affected**: Any model using `torch.compile + FSDP2` with per-layer
-   compilation (e.g. `DenseDecoderLayer.forward`, `MoEBlock.forward`) could hit the same
-   race. The specific parameter affected depends on TorchInductor's memory plan.
+3. Why does FA2 increase the trigger rate relative to `fake_attn` in this env?
+   Is it only timing / stream pressure, or does FA2 also change layout/lifetime in a
+   way that makes the bad plan more likely to surface?
 
-4. **PyTorch version sensitivity**: Tested on the current env. The memory planning
-   heuristics may change across PyTorch versions, potentially making the bug appear/
-   disappear at different seq_len thresholds.
+4. How much peak memory does `inplace_buffers=False` cost in full training?
+
+5. Does a newer or older PyTorch version change:
+   - whether the bug reproduces,
+   - which parameter drifts,
+   - or the exact seq-len threshold that triggers the bad plan?
+
+6. This still looks worth reporting upstream as a PyTorch / Inductor + FSDP2 issue,
+   but the bug report should use the refined claim above rather than the stronger
+   unproven same-address statement.
