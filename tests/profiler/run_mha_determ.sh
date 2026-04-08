@@ -13,7 +13,7 @@ export OMP_NUM_THREADS=1
 # FA3 raises RuntimeError: Deterministic backward not supported for hdim 256.
 export XTUNER_USE_FA3=0
 
-NPROC="${NPROC:-8}"
+NPROC="${NPROC:-4}"
 TORCHRUN="torchrun --nproc-per-node ${NPROC} --master-port 29711"
 SCRIPT="tests/profiler/mha_determ.py"
 
@@ -49,7 +49,8 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 XTUNER_DETERMINISTIC=true $TORCHRUN "$SCRIPT" \
     --record-path "$OUT/run_${SEQ_LEN2}_v1" \
     --seq-len $SEQ_LEN2 \
-    --deterministic
+    --deterministic \
+    --keep-trace
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -59,7 +60,8 @@ XTUNER_DETERMINISTIC=true $TORCHRUN "$SCRIPT" \
     --record-path "$OUT/run_${SEQ_LEN2}_v2" \
     --compare "$OUT/run_${SEQ_LEN2}_v1" \
     --seq-len $SEQ_LEN2 \
-    --deterministic
+    --deterministic \
+    --keep-trace
 
 
 echo ""
@@ -70,7 +72,8 @@ XTUNER_DETERMINISTIC=true $TORCHRUN "$SCRIPT" \
     --record-path "$OUT/run_${SEQ_LEN2}_v3" \
     --seq-len $SEQ_LEN2 \
     --deterministic \
-    --no-inplace-buffers
+    --no-inplace-buffers \
+    --keep-trace
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -81,7 +84,8 @@ XTUNER_DETERMINISTIC=true $TORCHRUN "$SCRIPT" \
     --compare "$OUT/run_${SEQ_LEN2}_v3" \
     --seq-len $SEQ_LEN2 \
     --deterministic \
-    --no-inplace-buffers
+    --no-inplace-buffers \
+    --keep-trace
 
 echo ""
 echo "Done. Per-rank JSON under: $OUT"

@@ -19,7 +19,6 @@ import json
 import os
 import sys
 import time
-
 import torch
 import torch.distributed as dist
 from mmengine.runner import set_random_seed
@@ -32,6 +31,19 @@ from xtuner.v1.model.moe.qwen3_5_text import Qwen3_5_VLTextMoE35BA3BConfig
 from xtuner.v1.module.rope.rope import get_rope_embedding
 
 import torch._inductor.config as inductor_cfg
+
+
+def _configure_inductor_trace(trace_dir: str) -> None:
+    """Dump Inductor ``output_code.py`` under ``trace_dir/torchinductor/...`` (per compile)."""
+    os.makedirs(trace_dir, exist_ok=True)
+    inductor_cfg.trace.enabled = True
+    inductor_cfg.trace.debug_dir = trace_dir
+    inductor_cfg.trace.fx_graph = False
+    inductor_cfg.trace.fx_graph_transformed = False
+    inductor_cfg.trace.ir_pre_fusion = False
+    inductor_cfg.trace.ir_post_fusion = False
+    inductor_cfg.trace.output_code = True
+    inductor_cfg.force_disable_caches = True
 
 
 def _record_path_for_rank(base: str, rank: int) -> str:
@@ -162,6 +174,15 @@ def main() -> None:
         action="store_true",
         help="Disable TorchInductor inplace_buffers only (minimal fix candidate)",
     )
+    parser.add_argument(
+        "--keep-trace",
+        action="store_true",
+        help=(
+            "When compiling MHA, enable TorchInductor trace and write output_code under "
+            "<record-path>_inductor_trace_r<rank>/ (one directory per process). "
+            "No effect with --no-compile or --skip-train."
+        ),
+    )
     args = parser.parse_args()
 
     if args.no_inplace_buffers:
@@ -169,6 +190,10 @@ def main() -> None:
 
     if args.skip_train and not args.compare:
         print("ERROR: --skip-train requires --compare", file=sys.stderr)
+        sys.exit(2)
+
+    if args.keep_trace and args.skip_train:
+        print("ERROR: --keep-trace is not supported with --skip-train", file=sys.stderr)
         sys.exit(2)
 
     if args.deterministic:
@@ -220,6 +245,19 @@ def main() -> None:
                 f"[mha_determinism_minimal] skip_train  loaded {len(new_grads)} params in {time.time() - t0:.2f}s"
             )
     else:
+        if args.keep_trace and not compile_on:
+            if rank == 0:
+                print("[mha_determ] warning: --keep-trace ignored when --no-compile", file=sys.stderr)
+
+        if args.keep_trace and compile_on:
+            trace_dir = f"{args.record_path}_inductor_trace_r{rank}"
+            _configure_inductor_trace(trace_dir)
+            if rank == 0:
+                print(
+                    "[mha_determ] inductor trace enabled -> <record-path>_inductor_trace_r<R>  "
+                    f"(example rank0: {trace_dir})"
+                )
+
         rotary = get_rope_embedding(cfg, device=None)
         rotary = rotary.to(device=device)
 
