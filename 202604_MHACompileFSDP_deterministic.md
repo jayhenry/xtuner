@@ -29,8 +29,10 @@ That fix is confirmed. What changed is the confidence level of the mechanism bel
 The strongest evidence now points to:
 
 **TorchInductor `inplace_buffers=True` causes the compiled backward to mutate saved
-K-path activation storage in-place; under FSDP2 multi-GPU execution, that reuse
-becomes non-deterministic.**
+K-path activation storage in-place; this is the only switch that reliably removes
+the cross-launch non-determinism in the current repro. The remaining evidence says
+the failure still depends on multi-GPU FSDP2 execution, but the allocator-only
+explanation is not sufficient.**
 
 What is solidly established:
 
@@ -40,19 +42,37 @@ What is solidly established:
 4. Setting `inplace_buffers=False` changes the reuse target from `mm_1` to `buf3`
    and removes all backward `in_out_ptr*` kernels.
 5. With that change, the repro becomes deterministic again.
+6. Leaving `inplace_buffers=True` and merely synchronizing around FSDP2 hook
+   boundaries does **not** make the repro deterministic.
+7. Leaving `inplace_buffers=True` and switching only FSDP2 comm staging buffers to
+   the ProcessGroup allocator does **not** reliably make the repro deterministic.
+8. Leaving `inplace_buffers=True` and switching `all_gather_outputs` to the
+   ProcessGroup allocator also does **not** make the repro deterministic.
+9. Even switching both FSDP2 comm staging buffers and `all_gather_outputs` to the
+   ProcessGroup allocator together still does **not** make the repro deterministic.
+10. In the minimal validator repro, `compiled_autograd_enabled=False`, so this is
+   **not** specific to Traceable FSDP2 compiled-autograd.
 
 What is **not** yet proven:
 
 - We have **not** directly captured a runtime same-address alias between:
-  - the FSDP2 pre-backward all-gather buffer for `k_proj.weight`, and
+  - an FSDP2 communication staging buffer, and
   - the compiled backward buffer that is reused in-place.
 
 So the older, stronger claim
 
-> "FSDP2 all-gather writes the exact same GPU address that the compiled backward
-> reuses in-place"
+> "FSDP2 communication writes the exact same GPU address that the compiled
+> backward reuses in-place"
 
 should currently be treated as an **unconfirmed hypothesis**, not as proven fact.
+
+The other statement that should now also be treated as **incorrect / withdrawn** is:
+
+> "Moving FSDP2 buffers to the ProcessGroup allocator restores determinism"
+
+That was observed in one earlier run, but it does not hold up after rerunning the
+same cross-launch validator and after extending the validator to cover
+`all_gather_outputs`.
 
 ---
 
@@ -85,7 +105,8 @@ That no longer holds as a general conclusion in this environment.
 Repeated sampling with `tests/profiler/mha_backend_repro.py` showed:
 
 - `backend=fa2`: 4/5 compare runs were non-deterministic
-- `backend=fake_attn`: 1/5 compare runs was non-deterministic. But I cannot reproduce it now for some reason.
+- `backend=fake_attn`: 1/5 compare runs was non-deterministic, but recent reruns
+  have been less stable as evidence.
 
 So FA2 is **not necessary** for the issue. It may still increase the trigger rate,
 but it is not the root switch.
@@ -134,14 +155,58 @@ rather than:
 The issue still depends on FSDP2 multi-GPU execution:
 
 - single-GPU does not reproduce
-- FSDP2 pre-backward runs with separate communication streams
+- FSDP2 allocates comm staging buffers from the default CUDA caching allocator by
+  default (`torch.empty(...)`) and can optionally switch to the ProcessGroup allocator
+- FSDP2 pre-backward / post-backward use separate communication streams
 - the nondeterminism only shows up in multi-rank compiled runs
 
-That strongly suggests FSDP2 concurrent activity is what makes the buggy reuse unsafe.
-But the exact storage alias between FSDP-managed buffers and the reused backward buffer
-has not been directly demonstrated yet.
+That strongly suggests the unsafe interaction is between the compiled backward reuse
+and FSDP2's communication-buffer allocation/lifetime behavior. But the exact storage
+alias between an FSDP-managed buffer and the reused backward buffer has not been
+directly demonstrated yet.
 
-### 6. Pointer evidence is suggestive, but not sufficient
+### 6. Allocator experiments are informative, but not sufficient
+
+Using `tests/profiler/mha_fsdp_comm_overlap_validator.py` with cross-launch compare:
+
+- baseline:
+  - `inplace_buffers=True`
+  - FSDP2 comm buffers use the default CUDA caching allocator
+  - result: reproducibly non-deterministic across launches, only on `k_proj.weight`
+- `--use-process-group-allocator`:
+  - keeps `inplace_buffers=True`
+  - moves FSDP2 comm staging buffers to the ProcessGroup allocator
+  - result: still non-deterministic across launches
+- `--use-process-group-allocator-for-allgather-outputs`:
+  - keeps `inplace_buffers=True`
+  - moves `all_gather_outputs` to the ProcessGroup allocator
+  - result: still non-deterministic across launches
+- `--use-process-group-allocator --use-process-group-allocator-for-allgather-outputs`:
+  - keeps `inplace_buffers=True`
+  - moves both comm staging buffers and `all_gather_outputs` to the ProcessGroup allocator
+  - result: still non-deterministic across launches
+- `--sync-fsdp-hooks`:
+  - keeps `inplace_buffers=True`
+  - synchronizes CUDA after FSDP2 `pre_backward` / `post_backward`
+  - result: still non-deterministic across launches
+- `--no-inplace-buffers`:
+  - changes the compiled backward memory plan
+  - result: deterministic across launches
+
+This narrows the allocator claim substantially. It says:
+
+- the issue is **not** explained by hook-boundary synchronization alone
+- moving the currently identified FSDP-managed buffers to the ProcessGroup allocator
+  is **not** sufficient to restore determinism
+
+So the best current mechanism is no longer:
+
+**"Inductor's in-place reuse of saved `mm_1` becomes unsafe specifically because
+FSDP2 comm staging buffers come from the default CUDA caching allocator pool."**
+
+That allocator-only explanation is now too strong.
+
+### 7. Pointer evidence is suggestive, but not sufficient
 
 The pointer probe shows:
 
@@ -161,7 +226,7 @@ pointer match between:
 
 So this remains an open gap.
 
-### 7. The existing race demo still hints at memory corruption
+### 8. The existing race demo still hints at memory corruption
 
 Running `tests/profiler/demo_race_condition.py` in the buggy mode sometimes triggered
 an illegal memory access when reading `_unsharded_param` after backward.
@@ -179,16 +244,22 @@ The current best-supported mechanism is:
 2. With `inplace_buffers=True`, Inductor chooses a backward plan that reuses saved
    `mm_1` in-place on the K path.
 3. In the forward graph, that saved value comes from the `k_proj` matmul output.
-4. In multi-GPU FSDP2 runs, pre-backward communication happens on side CUDA streams.
-5. That combination makes the in-place backward reuse non-deterministic.
-6. Setting `inplace_buffers=False` forces a different plan:
+4. In multi-GPU FSDP2 runs, that backward plan becomes cross-launch
+   non-deterministic in the current repro.
+5. Setting `inplace_buffers=False` forces a different plan:
    - no backward `in_out_ptr*` kernels
    - reuse source changes from `mm_1` to `buf3`
    - determinism is restored
+6. Simply synchronizing around FSDP2 hook boundaries is **not** sufficient to remove
+   the nondeterminism, so this is not just a coarse "pre-backward overlap" issue.
+7. Moving FSDP2 comm staging buffers, `all_gather_outputs`, or both to the
+   ProcessGroup allocator is also **not** sufficient to remove the nondeterminism.
 
-This is strong evidence for an **Inductor memory-planning bug or unsupported aliasing
-assumption in the presence of FSDP2**, even though the exact storage collision is still
-not fully pinned down.
+This is strong evidence for an **Inductor memory-planning / alias-lifetime bug whose
+trigger requires the multi-GPU FSDP2 execution context**, but the exact offending
+buffer interaction is still unresolved. The data no longer supports the narrower
+claim that the bug is fully explained by default-allocator ownership of the known
+FSDP communication buffers.
 
 ---
 
@@ -202,8 +273,8 @@ Eager execution does not produce this compiled memory plan.
 ### Why only multi-GPU / FSDP2?
 
 Because the failure seems to require FSDP2's pre-backward communication behavior.
-Single-GPU runs do not have the same sharded parameter orchestration and do not
-reproduce the issue.
+Single-GPU runs do not have the same sharded parameter orchestration or FSDP2 comm
+staging buffers and do not reproduce the issue.
 
 ### Why `seq_len=65536` but not `65535` in the repro?
 
@@ -220,6 +291,12 @@ tested version and shapes.
 
 The compiled backward reuse pattern we observed is on the **K path** specifically.
 That matches the empirical symptom that only `k_proj.weight` drifts.
+
+### Why this is not just a compiled-autograd bug
+
+In the minimal validator repro, `compiled_autograd_enabled=False`, and the issue still
+reproduces across launches. So this is broader than the Traceable FSDP2
+compiled-autograd path.
 
 ---
 
@@ -256,6 +333,18 @@ inductor_cfg.inplace_buffers = False
 
 This is more aggressive and may cost more memory. So far, `inplace_buffers=False`
 alone is sufficient.
+
+### Experimental allocator toggles
+
+For local diagnosis, the validator now has FSDP2 allocator toggles for:
+
+- comm staging buffers
+- `all_gather_outputs`
+- both together
+
+Those toggles are still useful for narrowing hypotheses, but they should **not** be
+described as fixes. In the current environment, none of them restores cross-launch
+determinism reliably.
 
 ---
 
@@ -338,6 +427,86 @@ Expected signature:
   - `in_out_ptr_count=0`
   - `k_norm_reuse_source=buf3`
 
+### Allocator / overlap validator
+
+```bash
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
+  --seq-len 65536 --iters 1 --deterministic \
+  --record-path /tmp/mha_validator_base_a
+
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
+  --seq-len 65536 --iters 1 --deterministic \
+  --record-path /tmp/mha_validator_base_b \
+  --compare /tmp/mha_validator_base_a
+
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
+  --seq-len 65536 --iters 1 --deterministic \
+  --use-process-group-allocator \
+  --record-path /tmp/mha_validator_pg_a
+
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
+  --seq-len 65536 --iters 1 --deterministic \
+  --use-process-group-allocator \
+  --record-path /tmp/mha_validator_pg_b \
+  --compare /tmp/mha_validator_pg_a
+
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
+  --seq-len 65536 --iters 1 --deterministic \
+  --use-process-group-allocator-for-allgather-outputs \
+  --record-path /tmp/mha_validator_pg_agout_a
+
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
+  --seq-len 65536 --iters 1 --deterministic \
+  --use-process-group-allocator-for-allgather-outputs \
+  --record-path /tmp/mha_validator_pg_agout_b \
+  --compare /tmp/mha_validator_pg_agout_a
+
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
+  --seq-len 65536 --iters 1 --deterministic \
+  --use-process-group-allocator \
+  --use-process-group-allocator-for-allgather-outputs \
+  --record-path /tmp/mha_validator_pg_both_a
+
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
+  --seq-len 65536 --iters 1 --deterministic \
+  --use-process-group-allocator \
+  --use-process-group-allocator-for-allgather-outputs \
+  --record-path /tmp/mha_validator_pg_both_b \
+  --compare /tmp/mha_validator_pg_both_a
+
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
+  --seq-len 65536 --iters 1 --deterministic \
+  --sync-fsdp-hooks \
+  --record-path /tmp/mha_validator_sync_a
+
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
+  --seq-len 65536 --iters 1 --deterministic \
+  --sync-fsdp-hooks \
+  --record-path /tmp/mha_validator_sync_b \
+  --compare /tmp/mha_validator_sync_a
+
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
+  --seq-len 65536 --iters 1 --deterministic \
+  --no-inplace-buffers \
+  --record-path /tmp/mha_validator_no_inplace_a
+
+torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
+  --seq-len 65536 --iters 1 --deterministic \
+  --no-inplace-buffers \
+  --record-path /tmp/mha_validator_no_inplace_b \
+  --compare /tmp/mha_validator_no_inplace_a
+```
+
+Observed:
+
+- baseline: cross-launch **NON-DETERMINISTIC**, only `_orig_mod.k_proj.weight` drifts
+- `--use-process-group-allocator`: cross-launch **NON-DETERMINISTIC**
+- `--use-process-group-allocator-for-allgather-outputs`: cross-launch **NON-DETERMINISTIC**
+- `--use-process-group-allocator --use-process-group-allocator-for-allgather-outputs`:
+  cross-launch **NON-DETERMINISTIC**
+- `--sync-fsdp-hooks`: cross-launch **NON-DETERMINISTIC**
+- `--no-inplace-buffers`: cross-launch **DETERMINISTIC**
+
 ---
 
 ## Investigation Scripts
@@ -349,6 +518,7 @@ Expected signature:
 | `tests/profiler/mha_backend_repro.py` | Same MHA wrapper path, but attention backend can be switched between `fa2` and `fake_attn` |
 | `tests/profiler/demo_race_condition.py` | Older pointer/race probe; can trigger illegal memory access in buggy mode |
 | `tests/profiler/mha_fsdp_inplace_addr_demo.py` | Updated backend-aware pointer + codegen probe for the current hypothesis |
+| `tests/profiler/mha_fsdp_comm_overlap_validator.py` | Cross-launch validator for allocator-vs-overlap hypotheses (`PG allocator`, `all_gather_outputs`, hook sync, `no-inplace-buffers`) |
 
 ---
 
@@ -376,12 +546,13 @@ compiled plan in this repro.
 
 ## Open Questions
 
-1. Can we capture a **direct same-address runtime alias** between the FSDP2
-   pre-backward buffer and the in-place reused backward buffer?
+1. Can we capture a **direct same-address runtime alias** between the in-place
+   reused backward buffer and any FSDP-managed storage that is live in the failing run?
 
 2. Is the exact unsafe interaction:
-   - true storage aliasing with an FSDP-managed buffer, or
-   - an ordering / lifetime bug around saved activation reuse under FSDP2?
+   - true storage aliasing with some FSDP-managed buffer,
+   - an allocator event / lifetime bug around saved activation reuse,
+   - or a different cross-stream lifetime bug entirely?
 
 3. Why does FA2 increase the trigger rate relative to `fake_attn` in this env?
    Is it only timing / stream pressure, or does FA2 also change layout/lifetime in a
@@ -394,6 +565,12 @@ compiled plan in this repro.
    - which parameter drifts,
    - or the exact seq-len threshold that triggers the bad plan?
 
-6. This still looks worth reporting upstream as a PyTorch / Inductor + FSDP2 issue,
-   but the bug report should use the refined claim above rather than the stronger
-   unproven same-address statement.
+6. Would moving additional FSDP-owned buffers, or changing how their lifetime is
+   modeled across streams, alter the result? Current partial allocator experiments
+   say "not enough yet", but they do not rule out a broader FSDP-side mitigation.
+
+7. This still looks worth reporting upstream as a PyTorch / Inductor + FSDP2 issue,
+   but the bug report should use the refined claim above rather than either of these
+   stronger statements:
+   - "the exact same GPU address is proven to collide"
+   - "moving known FSDP buffers to the ProcessGroup allocator fixes it"
