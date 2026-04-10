@@ -1,4 +1,4 @@
-# MHA + torch.compile + FSDP2 Non-Determinism: Root Cause Found ✓
+# MHA + torch.compile + FSDP2 Non-Determinism: Investigation In Progress
 
 ## Problem Statement
 
@@ -13,26 +13,46 @@ non-deterministic gradients across launches in the MHA path of
 - `compile + multi-GPU + seq_len=65536`: **NON-DETERMINISTIC**
 - the drift is concentrated in `k_proj.weight`
 
-The fix:
+The fix (empirically validated):
 
 ```python
 import torch._inductor.config as inductor_cfg
 inductor_cfg.inplace_buffers = False
 ```
 
-This fix is confirmed and the **root cause is now fully identified**.
+The fix is confirmed to work. **The exact root cause mechanism is still under investigation.**
 
 ---
 
-## Root Cause — CONFIRMED
+## Current Best Guess for Root Cause
 
-**A cross-stream memory race between the FSDP2 reduce-scatter (COMM stream) and the
-compiled backward's `o_proj` matmul (stream0), triggered specifically when
-`inplace_buffers=True` causes `buf24` to alias `mm_1`'s storage.**
+**A cross-stream race involving FSDP2 reduce-scatter (COMM stream) and the compiled
+backward (stream0), triggered when `inplace_buffers=True` causes unsafe buffer reuse
+in the compiled backward plan.**
 
-### Exact race sequence (BUGGY mode)
+### What we know for certain
 
-The compiled backward (`output_code.py`, key lines):
+1. `inplace_buffers=True` causes the compiled backward to reuse `mm_1`'s storage
+   as `buf24` (the k-norm computation buffer).
+2. `del buf24` at line 909 of the compiled backward frees that storage block.
+3. After `del buf24`, FSDP2 fires `reduce_scatter` asynchronously on the COMM stream.
+4. The RS INPUT (`reduce_scatter_input`) is **non-deterministic between launches**
+   (confirmed by `mha_flatgrad_nosync_probe.py`: 3418/27M elements differ, max_diff=2.0).
+5. Without `inplace_buffers=True`, this non-determinism disappears.
+6. `sync after RS` (serializing COMM stream and stream0) restores determinism.
+
+### What remains uncertain
+
+The **exact memory aliasing pattern** that creates the race has not been confirmed:
+
+- The original hypothesis was: RS output ↔ mm_1's freed address → race with stream0.
+  **This was disproved** by CUDA memory history probe (`mha_buf29_rs_overlap_probe.py`):
+  RS output (26 MB float32) is NEVER allocated at `addr_mm1`. Instead, the 32 MB alloc
+  at `addr_mm1` is `q_proj.weight.grad` (bf16), not the RS output.
+- The RS INPUT (`reduce_scatter_input`) is non-deterministic. The mechanism by which
+  `inplace_buffers=True` causes this non-determinism in the RS input is not yet pinned.
+
+### Compiled backward structure (key lines)
 
 ```python
 # line 866: buf24 = mm_1 storage reused in-place (addr_mm1, 64 MB)
@@ -48,32 +68,29 @@ extern_kernels.mm(reinterpret_tensor(buf24, (512, 65536), (1, 512), 0), view, ou
 # line 909: buf24/mm_1 storage FREED — addr_mm1 returned to CUDA allocator
 del buf24
 
-# ← AccumulateGrad fires here: buf25 accumulated, then FSDP2 triggers
-#   reduce_scatter on the COMM stream (async, not synced with stream0)
-#   RS output buffer allocation happens on COMM stream → may get addr_mm1
+# ← FSDP2 triggers reduce_scatter on COMM stream (async)
+# ← stream0 continues with o_proj gradient computation
 
-# line 912: buf29 allocated for o_proj gradient (32 MB, stream0)
+# line 912: buf29 for o_proj gradient (32 MB, stream0)
 buf29 = empty_strided_cuda((8192, 2048), (2048, 1), torch.bfloat16)
-#   → CUDA caching allocator may also give addr_mm1 to stream0
 
 # line 914: o_proj.weight.grad matmul writes into buf29
 extern_kernels.mm(reinterpret_tensor(buf28, (8192, 65536), (1, 8192), 0), view, out=buf29)
 ```
 
-**The race:** After `del buf24` (line 909) frees `addr_mm1` (64 MB) to the CUDA
-caching allocator, two concurrent allocations compete for that block:
+**Observed address reuse (from CUDA memory history probe):**
+- `addr_mm1` (64 MB) freed at line 909
+- `q_proj.weight.grad` (32 MB bf16) allocated at `addr_mm1` on stream0
+- RS output (26 MB float32) allocated from a **different** CUDA segment — no alias with `addr_mm1`
 
-1. **COMM stream**: FSDP2 reduce-scatter output allocation for k_proj shard (~1 MB)
-2. **stream0**: `buf29` allocation for o_proj matmul (32 MB)
-
-If both allocations receive the same or overlapping address region, the RS write on
-the COMM stream races with the o_proj matmul write on stream0. The result: the
-accumulated k_proj.weight.grad and/or o_proj.weight.grad become
-**non-deterministically corrupted** depending on which stream wins the timing race.
+**Current best guess for the race:** The non-determinism in the RS INPUT may arise
+from a race between stream0 (writing the unsharded param grads that `chunk_cat` reads
+to build `reduce_scatter_input`) and some COMM stream operation that writes to an
+overlapping address. The exact address pair has not been captured.
 
 ### Why `inplace_buffers=False` fixes it
 
-With `inplace_buffers=False`, the backward plan is:
+With `inplace_buffers=False`, the backward plan changes:
 
 ```python
 # line 865: buf24 = buf3 storage (NOT mm_1) — buf3 lives until here
@@ -87,9 +104,8 @@ triton_red_fused__to_copy_add_clone_div_mul_pow_sum_5.run(buf11, primals_6, mm_1
 del mm_1
 ```
 
-Now `del buf24` (line 909) frees `addr_buf3` (not `addr_mm1`). The RS output and
-`buf29` compete for a **different address range**, and the specific collision pattern
-that triggers the race does not occur.
+Now `del buf24` frees `addr_buf3` (not `addr_mm1`), changing the allocator dynamics
+enough to prevent the race.
 
 ### Required conditions (all four must be true)
 
@@ -102,18 +118,7 @@ that triggers the race does not occur.
 
 - **`reshard_after_forward=False`**: no pre-backward all-gather → no RS inside backward → no race
 - **`world_size=1`**: RS is a no-op (no actual NCCL transfer), never fires asynchronously
-- **`sync after RS`**: serializes the COMM stream and stream0, preventing the concurrent allocation race
-
-### Data integrity probe results
-
-Probed `mm_1` data at pack time (forward) and unpack time (backward) across two launches:
-
-- `mm_1` at pack time: **IDENTICAL** (n_differ=0/33554432 on all 4 ranks)
-- `mm_1` at unpack time: **IDENTICAL** (n_differ=0/33554432 on all 4 ranks)
-- `k_proj.weight.grad`: **DIFFERS** (120–187 elements, max_abs_diff=0.5–2.0)
-
-This confirms: `mm_1` is **not** itself corrupted. The race corrupts the gradient
-**after** `mm_1` is consumed (at line 908–914), not before.
+- **`sync after RS`**: serializes the COMM stream and stream0, preventing the concurrent race
 
 ---
 
@@ -226,8 +231,8 @@ Tested `tests/profiler/test_rs_sync.py` with four sync modes:
 | `both` | AG + RS | **DETERMINISTIC** |
 
 `sync after RS` serializes the COMM stream with stream0, preventing the concurrent
-write to the freed `addr_mm1` block. `sync after AG` alone is insufficient — the AG
-timing is not the source of the race.
+race. `sync after AG` alone is insufficient — the AG timing is not the source of the
+race.
 
 This is the **key confirmatory experiment**: the reduce-scatter (fired asynchronously
 on the COMM stream inside the compiled backward) is the race partner.
@@ -322,62 +327,90 @@ an illegal memory access when reading `_unsharded_param` after backward.
 That supports "something around backward-time storage reuse is unsafe", but it still
 does not prove the exact same-address all-gather alias claim.
 
----
+### 12. RS output does NOT alias mm_1 — original hypothesis disproved
 
-## Confirmed Mechanism
+Probed RS output and buf29 (o_proj gradient) addresses with CUDA memory history
+(`tests/profiler/mha_buf29_rs_overlap_probe.py`, `tests/profiler/mha_rs_buf29_addr_probe.py`):
 
-1. `torch.compile` lowers MHA forward+backward into an Inductor graph.
-2. With `inplace_buffers=True`, Inductor chooses a backward plan that reuses saved
-   `mm_1` (the k_proj output) in-place as `buf24`.
-3. The compiled backward computes the k_proj.weight gradient using `buf24`, then
-   frees `buf24` (and thus `addr_mm1`) at line 909.
-4. At this point, AccumulateGrad fires for k_proj, which triggers FSDP2's
-   `reduce_scatter` **asynchronously on the COMM stream**.
-5. The COMM stream's RS output buffer allocation and stream0's next allocation
-   (`buf29` for o_proj grad, 32 MB) both compete for `addr_mm1`.
-6. The resulting concurrent writes corrupt o_proj.weight.grad or k_proj.weight.grad
-   non-deterministically depending on timing.
-7. Adding `torch.cuda.synchronize()` after the RS (serializing COMM stream and
-   stream0) eliminates the race and restores full determinism.
-8. Setting `inplace_buffers=False` causes `del buf24` to free `addr_buf3` (not
-   `addr_mm1`), preventing the specific collision pattern.
+- RS output (26 MB float32) comes from a **fresh CUDA segment**, never allocated at `addr_mm1`
+- The 32 MB allocation at `addr_mm1` (after it is freed at line 909) is
+  **q_proj.weight.grad** (bf16), not o_proj or the RS output
+- RS output and all param grad buffers are in completely separate address ranges
 
----
+This rules out the original specific mechanism:
+> "COMM stream RS output and stream0 buf29 both race to get addr_mm1"
 
-## Why The Existing Fingerprint Makes Sense
+The address aliasing is partial (q_proj.weight.grad lands at addr_mm1), but the
+previously hypothesized RS-output ↔ addr_mm1 collision was not observed.
 
-### Why only with compile?
+### 13. RS INPUT is non-deterministic — flat_grad race confirmed
 
-Because the problematic in-place reuse is introduced by TorchInductor codegen.
-Eager execution does not produce this compiled memory plan.
+Probed the RS input (`reduce_scatter_input`) at the moment RS fires, WITHOUT
+synchronizing stream0 first (`tests/profiler/mha_flatgrad_nosync_probe.py`):
 
-### Why only multi-GPU / FSDP2?
+- Cross-launch: **n_differ=3418/27M, max_diff=2.0** → RS INPUT DIFFERS between launches
+- This is the `reduce_scatter_input` buffer built by `chunk_cat` from unsharded param grads
 
-Because the failure seems to require FSDP2's pre-backward communication behavior.
-Single-GPU runs do not have the same sharded parameter orchestration or FSDP2 comm
-staging buffers and do not reproduce the issue.
+Control with synchronize() before clone
+(`tests/profiler/mha_flatgrad_at_rs_probe.py`):
 
-### Why `seq_len=65536` but not `65535` in the repro?
+- Cross-launch flat_grad: **IDENTICAL** (sync forces stream0 to complete → race masked)
+- Cross-launch k_proj.weight.grad: still DIFFERS by ~287 elements (NCCL float32 non-determinism)
 
-The exact threshold is still best understood as **shape-dependent codegen / memory
-planning**. For the current environment:
+This confirms: **the RS input is non-deterministic due to a cross-stream race with
+stream0 at RS fire time**. Synchronizing stream0 before RS reads the RS input
+eliminates the non-determinism.
 
-- `65536` consistently hits the buggy plan
-- `65535` does not in the same repro
+### 14. FSDP2 backward workflow — RS triggered by RegisterPostBackwardFunction
 
-We should avoid overstating this as a universal TorchInductor heuristic beyond the
-tested version and shapes.
+Examined FSDP2 source with `compiled_autograd=False` and `skip_fsdp_hooks=True` (default):
 
-### Why only `k_proj.weight`?
+**Code path:**
 
-The compiled backward reuse pattern we observed is on the **K path** specifically.
-That matches the empirical symptom that only `k_proj.weight` drifts.
+`_fsdp_param_group.py:585` `_register_post_backward_hook()`:
+```python
+# (not skip_fsdp_hooks) or compiled_autograd_enabled() = False or False = False
+# → RegisterPostBackwardFunction IS registered at module input
+inp_tensors = RegisterPostBackwardFunction.apply(self, *inp_tensors)  # line 605
+```
 
-### Why this is not just a compiled-autograd bug
+`_fsdp_param_group.py:766` `RegisterPostBackwardFunction.backward`:
+```python
+def backward(ctx, *grads):
+    ctx.param_group.post_backward()   # triggers RS
+    return grads
+```
 
-In the minimal validator repro, `compiled_autograd_enabled=False`, and the issue still
-reproduces across launches. So this is broader than the Traceable FSDP2
-compiled-autograd path.
+`_fsdp_param_group.py:391` `post_backward()` → `_fsdp_collectives.py:376` `foreach_reduce()`:
+```python
+foreach_reduce_scatter_copy_in(unsharded_grads, reduce_scatter_input, world_size)  # line 445
+# chunk_cat on stream0: packs unsharded_grads into reduce_scatter_input
+
+current_stream = device_handle.current_stream()  # = stream0
+reduce_scatter_stream.wait_stream(current_stream)  # line 449: GPU sync — RS waits for stream0
+
+with device_handle.stream(reduce_scatter_stream):
+    dist.reduce_scatter_tensor(output=reduce_output, input=reduce_scatter_input, ...)  # line 461
+```
+
+**CPU event order (from `mha_accgrad_order_probe.py`):**
+```
+[0] RS_FIRE
+[1] ACCUM_DONE(q_proj)
+[2] ACCUM_DONE(k_proj)
+...
+```
+
+RS fires on CPU at [0], BEFORE AccumulateGrad Python post-hooks at [1–6]. This is
+because `RegisterPostBackwardFunction` is at module input level in the autograd graph,
+and fires before AccumulateGrad Python hooks in the CPU-side event order.
+
+**Implication for the race:** `reduce_scatter_stream.wait_stream(stream0)` ensures RS
+starts AFTER `chunk_cat` finishes on stream0. But if the unsharded param grads being
+read by `chunk_cat` are themselves being written concurrently by stream0 operations
+enqueued AFTER `chunk_cat` (due to the inplace buffer aliasing changing the GPU memory
+layout), the `wait_stream` guarantee is insufficient to prevent a race on the actual
+data.
 
 ---
 
@@ -396,14 +429,15 @@ decision into the generated graph during trace/compile time.
 ### Recommended comment
 
 ```python
-# Root cause: TorchInductor's `inplace_buffers=True` causes the compiled backward
-# to reuse the k_proj saved activation (mm_1) in-place as buf24. After buf24 is
-# freed at the end of the k_proj gradient computation (line 909), FSDP2 fires
-# reduce_scatter asynchronously on the COMM stream while stream0 simultaneously
-# allocates buf29 for the o_proj gradient. Both allocations may get the same freed
-# address (addr_mm1), creating a concurrent write race that corrupts gradients
-# non-deterministically. Disabling inplace_buffers changes the backward plan so
-# that buf24 aliases buf3 (not mm_1), preventing the collision pattern.
+# Workaround for a non-determinism bug with FSDP2 + torch.compile(fullgraph=True):
+# TorchInductor's `inplace_buffers=True` generates a backward plan that reuses the
+# k_proj saved activation (mm_1) in-place as buf24. After buf24 is freed mid-backward,
+# FSDP2's reduce_scatter fires asynchronously on the COMM stream while stream0
+# continues writing param gradients. This creates a cross-stream race that corrupts
+# the RS input (reduce_scatter_input) non-deterministically.
+# Setting inplace_buffers=False changes the backward memory plan (buf24 aliases buf3
+# instead of mm_1), preventing the race. The exact aliasing collision is still under
+# investigation; the fix is empirically validated.
 import torch._inductor.config as inductor_cfg
 inductor_cfg.inplace_buffers = False
 ```
@@ -511,6 +545,40 @@ Expected signature:
   - `in_out_ptr_count=0`
   - `k_norm_reuse_source=buf3`
 
+### RS input / flat_grad race probes
+
+```bash
+# Probe A: capture RS input WITHOUT syncing stream0 (shows the actual race)
+PYTHONPATH=. XTUNER_DETERMINISTIC=true torchrun --nproc-per-node 4 \
+  tests/profiler/mha_flatgrad_nosync_probe.py --save-dir /tmp/flatgrad_nosync_a
+
+PYTHONPATH=. XTUNER_DETERMINISTIC=true torchrun --nproc-per-node 4 \
+  tests/profiler/mha_flatgrad_nosync_probe.py \
+  --save-dir /tmp/flatgrad_nosync_b --compare /tmp/flatgrad_nosync_a
+
+# Expected: n_differ > 0 (non-deterministic RS input)
+
+# Probe B: capture RS input WITH sync (masks the race)
+PYTHONPATH=. XTUNER_DETERMINISTIC=true torchrun --nproc-per-node 4 \
+  tests/profiler/mha_flatgrad_at_rs_probe.py --save-dir /tmp/flatgrad_sync_a
+
+PYTHONPATH=. XTUNER_DETERMINISTIC=true torchrun --nproc-per-node 4 \
+  tests/profiler/mha_flatgrad_at_rs_probe.py \
+  --save-dir /tmp/flatgrad_sync_b --compare /tmp/flatgrad_sync_a
+
+# Expected: flat_grad IDENTICAL (sync hides race); k_proj.weight.grad still DIFFERS
+```
+
+### AccumulateGrad order probe
+
+```bash
+# Show CPU event order: RS_FIRE vs ACCUM_DONE per param
+PYTHONPATH=. XTUNER_DETERMINISTIC=true torchrun --nproc-per-node 4 \
+  tests/profiler/mha_accgrad_order_probe.py
+
+# Expected: RS_FIRE at [0], ACCUM_DONE(q/k/v/o_proj) at [1]-[6]
+```
+
 ### Allocator / overlap validator
 
 ```bash
@@ -523,62 +591,7 @@ torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
   --record-path /tmp/mha_validator_base_b \
   --compare /tmp/mha_validator_base_a
 
-torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
-  --seq-len 65536 --iters 1 --deterministic \
-  --use-process-group-allocator \
-  --record-path /tmp/mha_validator_pg_a
-
-torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
-  --seq-len 65536 --iters 1 --deterministic \
-  --use-process-group-allocator \
-  --record-path /tmp/mha_validator_pg_b \
-  --compare /tmp/mha_validator_pg_a
-
-torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
-  --seq-len 65536 --iters 1 --deterministic \
-  --use-process-group-allocator-for-allgather-outputs \
-  --record-path /tmp/mha_validator_pg_agout_a
-
-torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
-  --seq-len 65536 --iters 1 --deterministic \
-  --use-process-group-allocator-for-allgather-outputs \
-  --record-path /tmp/mha_validator_pg_agout_b \
-  --compare /tmp/mha_validator_pg_agout_a
-
-torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
-  --seq-len 65536 --iters 1 --deterministic \
-  --use-process-group-allocator \
-  --use-process-group-allocator-for-allgather-outputs \
-  --record-path /tmp/mha_validator_pg_both_a
-
-torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
-  --seq-len 65536 --iters 1 --deterministic \
-  --use-process-group-allocator \
-  --use-process-group-allocator-for-allgather-outputs \
-  --record-path /tmp/mha_validator_pg_both_b \
-  --compare /tmp/mha_validator_pg_both_a
-
-torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
-  --seq-len 65536 --iters 1 --deterministic \
-  --sync-fsdp-hooks \
-  --record-path /tmp/mha_validator_sync_a
-
-torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
-  --seq-len 65536 --iters 1 --deterministic \
-  --sync-fsdp-hooks \
-  --record-path /tmp/mha_validator_sync_b \
-  --compare /tmp/mha_validator_sync_a
-
-torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
-  --seq-len 65536 --iters 1 --deterministic \
-  --no-inplace-buffers \
-  --record-path /tmp/mha_validator_no_inplace_a
-
-torchrun --nproc-per-node 4 tests/profiler/mha_fsdp_comm_overlap_validator.py \
-  --seq-len 65536 --iters 1 --deterministic \
-  --no-inplace-buffers \
-  --record-path /tmp/mha_validator_no_inplace_b \
-  --compare /tmp/mha_validator_no_inplace_a
+# (and variants with --use-process-group-allocator, --sync-fsdp-hooks, --no-inplace-buffers)
 ```
 
 Observed:
@@ -598,18 +611,24 @@ Observed:
 | File | Purpose |
 |------|---------|
 | `tests/profiler/mha_determ.py` | Main compiled MHA determinism repro |
-| `tests/profiler/run_mha_determ.sh` | Shell runner for the main repro |
-| `tests/profiler/mha_backend_repro.py` | Same MHA wrapper path, but attention backend can be switched between `fa2` and `fake_attn` |
+| `tests/profiler/mha_backend_repro.py` | Same MHA wrapper path; attention backend switchable between `fa2` and `fake_attn` |
 | `tests/profiler/demo_race_condition.py` | Older pointer/race probe; can trigger illegal memory access in buggy mode |
-| `tests/profiler/mha_fsdp_inplace_addr_demo.py` | Updated backend-aware pointer + codegen probe for the current hypothesis |
-| `tests/profiler/mha_fsdp_comm_overlap_validator.py` | Cross-launch validator for allocator-vs-overlap hypotheses (`PG allocator`, `all_gather_outputs`, hook sync, `no-inplace-buffers`) |
+| `tests/profiler/mha_fsdp_inplace_addr_demo.py` | Backend-aware pointer + codegen probe; shows `k_norm_reuse_source=mm_1` vs `buf3` |
+| `tests/profiler/mha_fsdp_comm_overlap_validator.py` | Cross-launch validator for allocator-vs-overlap hypotheses |
 | `tests/profiler/mha_pre_rs_grad_probe.py` | Captures pre-reduce_scatter gradient data to determine if non-determinism is local or NCCL-introduced |
-| `tests/profiler/mha_mm1_data_probe.py` | Captures mm_1 data at both forward-save and backward-retrieve time; confirms mm_1 is IDENTICAL but k_proj.weight.grad DIFFERS |
+| `tests/profiler/mha_mm1_data_probe.py` | Captures mm_1 data at forward-save and backward-retrieve time; confirms mm_1 IDENTICAL, k_proj.weight.grad DIFFERS |
 | `tests/profiler/mha_combined_addr_probe.py` | Combined mm_1 + RS address capture; checks for address overlap within and across launches |
-| `tests/profiler/mha_ag_alias_probe.py` | Probes all-gather output addresses vs mm_1; confirms AG output does NOT overlap mm_1 |
-| `/tmp/test_no_reshard.py` | Tests 4 combinations of inplace_buffers × reshard_after_forward; confirms both must be True to trigger bug |
-| `/tmp/test_ag_sync.py` | Tests sync after all-gather; confirms AG timing is NOT the race source |
-| `/tmp/test_rs_sync.py` | Tests sync after reduce-scatter; confirms RS on COMM stream IS the race partner (sync → deterministic) |
+| `tests/profiler/mha_ag_alias_probe.py` | Probes AG output addresses vs mm_1; confirms AG output does NOT overlap mm_1 |
+| `tests/profiler/mha_mm1_alias_probe.py` | Additional mm_1 aliasing probe |
+| `tests/profiler/mha_buf29_rs_overlap_probe.py` | CUDA memory history probe; confirms RS output does NOT alias mm_1; identifies q_proj.weight.grad at addr_mm1 |
+| `tests/profiler/mha_rs_buf29_addr_probe.py` | Probes RS output address vs buf29 (o_proj grad); confirms no overlap |
+| `tests/profiler/mha_flatgrad_nosync_probe.py` | Captures RS input WITHOUT stream0 sync; confirms RS input is non-deterministic (3418/27M differ) |
+| `tests/profiler/mha_flatgrad_at_rs_probe.py` | Captures RS input WITH stream0 sync; RS input becomes identical (sync masks race) |
+| `tests/profiler/mha_accgrad_order_probe.py` | Records CPU-side AccumulateGrad + RS fire order; confirms RS_FIRE[0] before ACCUM_DONE[1-6] |
+| `tests/profiler/test_no_reshard.py` | 4-combination matrix: inplace_buffers × reshard_after_forward |
+| `tests/profiler/test_ag_sync.py` | Sync after all-gather; confirms AG timing is NOT the race source |
+| `tests/profiler/test_rs_sync.py` | Sync after reduce-scatter; confirms RS on COMM stream IS the race partner |
+| `tests/profiler/test_accgrad_order.py` | Earlier AccumulateGrad order probe (superseded by mha_accgrad_order_probe.py) |
 
 ---
 
@@ -637,21 +656,31 @@ compiled plan in this repro.
 
 ## Remaining Questions
 
-1. **Memory cost**: How much peak memory does `inplace_buffers=False` cost in full
+1. **Exact race mechanism**: Why does the RS input (`reduce_scatter_input`) become
+   non-deterministic? `reduce_scatter_stream.wait_stream(stream0)` should ensure RS
+   reads `reduce_scatter_input` only after stream0's `chunk_cat` finishes. The missing
+   piece: what writes to `reduce_scatter_input` (or the unsharded grads it was copied
+   from) concurrently with `chunk_cat` on a different stream?
+
+2. **Address pair for the actual race**: The q_proj.weight.grad alloc at `addr_mm1` is
+   suspicious. If COMM stream also gets `addr_mm1` for some buffer (not the RS output
+   we measured), there could be a q_proj.weight.grad ↔ COMM buffer race. This needs a
+   probe that captures ALL COMM stream allocations, not just the RS output.
+
+3. **Memory cost**: How much peak memory does `inplace_buffers=False` cost in full
    training? Not measured; `allow_buffer_reuse=False` would be more conservative but
    also more expensive.
 
-2. **FA2 trigger rate**: Why does FA2 increase the trigger rate relative to
+4. **FA2 trigger rate**: Why does FA2 increase the trigger rate relative to
    `fake_attn`? Likely timing/stream pressure differences, but not conclusively proven.
 
-3. **PyTorch version sensitivity**: Does a newer or older PyTorch change whether the
+5. **PyTorch version sensitivity**: Does a newer or older PyTorch change whether the
    specific buf24→addr_mm1 collision pattern occurs? The seq_len=65536 threshold and
    codegen shape are build-specific.
 
-4. **Upstream report**: This is worth reporting to PyTorch as a TorchInductor +
+6. **Upstream report**: This is worth reporting to PyTorch as a TorchInductor +
    FSDP2 interaction bug. The correct framing is:
-   - `inplace_buffers=True` generates a backward plan that frees a 64 MB buffer
-     inside a compiled backward while an FSDP2 RS is in-flight on the COMM stream
-   - the CUDA caching allocator races to give that freed block to both the RS output
-     and the next stream0 allocation
-   - this is a **cross-stream lifetime bug** in Inductor's buffer reuse analysis
+   - `inplace_buffers=True` generates a backward plan that frees a large buffer
+     mid-backward while an FSDP2 RS is in-flight on the COMM stream
+   - this creates a cross-stream lifetime hazard in Inductor's buffer reuse analysis
+   - the exact GPU-level race mechanism is still being characterized
