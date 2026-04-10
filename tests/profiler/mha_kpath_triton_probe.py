@@ -1,7 +1,7 @@
 """Capture the k-path Triton norm-backward kernel inputs/output.
 
-In the buggy Inductor plan, the k_proj saved activation ``mm_1`` is reused
-in-place as ``buf24``:
+In the Inductor in-place-buffer plan, the k_proj saved activation ``mm_1`` is
+reused in-place as ``buf24``:
 
     triton_red_fused__to_copy_add_clone_div_mul_pow_sum_5.run(
         buf24, buf11, k_norm_weight, rsqrt_1, ...
@@ -9,14 +9,16 @@ in-place as ``buf24``:
 
 ``buf24`` is then fed into the k_proj.weight.grad GEMM.  This probe snapshots
 ``buf11`` (the upstream dK-like input), the in-place ``buf24`` value before the
-Triton kernel, and ``buf24`` after the Triton kernel.  If the inputs are
-identical but ``buf24_after`` differs, the in-place Triton kernel is the first
-observed divergence point.
+Triton kernel, the RMSNorm weight/rstd inputs, and ``buf24`` after the Triton
+kernel.  With ``--print-target-config`` it also prints the selected Triton
+launcher, which lets us distinguish value drift caused by different reduction
+block sizes from a same-launcher computation bug.
 """
 from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 
 import torch
 import torch._inductor.config as inductor_cfg
@@ -45,10 +47,24 @@ def main() -> None:
     parser.add_argument("--compare", default=None)
     parser.add_argument("--no-inplace-buffers", action="store_true")
     parser.add_argument("--sync-before-target", action="store_true")
+    parser.add_argument("--sync-after-target", action="store_true")
+    parser.add_argument("--print-target-config", action="store_true")
+    parser.add_argument(
+        "--no-dynamic-scale-rblock",
+        action="store_true",
+        help="Set torch._inductor.config.dynamic_scale_rblock=False before compile.",
+    )
+    parser.add_argument(
+        "--keep-trace",
+        action="store_true",
+        help="Save TorchInductor debug output_code.py files under save-dir.",
+    )
     args = parser.parse_args()
 
     if args.no_inplace_buffers:
         inductor_cfg.inplace_buffers = False
+    if args.no_dynamic_scale_rblock:
+        inductor_cfg.dynamic_scale_rblock = False
 
     os.environ.setdefault("NCCL_ALGO", "Ring")
     os.environ.setdefault("NCCL_PROTO", "Simple")
@@ -63,6 +79,15 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
     torch.cuda.set_device(local_rank)
     torch.accelerator.set_device_index(local_rank)
+
+    trace_dir = None
+    if args.keep_trace:
+        trace_dir = Path(args.save_dir).resolve() / "inductor_trace" / f"rank{rank}"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        inductor_cfg.fx_graph_cache = False
+        inductor_cfg.trace.enabled = True
+        inductor_cfg.trace.debug_dir = str(trace_dir)
+        inductor_cfg.trace.output_code = True
 
     device = torch.device("cuda", local_rank)
     dtype = torch.bfloat16
@@ -108,10 +133,14 @@ def main() -> None:
             if is_inplace_target:
                 snapshots["buf11_input"] = run_args[1].detach().clone()
                 snapshots["buf24_before"] = run_args[0].detach().clone()
+                if isinstance(run_args[2], torch.Tensor):
+                    snapshots["norm_weight"] = run_args[2].detach().clone()
                 if isinstance(run_args[3], torch.Tensor):
                     snapshots["rsqrt_1"] = run_args[3].detach().clone()
             else:
                 snapshots["buf11_input"] = run_args[0].detach().clone()
+                if isinstance(run_args[1], torch.Tensor):
+                    snapshots["norm_weight"] = run_args[1].detach().clone()
                 snapshots["mm1_input"] = run_args[2].detach().clone()
                 if isinstance(run_args[3], torch.Tensor):
                     snapshots["rsqrt_1"] = run_args[3].detach().clone()
@@ -124,6 +153,22 @@ def main() -> None:
             **run_kwargs,
         )
         if should_capture:
+            if args.sync_after_target:
+                torch.cuda.synchronize()
+            if args.print_target_config:
+                launcher = self.launchers[0] if getattr(self, "launchers", None) else None
+                config = getattr(launcher, "config", None)
+                compile_configs = [
+                    getattr(result, "config", None)
+                    for result in getattr(self, "compile_results", [])
+                ]
+                print(
+                    f"  target_config rank={rank} "
+                    f"kwargs={getattr(config, 'kwargs', None)} "
+                    f"num_warps={getattr(config, 'num_warps', None)} "
+                    f"num_stages={getattr(config, 'num_stages', None)} "
+                    f"compile_configs={[getattr(c, 'kwargs', None) for c in compile_configs]}"
+                )
             if is_inplace_target:
                 snapshots["buf24_after"] = run_args[0].detach().clone()
             else:
@@ -191,14 +236,34 @@ def main() -> None:
 
     if rank == 0:
         mode = "inplace=OFF" if args.no_inplace_buffers else "inplace=ON"
-        print(f"\n[mha_kpath_triton_probe] mode={mode} world_size={world_size}")
+        rblock_mode = (
+            "dynamic_scale_rblock=OFF"
+            if args.no_dynamic_scale_rblock
+            else "dynamic_scale_rblock=ON"
+        )
+        print(
+            f"\n[mha_kpath_triton_probe] mode={mode} {rblock_mode} "
+            f"world_size={world_size}"
+        )
         print(f"  captured keys on rank0: {sorted(snapshots)}")
+        if args.keep_trace:
+            print(
+                "  output_code traces: "
+                f"{Path(args.save_dir).resolve() / 'inductor_trace' / 'rank*'}"
+            )
+    if args.keep_trace and trace_dir is not None:
+        output_codes = sorted(trace_dir.rglob("output_code.py"))
+        print(
+            f"  rank {rank} output_code files: "
+            f"{len(output_codes)} under {trace_dir}"
+        )
 
     if args.compare is not None:
         for key in (
             "buf11_input",
             "buf24_before",
             "mm1_input",
+            "norm_weight",
             "rsqrt_1",
             "buf24_after",
         ):
