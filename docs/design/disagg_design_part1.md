@@ -86,7 +86,7 @@
 
 - `EXPIRED_BATCH`
   - 当前 rollout model 已经过旧
-  - trainer 只有在训练侧已经有更新模型版本时，才跳过训练并进入权重同步
+  - trainer 看到这个状态后会立刻跳过训练，直接进入权重同步
 
 - `FINISH`
   - 整个训练结束
@@ -103,8 +103,8 @@
   - 权重同步完成后调用 `continue_product()`
 - `NORMAL -> EXPIRED_BATCH`
   - 当前 rollout model 已经过旧
-- `EXPIRED_BATCH -> NORMAL`
-  - trainer 检测到过期且已有或训练出更新模型版本后，完成 pause / 权重同步 / 评测，再调用 `continue_produce()`
+- `EXPIRED_BATCH -> UPDATE_ABORT`
+  - trainer 检测到过期后，进入权重同步阶段
 - 任意状态 -> `FINISH`
   - 训练结束
 
@@ -126,7 +126,7 @@
 用途：
 
 - 共卡路径下，通常返回 `NORMAL`
-- 非共卡路径下，`get_batch()` 如果发现 manager 已经处于 `EXPIRED_BATCH`，需要先判断训练侧当前可用模型版本是否大于 rollout 侧模型版本；只有已经有更新版本时，才可以返回空 batch，并通过 `status` 告诉 trainer “当前 rollout model 已经过旧，这轮可以不训练，直接去做权重同步”
+- 非共卡路径下，`get_batch()` 如果发现 manager 已经处于 `EXPIRED_BATCH`，可以直接返回一个空 batch，并通过 `status` 告诉 trainer “当前 rollout model 已经过旧，这轮不要训练，直接去做权重同步”
 
 其余 timing / leftover 字段继续保留，用于训练日志与调试。
 
@@ -290,8 +290,7 @@
 
 - 只要当前 rollout model 过旧，就直接返回 `EXPIRED_BATCH`
 - 不再优先尝试复用 buffer 里的旧 completed 数据
-- trainer 收到信号后，如果当前可用 model step 已经大于 rollout model step，直接跳过训练并推进权重更新
-- 如果当前可用 model step 不大于 rollout model step，说明没有更新权重可以同步，trainer 必须继续训练当前 step
+- trainer 收到信号后，直接跳过训练并推进权重更新
 
 这样做的原因是：
 
@@ -352,8 +351,7 @@
 
 1. 先置 `_update_event`
 2. 再把 manager 状态切到 `UPDATE_ABORT`
-3. 调用 rollout controller 的 `pause_generation`
-4. 最后调用各 task strategy 的 `pause_product()` drain pending
+3. 最后调用各 task strategy 的 `pause_product()`
 
 顺序很重要。
 
@@ -361,17 +359,15 @@
 
 - 防止 producer 在 pause 开始前又继续补发新任务
 
-### 7.4 `continue_produce(...)`
+### 7.4 `continue_product(...)`
 
-`continue_produce(model_rollout_step=...)` 的作用是恢复 rollout controller 和 producer 控制状态：
+`continue_product(model_rollout_step=...)` 的作用是恢复 producer 控制状态：
 
-- `_model_rollout_step = 当前训练步`
-- 调用 rollout controller 的 `continue_generation`
-- `_status = NORMAL`
 - 清 `_update_event`
+- `_status = NORMAL`
+- `_model_rollout_step = 当前训练步`
 
 这样 producer 才知道：“现在 rollout 侧已经切换到新权重，可以继续生成了”。
-`_status = NORMAL` 和清 `_update_event` 必须在 `continue_generation` 完成后发生，避免后台 producer 早于 rollout controller 恢复而继续发新 rollout。
 
 ---
 
@@ -381,10 +377,12 @@
 
 新的共卡 `AgentLoopManager.produce_batch()` 内部改成：
 
-1. `await continue_produce(model_rollout_step=rollout_step)`
-2. `_produce_batch_to_buffer(...)`
-3. `pause_produce(for_weight_update=False)`
-4. `_get_batch_from_buffer(...)`
+1. `continue_generation()`
+2. `continue_product(model_rollout_step=rollout_step)`
+3. `_produce_batch_to_buffer(...)`
+4. `pause_product(for_weight_update=False)`
+5. `_get_batch_from_buffer(...)`
+6. `pause_generation()`
 
 这样做的意义是：
 
@@ -414,12 +412,12 @@
   - manager 进入 `EXPIRED_BATCH`
   - producer 立即暂停继续工作
   - 不再继续尝试消化旧 completed buffer
-  - 等待 trainer 训练出或已有更新模型版本后进行权重同步并 `continue_product()`
+  - 等待 trainer 进行权重同步并 `continue_product()`
 
 - `UPDATE_ABORT`
   - 表示 trainer 正在准备做权重同步
   - producer 不再自己 pause，避免与 trainer 竞争
-  - 只等待外部 `continue_produce()`
+  - 只等待外部 `continue_product()`
 
 - `FINISH`
   - 退出 producer loop
@@ -427,8 +425,7 @@
 这里有一个重要约束：
 
 - producer loop 收到 `UPDATE_ABORT` 后不做二次 pause
-- producer loop 从 `UPDATE_ABORT` / `EXPIRED_BATCH` 恢复时，不调用 `continue_generation`；恢复 rollout controller 的唯一入口是 trainer 调用的 `continue_produce()`
-- 只有 trainer 的权重同步路径显式调用 `pause_produce()`
+- 只有 trainer 的权重同步路径显式调用 `pause_product()`
 
 这样可以避免重复回收 pending rollout 的竞态。
 
@@ -446,14 +443,11 @@
 特殊情况：
 
 - 如果当前 `AgentLoopManager._status == EXPIRED_BATCH`
-- 且训练侧当前可用模型版本大于 rollout 侧模型版本
-- 则返回 `ProduceBatchResult(status=EXPIRED_BATCH, rollout_states=[])`
-- 如果当前 `AgentLoopManager._status == EXPIRED_BATCH`，训练侧还没有更新模型版本，但当前 step 的 batch 已 ready，则返回 `ProduceBatchResult(status=EXPIRED_BATCH, rollout_states=[...])`，表示 trainer 必须先训练这批数据，训练后立刻同步新模型版本
-- 如果当前 `AgentLoopManager._status == EXPIRED_BATCH` 但训练侧还没有更新模型版本，当前 step 的 batch 必须已经 ready；否则 producer 已停且没有新模型可同步，必须 fail fast，并打印 model/progress/replay buffer 相关不变量辅助定位
+- 则直接返回 `ProduceBatchResult(status=EXPIRED_BATCH, rollout_states=[])`
 
 这样 trainer 就能收到一个很明确的信号：
 
-- 这轮可以不再训练
+- 这轮不要再训练
 - 直接进入权重同步
 
 ---
@@ -498,15 +492,12 @@
    - `train_controller.fit(...)`
 3. 如果到达同步点
    - `agent_loop_manager.pause_product(for_weight_update=True)`
-   - `_sync_weights_and_save(sync_model_step)`
+   - `_sync_weights_and_save(...)`
 4. 如果这一轮需要 eval
    - 先做 eval
-5. `await agent_loop_manager.continue_produce(model_rollout_step=sync_model_step)`
+5. `agent_loop_manager.continue_product(model_rollout_step=current_step)`
 
-其中 `sync_model_step = current_step` 只在当前 step 已经完成训练时成立；如果 `EXPIRED_BATCH` 触发跳过训练，则 `sync_model_step = current_step - 1`。
-如果 `EXPIRED_BATCH` 返回非空 batch，当前 step 仍要完成训练，并在训练后立即同步 `current_step` 对应的新模型版本。
-
-### 11.4 为什么 `EXPIRED_BATCH` 时不一定直接跳过训练
+### 11.4 为什么 `EXPIRED_BATCH` 时直接跳过训练
 
 `EXPIRED_BATCH` 的语义不是“这一轮没有数据”，而是：
 
@@ -520,10 +511,9 @@
 
 因此策略是：
 
-- 如果当前可用 model step 大于 rollout model step，跳过 `_prepare_train_data` 和 `train_controller.fit`，直接进入权重同步
-- 如果当前可用 model step 不大于 rollout model step，说明没有更新权重可以同步，必须继续训练当前 step；训练完成后立即同步并恢复 producer
-- 跳过训练时没有完成训练 step，不能推进训练 step 计数
-- 跳过训练时同步的模型版本是 `train_step - 1`，不是当前尚未完成的 `train_step`
+- 直接跳过 `_prepare_train_data`
+- 跳过 `train_controller.fit`
+- 直接进入权重同步
 
 ---
 
@@ -534,21 +524,23 @@
 非共卡下，权重同步前的顺序必须是：
 
 1. `agent_loop_manager.pause_product(for_weight_update=True)`
-2. `_sync_weights_and_save(model_step)`
+2. `_sync_weights_and_save(rollout_step)`
 
-这里的 `model_step` 是已经完成训练、可以同步给 rollout 侧的模型版本，不一定等于当前正在处理的 `train_step`。如果 `EXPIRED_BATCH` 空 batch 触发跳过训练，则 `model_step = train_step - 1`。
+而 `_sync_weights_and_save(rollout_step)` 内部再做：
 
-而 `_sync_weights_and_save(model_step)` 内部再做：
-
-1. `_maybe_save_checkpoint(model_step)`
+1. `_maybe_save_checkpoint(rollout_step)`
 2. `bind_train_rollout(...)`
-3. `update_weights()`
+3. `fake_update_weights()`
 
-`update_weights()` 只负责把 train 侧权重更新到 rollout 侧，不负责 `pause_generation` / `continue_generation`。生产暂停由 `agent_loop_manager.pause_produce(...)` 负责，生产恢复只能发生在 eval 之后的 `agent_loop_manager.continue_produce(...)`。
+这里暂时不走真实的 `train_controller.update_weights()`，而是保留一个显式占位函数：
 
-### 12.2 为什么 eval 要优先于 producer continue_produce
+- `fake_update_weights()`
 
-如果同步权重后立刻 `continue_produce()`，producer 会马上恢复后台生成。
+这样后续接入真实跨卡同步实现时，不需要改 trainer 主流程。
+
+### 12.2 为什么 eval 要优先于 producer continue_product
+
+如果同步权重后立刻 `continue_product()`，producer 会马上恢复后台生成。
 
 但如果这一步还要做 eval，就会出现：
 
@@ -558,7 +550,7 @@
 
 - 先同步权重
 - 若本轮需要 eval，则先跑 eval
-- eval 完成后再 `continue_produce()`
+- eval 完成后再 `continue_product()`
 
 即：eval 的优先级高于 background producer。
 
@@ -603,15 +595,16 @@ checkpoint 的安全保存点固定放在 `_sync_weights_and_save(...)` 中，�
 
 这里还要再强调一个容易误解的点：
 
-- `_maybe_save_checkpoint(model_step)` 中，必须用已完成的 `model_step` 保存 train state 和 agent loop manager state
+- `_maybe_save_checkpoint(rollout_step)` 中，必须显式传入
+  `model_rollout_step_override=rollout_step`
 - 不能偷懒直接把当时 manager 内部的 `self._model_rollout_step` 原样存盘
 
 原因是：
 
-- save 的时机在 `pause_produce(use_global_progress=True)` 之后
-- 但在 `continue_produce(model_step=...)` 之前
-- 所以 save 那一刻，manager 里的 `self._model_step` 仍然还是旧的 rollout 权重版本
-- 而主流程的真实意图，是保存“本轮同步完成后，resume 应该继续使用的新 model_step”
+- save 的时机在 `pause_product(for_weight_update=True)` 之后
+- 但在 `continue_product(model_rollout_step=rollout_step)` 之前
+- 所以 save 那一刻，manager 里的 `self._model_rollout_step` 仍然还是旧的 rollout 权重版本
+- 而主流程的真实意图，是保存“本轮同步完成后，resume 应该继续使用的新 rollout_step”
 
 换句话说，这个 override 不是建议项，而是恢复语义正确性的必要条件。
 
@@ -636,7 +629,8 @@ checkpoint 的安全保存点固定放在 `_sync_weights_and_save(...)` 中，�
 
 其中 `model_rollout_step` 的来源要特别注意：
 
-- 在 `_maybe_save_checkpoint(model_step)` 里，必须通过已完成的 `model_step` 显式写入
+- 在 `_maybe_save_checkpoint(rollout_step)` 里，必须通过
+  `model_rollout_step_override=rollout_step` 显式写入
 - 不应直接落盘 save 瞬间那个尚未经过 `continue_product()` 推进的旧
   `self._model_rollout_step`
 
@@ -675,37 +669,38 @@ checkpoint 的安全保存点固定放在 `_sync_weights_and_save(...)` 中，�
 建议额外保存：
 
 - `global_train_step`
-- `model_step`
+- `model_rollout_step`
 
 其中：
 
 - `cur_step` 决定训练主循环恢复到哪一步
-- `model_step` 主要用于恢复校验和排障，并应与 `cur_step` 一致
+- `model_rollout_step` 主要用于恢复校验和排障
 
-### 13.4 `model_step` 为什么要单独保存
+### 13.4 `model_rollout_step` 为什么要单独保存
 
-`model_step` 不能只依赖 `cur_step` 间接推导。
+`model_rollout_step` 不能只依赖 `cur_step` 间接推导。
 
 原因是：
 
-- checkpoint 是在 `pause_produce()` 后、`continue_produce()` 前拍摄的
+- checkpoint 是在 `pause_product()` 后、`continue_product()` 前拍摄的
 - 这个时间点的 manager 状态，不一定能直接由训练步数唯一还原
 - 后续如果 sync 策略变化，`cur_step` 与 rollout 实际使用的权重版本也不一定严格一一对应
 
 因此这里更准确的做法是：
 
-- 在 manager state 中显式保存“resume 目标版本”的 `model_step`
-- 这个值在 `_maybe_save_checkpoint(model_step)` 时通过已完成的 `model_step` 传入
+- 在 manager state 中显式保存“resume 目标版本”的 `model_rollout_step`
+- 这个值在 `_maybe_save_checkpoint(rollout_step)` 时通过
+  `model_rollout_step_override=rollout_step` 传入
 - resume 后直接按这个保存值恢复
 
-这里之所以不能直接依赖 `self._model_step`，不是因为它永远不可信，
+这里之所以不能直接依赖 `self._model_rollout_step`，不是因为它永远不可信，
 而是因为当前设计的 checkpoint 保存点刚好卡在：
 
-1. `pause_produce(...)` 已完成
-2. `continue_produce(model_step=model_step)` 尚未执行
+1. `pause_product(...)` 已完成
+2. `continue_product(model_rollout_step=rollout_step)` 尚未执行
 
-所以 save 瞬间的 `self._model_step` 在语义上仍代表“旧 rollout 模型版本”，
-而 resume 后我们真正希望恢复的是本次同步完成后对应的 `model_step`。
+所以 save 瞬间的 `self._model_rollout_step` 在语义上仍代表“旧 rollout 模型版本”，
+而 resume 后我们真正希望恢复的是“新的 rollout_step 对应版本”。
 
 ### 13.5 `AgentLoopManager.save(...)` 的约束
 
@@ -715,7 +710,8 @@ checkpoint 的安全保存点固定放在 `_sync_weights_and_save(...)` 中，�
 - `AgentLoopManager._status == UPDATE_ABORT`
 - `_update_event` 已经置位
 - producer 当前不会继续写 replay buffer
-- 调用方显式以已完成的 `model_step` 保存本次 checkpoint 对应的目标 rollout 版本
+- 调用方显式以 `model_rollout_step_override=rollout_step` 传入
+  本次 checkpoint 对应的目标 rollout 版本
 
 如果这些条件不满足，建议：
 
@@ -736,8 +732,8 @@ resume 的 source of truth 不是 rollout 的运行时内存，而是：
 1. `train_controller.resume(checkpoint_path)`
 2. `agent_loop_manager.resume(checkpoint_path)`
 3. `bind_train_rollout(...)`
-4. `update_weights()`
-5. `asyncio_run(agent_loop_manager.continue_produce(model_step=saved_model_step))`
+4. `fake_update_weights()` 或后续真实权重同步
+5. `agent_loop_manager.continue_product(model_rollout_step=saved_model_rollout_step)`
 6. `fit()` 启动新的 `producer_task = create_task(produce_loop(...))`
 
 这里有两个重要点：
@@ -746,16 +742,15 @@ resume 的 source of truth 不是 rollout 的运行时内存，而是：
   - producer task 是运行时协程，进程重启后必须重新创建
 - rollout 权重不作为 checkpoint source of truth
   - resume 后总是从 train 侧重新同步一次 rollout
-- `saved_model_step` 应该对应保存时已完成的 `model_step`
-  - 也就是 `_maybe_save_checkpoint(model_step)` 时显式写进去的值
-  - 不能退回到 save 瞬间那个旧的 `self._model_step`
+- `saved_model_rollout_step` 应该对应新的 `rollout_step`
+  - 也就是 `_maybe_save_checkpoint(rollout_step)` 时显式 override 写进去的值
+  - 不能退回到 save 瞬间那个旧的 `self._model_rollout_step`
 
 ### 13.7 `AgentLoopManager.resume(...)` 的目标状态
 
 `AgentLoopManager.resume(...)` 恢复 sampler / replay buffer 后，推荐把 manager 留在一个“暂停态”：
 
 - `_model_rollout_step = saved_model_rollout_step`
-- `_model_step = saved_model_step`
 - `_status = UPDATE_ABORT`
 - `_update_event.set()`
 - `_finish_event.clear()`
@@ -798,16 +793,14 @@ resume 的 source of truth 不是 rollout 的运行时内存，而是：
 
 - 单 task / 多 task 的 `_produce_batch_to_buffer()` 行为一致
 - 多 task 下 `task_batch_sizes` 仍正确分配
-- `get_batch()` 在 `EXPIRED_BATCH` 状态下只有已有更新模型版本时才返回空 batch + 状态
-- `get_batch()` 在不可跳过的 `EXPIRED_BATCH` 且 batch 未 ready 时 fail fast，并打印调度不变量
+- `get_batch()` 在 `EXPIRED_BATCH` 状态下直接返回空 batch + 状态
 - `pause_product(for_weight_update=True)` 先置 `_update_event`
 - `save()` 前若仍有 pending tasks，会拒绝保存或先 pause
 - `resume()` 后 manager 先处于 `UPDATE_ABORT`，而不是直接 `NORMAL`
 
 ### 14.3 Trainer
 
-- `EXPIRED_BATCH + 空 batch` 只有已有更新模型版本时才跳过训练，直接进入同步
-- `EXPIRED_BATCH + 非空 batch` 必须先训练，再立即同步当前 step 产生的新模型版本
+- `EXPIRED_BATCH` 会跳过训练，直接进入同步
 - eval 步上 continue_product 发生在 eval 之后
 - `FINISH` 时 producer task 能正确退出
 - checkpoint 保存点发生在 pause 之后、continue_product 之前
