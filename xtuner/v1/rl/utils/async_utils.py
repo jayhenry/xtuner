@@ -58,7 +58,7 @@ def create_task(
     return task
 
 
-async def cancel_and_drain(tasks: list[Task | None], *, timeout: float = 5.0) -> None:
+async def cancel_and_drain(tasks: list[Task | None]) -> None:
     """Cancel tasks and consume their terminal exceptions.
 
     Use this when a parent coroutine handles cancellation itself but owns child tasks that must not keep running in the
@@ -71,10 +71,7 @@ async def cancel_and_drain(tasks: list[Task | None], *, timeout: float = 5.0) ->
         if task.done():
             continue
         task.cancel()
-    try:
-        await asyncio.wait_for(asyncio.gather(*tasks_to_drain, return_exceptions=True), timeout=timeout)
-    except asyncio.TimeoutError:
-        return
+    await asyncio.gather(*tasks_to_drain, return_exceptions=True)
 
 
 def _get_default_asyncio_loop() -> AbstractEventLoop:
