@@ -40,9 +40,7 @@ class _FakeRolloutState:
         self.id = uid
         self.uid = str(uid)
         self.message_uid = uid
-        self.session_uid = uid
         self.status = Status.INIT
-        self.finish_reason = None
         self.seq_staleness = 0
         self.prompt_ids = [10, 11]
         self.response_ids = []

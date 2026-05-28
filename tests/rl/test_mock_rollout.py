@@ -6,7 +6,7 @@ from transformers import AutoTokenizer
 import torch
 import tempfile
 import httpx
-from xtuner.v1.rl.rollout.worker import ROLLOUT_CONCURRENCY_GROUP_GENERATE, RolloutConfig
+from xtuner.v1.rl.rollout.worker import RolloutConfig
 from xtuner.v1.rl.rollout.lmdeploy import LMDeployWorker
 from xtuner.v1.rl.utils import AcceleratorResourcesConfig, AutoAcceleratorWorkers
 from xtuner.v1.data_proto.rl_data import RolloutState, Status
@@ -91,29 +91,25 @@ class MockInvalidResponseRolloutWorker(LMDeployWorker):
     def _launch_server(self):
         pass  # Override
 
-def _mock_rollout_remote(cls):
-    return ray.remote(concurrency_groups={ROLLOUT_CONCURRENCY_GROUP_GENERATE: 1000})(cls)
-
-
-@_mock_rollout_remote
+@ray.remote
 class MockTimeoutRolloutController(RolloutController):
-    def _get_worker_cls(self): return _mock_rollout_remote(MockTimeoutRolloutWorker)
+    def _get_worker_cls(self): return ray.remote(MockTimeoutRolloutWorker)
 
-@_mock_rollout_remote
+@ray.remote
 class MockRequestErrorRolloutController(RolloutController):
-    def _get_worker_cls(self): return _mock_rollout_remote(MockRequestErrorRolloutWorker)
+    def _get_worker_cls(self): return ray.remote(MockRequestErrorRolloutWorker)
 
-@_mock_rollout_remote
+@ray.remote    
 class MockClientErrorRolloutController(RolloutController):
-    def _get_worker_cls(self): return _mock_rollout_remote(MockClientErrorRolloutWorker)
+    def _get_worker_cls(self): return ray.remote(MockClientErrorRolloutWorker)
 
-@_mock_rollout_remote
+@ray.remote
 class MockServerErrorRolloutController(RolloutController):
-    def _get_worker_cls(self): return _mock_rollout_remote(MockServerErrorRolloutWorker)
+    def _get_worker_cls(self): return ray.remote(MockServerErrorRolloutWorker)
 
-@_mock_rollout_remote
+@ray.remote
 class MockInvalidResponseRolloutController(RolloutController):
-    def _get_worker_cls(self): return _mock_rollout_remote(MockInvalidResponseRolloutWorker)
+    def _get_worker_cls(self): return ray.remote(MockInvalidResponseRolloutWorker)
     
 class TestMockRollout(unittest.TestCase):
     @classmethod

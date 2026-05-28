@@ -1036,8 +1036,9 @@ class RolloutWorker(SingleAcceleratorWorker):
                     return rollout_state
 
                 if self.enable_partial_rollout:
-                    prompt_tokens = response["meta_info"]["prompt_tokens"]
-                    completion_tokens = response["meta_info"]["completion_tokens"]
+                    expect_len = (
+                        response["meta_info"]["prompt_tokens"] + response["meta_info"]["completion_tokens"] - 1
+                    )
                     rollout_state = await self.partial_rollout_handler.postprocess(
                         rollout_state,
                         response=returned_response,
@@ -1046,8 +1047,7 @@ class RolloutWorker(SingleAcceleratorWorker):
                         routed_experts=routed_experts,
                         finish_reason=finish_reason,
                         status=rollout_status,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
+                        routed_experts_expect_len=expect_len,
                     )
                 else:
                     rollout_state.response = returned_response
