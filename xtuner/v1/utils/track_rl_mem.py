@@ -299,6 +299,10 @@ def monitor_actor_memory(work_dir: str, interval: int = 60):
                         )
 
             time.sleep(interval)
+            print(f"\n时间: {current_time}")
+            print("-" * 80)
+            print(_format_memory_info_for_console(memory_info))
+            print("-" * 80)
 
     except KeyboardInterrupt:
         print("\n监控已停止")
