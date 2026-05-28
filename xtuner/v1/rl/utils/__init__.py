@@ -1,9 +1,4 @@
-from .async_utils import (
-    asyncio_run,
-    cancel_and_drain,
-    create_task,
-    handle_task_exception,
-)
+from .async_utils import asyncio_run, create_task, handle_task_exception
 from .misc import (
     BetweenNode,
     BetweenOperator,
@@ -73,7 +68,6 @@ __all__ = [
     "bind_train_rollout",
     "handle_task_exception",
     "create_task",
-    "cancel_and_drain",
     "QueryNode",
     "ConditionNode",
     "ScalarNode",
