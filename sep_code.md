@@ -59,6 +59,12 @@ AsyncProduceStrategyConfig(...).build(mode=ProducerMode.DISAGGREGATED)
 
 也就是说，拆分的是执行模式，不是删除共卡 async。
 
+设计约束：
+
+- `ColocateAsyncProduceStrategy` 和 `BackgroundAsyncProduceStrategy` 不继承公共父类。两者各自显式持有配置字段，少量共享算法用 module-level helper 函数表达。
+- `ColocateAgentLoopManager` 和 `DisaggregatedAgentLoopManager` 不继承公共父类。task batch 分配、staleness refresh、take batch、result 聚合等共享逻辑用 module-level helper 函数表达。
+- `pause_produce` 的关键顺序和 pending drain 协议必须复用当前生产代码语义，抽成独立 helper，而不是藏在某个 manager 父类或 async strategy 父类里。
+
 ## 5. Module 职责
 
 | Module | Interface | Implementation |
@@ -70,6 +76,20 @@ AsyncProduceStrategyConfig(...).build(mode=ProducerMode.DISAGGREGATED)
 | `BackgroundProduceProgress` | `ensure_target_upto`, `begin_consume`, `mark_consumed`, `state_dict` | 非共卡绝对累计 target/consumed 和 resume 状态 |
 | `ColocateAsyncProduceStrategy` | `produce_batch(ctx)` | 局部 pending set，结束时 drain 当前 pending |
 | `BackgroundAsyncProduceStrategy` | `produce_batch(ctx)`, `pause_produce(ctx)` | `_PendingTasks` 跨调用保存，处理 update event 和 model expired |
+
+建议的共享 helper：
+
+| Helper | 用途 |
+| --- | --- |
+| `allocate_task_batch_sizes(...)` | 复用当前按 task weight 分配 batch 的逻辑 |
+| `validate_task_batch_sizes(...)` | 复用 batch size 校验 |
+| `refresh_for_all_tasks(...)` | 复用 completed / aborted staleness refresh |
+| `take_train_batch(...)` | 复用 replay buffer take、consumed 记账、leftover 统计、result 聚合 |
+| `sample_retry_or_new_group(...)` | 复用 async strategy 从 retry pool / dataloader 抽样的选择 |
+| `is_model_expired_for_threshold(...)` | 复用 staleness threshold 判定 |
+| `pause_pending_tasks(...)` | 复用 pending task pause / drain / cancel 协议 |
+
+这些 helper 是 Implementation 复用，不是新的业务 **Interface**。调用方仍只看到 mode-specific manager 和 strategy。
 
 ## 6. Config 构建规则
 
@@ -177,6 +197,7 @@ produce_result = await manager.get_batch(batch_size, train_step=train_step)
 - 返回 `UPDATE_WEIGHT_AND_ABORT`。
 - 维护 `model_step` 状态机。
 - checkpoint pending task。
+- 继承公共 async 父类。
 
 ### 9.2 `BackgroundAsyncProduceStrategy`
 
@@ -193,6 +214,52 @@ produce_result = await manager.get_batch(batch_size, train_step=train_step)
 - 从 replay buffer 取训练 batch。
 - 推进 `BackgroundProduceProgress` 的 consumer step。
 - 触发权重同步。
+- 继承公共 async 父类。
+
+### 9.3 pause pending helper
+
+当前最新 `pause_produce` 有两个层次：
+
+1. manager 层：先设置暂停信号，切换 manager 状态，再暂停 rollout controller。
+2. strategy 层：如果还有 pending task，周期性发送 agent loop pause，claim 已完成任务并入库，超过 timeout 后 cancel 剩余 pending。
+
+拆分后保留这个顺序，但把 strategy 层 pending drain 抽成全局 helper：
+
+```python
+async def pause_pending_tasks(
+    *,
+    pending_tasks,
+    ctx,
+    put_claimed_task,
+) -> float:
+    if pending_tasks.count() == 0:
+        return 0.0
+
+    pending_pause_tasks = {create_task(request_agent_loop_pause(ctx))}
+    deadline = now() + PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S
+    next_periodic_pause = now() + PERIODIC_ABORT_INTERVAL_S
+
+    while pending_tasks.count() > 0:
+        if now() > deadline:
+            await pending_tasks.cancel_all()
+            break
+
+        if now() >= next_periodic_pause:
+            pending_pause_tasks.add(create_task(request_agent_loop_pause(ctx)))
+            next_periodic_pause += PERIODIC_ABORT_INTERVAL_S
+
+        claimed = await pending_tasks.wait_and_claim(timeout_s=1)
+        for task in claimed:
+            await put_claimed_task(task)
+
+    await cancel_and_drain(pending_pause_tasks)
+    return elapsed()
+```
+
+共卡路径把本次调用的局部 `set[Task]` 包成 `_LocalPendingTasks` 后调用这个 helper；非共卡路径直接把 `_PendingTasks` 传给它。这样 pause 协议复用，但 pending 的生命周期仍然独立：
+
+- 共卡：pending 生命周期等于一次 `produce_batch()`。
+- 非共卡：pending 生命周期跨多次后台 `produce_batch()`。
 
 ## 10. Progress 拆分
 
@@ -274,8 +341,9 @@ self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build_colocate(..
 3. 新增 `DisaggregatedAgentLoopManager`，把 `produce_loop/get_batch/pause/continue/shutdown/save/resume` 迁移过去。
 4. 拆出 `ColocateProduceProgress` 和 `BackgroundProduceProgress`。
 5. 把当前 `AsyncProduceStrategy` 拆成 `ColocateAsyncProduceStrategy` 和 `BackgroundAsyncProduceStrategy`。
-6. trainer 按类型调用不同 build 方法。
-7. 保留必要兼容导出，减少配置文件修改。
+6. 把 batch allocation、refresh、take batch、pause pending drain 抽成 module-level helper。
+7. trainer 按类型调用不同 build 方法。
+8. 保留必要兼容导出，减少配置文件修改。
 
 ## 14. 测试建议
 
@@ -285,12 +353,14 @@ self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build_colocate(..
 - 共卡 async `produce_batch()` 每次调用后不保留 pending。
 - 共卡 `produce_batch()` 不访问 `_status/_update_event/BackgroundProduceProgress`。
 - 共卡 multi-task batch allocation 仍稳定。
+- 共卡 local pending cleanup 复用 `pause_pending_tasks(...)`，但不创建 `_PendingTasks`。
 
 非共卡 manager：
 
 - `AsyncProduceStrategyConfig` 在非共卡下构建 `BackgroundAsyncProduceStrategy`。
 - `produce_loop/get_batch` 仍处理空/非空 **Expired Produce Batch**。
 - `pause_produce/continue_produce` 顺序不变。
+- `pause_produce` 先设置 update event / manager status，再暂停 rollout controller，然后调用 strategy pending drain。
 - checkpoint/resume 恢复 `BackgroundProduceProgress` 和 `model_step`。
 
 策略：
