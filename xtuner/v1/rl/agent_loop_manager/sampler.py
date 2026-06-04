@@ -1,9 +1,7 @@
-import copy
 from pathlib import Path
 from typing import Iterator, Optional, cast
 from uuid import uuid4
 
-import ray
 import torch
 from pydantic import BaseModel, ConfigDict
 
@@ -60,17 +58,6 @@ class SamplerConfig(BaseModel):
         return Sampler(dataloader=dataloader, prompt_repeat_k=self.prompt_repeat_k, replay_buffer=replay_buffer)
 
 
-# TODO: The best solution is to put it in the fake_collator,
-# but it will cause a deadlock problem, so it is temporarily placed here.
-# The best solution should be to start the dataloader using spawn.
-def put_to_ray(data: RolloutState) -> RolloutState:
-    if hasattr(data, "mm_info") and data.mm_info is not None:
-        pixel_values = data.mm_info.get("pixel_values", None)
-        if pixel_values is not None:
-            data.mm_info["pixel_values"] = ray.put(pixel_values)
-    return data
-
-
 class _DatasetSampler:
     def __init__(self, dataloader: Dataloader, prompt_repeat_k: int):
         self.dataloader = dataloader
@@ -88,29 +75,30 @@ class _DatasetSampler:
         assert self.dataloader_iter is not None
         try:
             data = cast(RolloutState, next(self.dataloader_iter)[0])
-            data = put_to_ray(data)
 
         except StopIteration:
             self.cur_epoch += 1
             self.dataloader.set_epoch(self.cur_epoch)
             self.dataloader_iter = iter(self.dataloader)
             data = cast(RolloutState, next(self.dataloader_iter)[0])
-            data = put_to_ray(data)
 
         if XTUNER_DETERMINISTIC:
             message_uid = self._consumed_samples
             uid_base = self._consumed_samples * self.prompt_repeat_k
 
+        # 只浅拷贝顶层结构 + 独立的 extra_fields dict（agent_loop / controller 会写入），
+        # 其他大对象字段（mm_info、tools、message、prompt_ids 等）跨副本共享引用。
+        # 避免 deepcopy 在 K-fanout 上把整个 RolloutState（含 tensor、numpy 数组）多复制 K 倍。
         group_data = []
         for item_idx in range(self.prompt_repeat_k):
-            new_data = copy.deepcopy(data)
+            update: dict = {"extra_fields": dict(data.extra_fields)}
             if XTUNER_DETERMINISTIC:
-                new_data.message_uid = message_uid
-                new_data.uid = uid_base + item_idx
-                new_data.session_uid = new_data.uid
+                update["message_uid"] = message_uid
+                update["uid"] = uid_base + item_idx
+                update["session_uid"] = uid_base + item_idx
             else:
-                new_data.uid = uuid4().int
-            group_data.append(new_data)
+                update["uid"] = uuid4().int
+            group_data.append(data.model_copy(update=update))
         self._consumed_samples += 1
         return cast(list[RolloutState], group_data)
 

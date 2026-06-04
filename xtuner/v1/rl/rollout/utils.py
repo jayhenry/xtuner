@@ -283,7 +283,9 @@ async def check_worker_health(
 
 async def _resolve_routed_experts(routed_experts: list[int] | RayObjectRef) -> list[int]:
     if isinstance(routed_experts, RayObjectRef):
-        routed_experts = await routed_experts
+        cur_routed_experts = await routed_experts
+        ray.internal.free(routed_experts, local_only=False)
+        routed_experts = cur_routed_experts
     if hasattr(routed_experts, "tolist"):
         routed_experts = routed_experts.tolist()
     assert isinstance(routed_experts, list), f"Unexpected routed_experts type: {type(routed_experts)}"
@@ -374,10 +376,9 @@ class PartialRolloutHandler:
                 )
                 cur_routed_experts = cur_routed_experts[history_routed_experts_len:]
                 concat_routed_experts = history_routed_experts + cur_routed_experts
-                rollout_state.routed_experts = ray.put(concat_routed_experts)
-                # free_object_refs(
-                #     [ref for ref in (history_routed_experts_ref, cur_routed_experts_ref) if isinstance(ref, ray.ObjectRef)]
-                # )
+                # 直接保留为 list[int]：之前 ray.put 一份只是为了跨进程传递，但 RolloutState
+                # 会被 cloudpickle 整体序列化，再 put 一次反而把对象塞进 plasma，撑大集群 GC 压力。
+                rollout_state.routed_experts = concat_routed_experts
                 end_time = time.time()
                 self.logger.debug(
                     f"[PartialRolloutHandler] Postprocess routed_experts concatenation time: {end_time - start_time:.4f} seconds"

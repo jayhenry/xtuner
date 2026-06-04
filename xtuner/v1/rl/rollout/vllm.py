@@ -402,9 +402,13 @@ class vLLMWorker(RolloutWorker):
 
                     data = base64.b64decode(routed_experts)
                     routed_experts = ray.cloudpickle.loads(data)
+                    if hasattr(routed_experts, "tolist"):
+                        routed_experts = routed_experts.tolist()
                 else:
-                    routed_experts = torch.tensor(routed_experts)
-                    routed_experts = ray.put(routed_experts)
+                    # Keep as plain list[int] in RolloutState; avoids ray.put which
+                    # accumulates ObjectRefs in plasma and triggers cluster LocalGC.
+                    if not isinstance(routed_experts, list):
+                        routed_experts = torch.tensor(routed_experts).tolist()
 
         rollout_status = update_status_from_finish_reason(finish_reason)
         if rollout_status == Status.COMPLETED:

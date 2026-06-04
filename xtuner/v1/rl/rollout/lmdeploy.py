@@ -183,8 +183,12 @@ class LMDeployWorker(RolloutWorker):
                 self.lmdeploy_actor = ray.get_actor(SHARED_STORE, namespace=SHARED_STORE_NAMESPACE)
             assert self.lmdeploy_actor is not None, "LMDeploy actor should be available in the shared store."
             routed_experts_data = await self.lmdeploy_actor.get.remote(routed_experts)
-            return ray.put(routed_experts_data)
-        return torch.tensor(routed_experts)
+            # Return plain list[int] so RolloutState.routed_experts stays cheap to deepcopy / pickle
+            # and never lives in plasma (which would trigger cluster LocalGC pressure).
+            if hasattr(routed_experts_data, "tolist"):
+                return routed_experts_data.tolist()
+            return routed_experts_data
+        return torch.tensor(routed_experts).tolist()
 
     def _transform_rollout_config_to_server_configs(self) -> Namespace:
         """Transform the RolloutConfig into a Namespace suitable for the

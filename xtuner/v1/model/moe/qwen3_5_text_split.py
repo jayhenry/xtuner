@@ -229,11 +229,16 @@ class Qwen3_5_VLTextMoE397BA17BSplitConfig(Qwen3_5_VLTextMoESplitConfig):
         norm_topk_prob=True,
         router_scaling_factor=1.0,
     )
-    rope_parameters_cfg: RopeParametersConfig = RopeParametersConfig(
-        rope_type="qwen3_vl",
-        mrope_section=[11, 11, 10],
-        partial_rotary_factor=0.25,
-        rope_theta=10000000,
+    # rope_parameters_cfg: RopeParametersConfig = RopeParametersConfig(
+    #     rope_type="qwen3_vl", mrope_section=[11, 11, 10], partial_rotary_factor=0.25
+    # )
+    rope_parameters_cfg: RopeParametersConfig = Field(
+        default_factory=lambda: RopeParametersConfig(
+            rope_theta=10000000.0,
+            rope_type="qwen3_vl",
+            mrope_section=[11, 11, 10],
+            partial_rotary_factor=0.25,
+        )
     )
     balancing_loss_cfg: BalancingLossConfig | None = BalancingLossConfig()
     z_loss_cfg: ZLossConfig | None = None

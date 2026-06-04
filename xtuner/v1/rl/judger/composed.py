@@ -67,7 +67,10 @@ def default_merge_fn(
                 )
         results: list[RolloutState] = []
         for i, orig in enumerate(original):
-            merged = orig.model_copy(deep=True)
+            # Shallow copy: default_merge_fn 只覆写 reward 字段，其余引用复用 orig；
+            # deep=True 会克隆整个 RolloutState（含 tensor / list[int] routed_experts / mm_info），
+            # 在 hot path 上每次 judge 都跑一遍非常昂贵，且会喂大 GC。
+            merged = orig.model_copy()
             merged.reward = {}
             for name, states in judged.items():
                 assert isinstance(states, list)
@@ -79,7 +82,7 @@ def default_merge_fn(
             results.append(merged)
         return results
     else:
-        merged = original.model_copy(deep=True)
+        merged = original.model_copy()
         merged.reward = {}
         for name, state in judged.items():
             if isinstance(state, list):
@@ -139,7 +142,7 @@ class ComposedJudger(Judger):
         for key in selected_keys:
             if key not in self.branches:
                 raise KeyError(f"Unknown judger branch: {key}, available={sorted(self.branches)}")
-            judged[key] = await self.branches[key].judge(deepcopy(rollout_state))
+            judged[key] = await self.branches[key].judge(rollout_state)
         return self.merge_fn(rollout_state, judged)
 
 

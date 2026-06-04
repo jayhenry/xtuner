@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import base64
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias
+from typing import Any, Literal
 
 import numpy as np
 import torch
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 from typing_extensions import NotRequired, TypedDict
 
 # ====================================
@@ -15,11 +14,6 @@ from typing_extensions import NotRequired, TypedDict
 from xtuner.v1.data_proto.utils import calculate_seq_staleness
 from xtuner.v1.utils.logger import get_logger
 
-
-if TYPE_CHECKING:
-    from ray import ObjectRef as RayObjectRef
-else:
-    RayObjectRef: TypeAlias = Any
 
 logger = get_logger()
 
@@ -46,7 +40,7 @@ class SampleParams(BaseModel):
     include_stop_str_in_output: bool = True
     no_stop_trim: bool = True
     spaces_between_special_tokens: bool = False
-    return_routed_experts: bool = False
+    return_routed_experts: bool = True
 
 
 class Status(Enum):
@@ -62,7 +56,7 @@ class Status(Enum):
 
 class MultimodalInfo(TypedDict):
     # 使用TypedDict给出pixel_values的类型提示
-    pixel_values: NotRequired[np.ndarray | RayObjectRef | None]
+    pixel_values: NotRequired[np.ndarray | None]
     image_grid_thw: NotRequired[torch.Tensor]
 
 
@@ -108,7 +102,7 @@ class RolloutState(BaseModel):
     tool_calls: list[RolloutToolCall] | None = None
     response_ids: list[int] | None = None
     logprobs: list[float] | None = None
-    routed_experts: list[int] | RayObjectRef | None = None
+    routed_experts: list[int] | None = None
     finish_reason: str | None = None
     # response_mask: 记录response_ids中哪个token算loss, 与response_ids长度相同，每轮rollout在 agent_loop.generate 中覆盖写
     response_mask: list[int] | None = None
@@ -127,46 +121,6 @@ class RolloutState(BaseModel):
     error_msg: str | None = None
     position_ids: torch.Tensor | None = None
     extra_fields: dict[str, Any] = {}
-
-    @field_serializer("routed_experts")
-    def _serialize_routed_experts(self, value: list[int] | RayObjectRef | None) -> list[int] | str | None:
-        """序列化 routed_experts 字段：
-
-        - None -> None
-        - list[int] -> list[int]（原样保留）
-        - RayObjectRef -> base64 编码的字符串（通过 ray.cloudpickle 序列化）
-        """
-        import ray
-
-        if value is None:
-            return None
-        if isinstance(value, ray.ObjectRef):
-            data = ray.cloudpickle.dumps(value)
-            return base64.b64encode(data).decode("utf-8")
-        return value
-
-    @field_validator("routed_experts", mode="before")
-    @classmethod
-    def _deserialize_routed_experts(cls, value: Any) -> list[int] | RayObjectRef | None:
-        """反序列化 routed_experts 字段：
-
-        - None -> None
-        - list[int] -> list[int]（原样保留）
-        - str（base64 编码）-> RayObjectRef（通过 ray.cloudpickle 反序列化）
-        - RayObjectRef -> RayObjectRef（原样保留）
-        """
-        import ray
-
-        if value is None:
-            return None
-        if isinstance(value, ray.ObjectRef):
-            return value
-        if isinstance(value, str):
-            data = base64.b64decode(value)
-            return ray.cloudpickle.loads(data)
-        if isinstance(value, list):
-            return value
-        return value
 
     @field_serializer("mm_info")
     def _serialize_mm_info(self, value: MultimodalInfo | None) -> MultimodalInfo | None:

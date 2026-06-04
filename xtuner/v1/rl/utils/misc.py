@@ -312,7 +312,8 @@ def chat_trace_records_to_rollout_states(
             except Exception:
                 response = None
 
-        normalized = rollout_state.model_copy(deep=True)
+        # Shallow copy: 后面的字段全部即刻覆写，不需要 deep clone tensor / list 等大对象。
+        normalized = rollout_state.model_copy()
         normalized.uid = uid
         normalized.prompt_ids = list(prompt_ids)
         normalized.tokens = list(prompt_ids)
@@ -324,15 +325,17 @@ def chat_trace_records_to_rollout_states(
         normalized.status = status
         normalized.error_msg = None if status == Status.COMPLETED else f"Gateway trace status={status.value}"
         normalized.reward = None
+        # extra_fields 都被塞进新建 dict，不会反向影响原 rollout_state.extra_fields；
+        # 仅 trace_summary 是上游可能复用的引用，保留 deepcopy 防止下游 in-place 改动。
         normalized.extra_fields = {
-            **deepcopy(rollout_state.extra_fields),
+            **(rollout_state.extra_fields or {}),
             "gateway_trace_index": index,
             "gateway_trace_count": trace_count,
             "gateway_trace_records": deepcopy(trace_summary),
             "gateway_request_id": record.get("request_id"),
             "gateway_request_snapshot": record.get("request_snapshot"),
             "gateway_response_snapshot": record.get("response_snapshot"),
-            **deepcopy(extra_fields or {}),
+            **(extra_fields or {}),
         }
         states.append(normalized)
     return states
