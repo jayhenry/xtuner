@@ -67,25 +67,26 @@ def calculate_stale_threshold(max_staleness: int, sync_weights_interval: int) ->
 
 
 @dataclass
-class ProduceMetrics:
+class ProduceBatchResult:
+    rollout_states: list[list[Any]]
+    status: ProduceBatchStatus = ProduceBatchStatus.NORMAL
+    group_gen_count: int | None = None
+    group_gen_mean_s: float | None = None
+    group_gen_p50_s: float | None = None
+    group_gen_p99_s: float | None = None
+    group_gen_p99_p50_ratio: float | None = None
+    group_gen_pause_time_s: float | None = None
+    leftover_init: int = 0
+    leftover_completed: int = 0
+    leftover_aborted: int = 0
+    leftover_expired: int = 0
+    leftover_failed: int = 0
+    leftover_filtered: int = 0
     raw_rewards_sum: float = 0.0
     raw_rewards_count: int = 0
     produced_samples: int = 0
     produced_tokens: int = 0
     produce_time_s: float = 0.0
-    group_generate_times_s: list[float] = field(default_factory=list)
-    pause_time_s: float = 0.0
-
-    def add_group_time(self, elapsed_s: float) -> None:
-        self.group_generate_times_s.append(elapsed_s)
-
-
-@dataclass
-class ProduceBatchResult:
-    rollout_states: list[list[Any]]
-    status: ProduceBatchStatus = ProduceBatchStatus.NORMAL
-    metrics: ProduceMetrics = field(default_factory=ProduceMetrics)
-    leftover_counts: dict[Status, int] = field(default_factory=dict)
     task_batch_sizes: dict[str, int] | None = None
     task_results: dict[str, "ProduceBatchResult"] | None = None
 
@@ -352,6 +353,10 @@ class BaseProduceContext:
     def current_train_step_for_staleness(self) -> int:
         return self.train_step
 
+    async def sample_group(self, *, from_expired_pool: bool) -> list[Any]:
+        statuses = [Status.EXPIRED, Status.ABORTED] if from_expired_pool else [Status.ABORTED]
+        return await self.sampler.sample(task_name=self.task_name, group_status=statuses)
+
     async def generate_group(
         self,
         group: list[Any],
@@ -430,8 +435,6 @@ class DisaggProduceContext(BaseProduceContext):
 
 
 class ProduceStrategy(ABC):
-    supports_multi_task: bool = True
-
     @abstractmethod
     async def produce_batch(self, ctx: ProduceContext) -> ProduceBatchStatus: ...
 
@@ -440,8 +443,6 @@ class ProduceStrategy(ABC):
 
 
 class DisaggProduceStrategy(ABC):
-    supports_multi_task: bool = True
-
     @abstractmethod
     async def produce_batch(self, ctx: DisaggProduceContext) -> ProduceBatchStatus: ...
 
@@ -531,8 +532,6 @@ class AsyncProduceStrategyConfig:
 
 
 class SyncProduceStrategy(ProduceStrategy):
-    supports_multi_task = True
-
     def __init__(
         self,
         *,
@@ -560,23 +559,12 @@ class SyncProduceStrategy(ProduceStrategy):
         return ProduceBatchStatus.NORMAL
 
 
-async def sample_retry_or_new_group(ctx: BaseProduceContext, *, from_expired_pool: bool) -> list[Any]:
-    statuses = [Status.EXPIRED, Status.ABORTED] if from_expired_pool else [Status.ABORTED]
-    return await ctx.sampler.sample(task_name=ctx.task_name, group_status=statuses)
-
-
-def is_model_expired_for_threshold(*, stale_threshold: int, train_step: int, model_step: int) -> bool:
-    return calculate_seq_staleness(model_step, train_step) >= stale_threshold
-
-
 async def put_finished_task_result(task: asyncio.Task, ctx: BaseProduceContext) -> bool:
     group = task.result()
     return await ctx.put_generated_group(group)
 
 
 class AsyncProduceStrategy(ProduceStrategy):
-    supports_multi_task = True
-
     def __init__(
         self,
         *,
@@ -598,11 +586,7 @@ class AsyncProduceStrategy(ProduceStrategy):
         self.stale_threshold = calculate_stale_threshold(max_staleness, sync_weights_interval)
 
     def is_model_expired(self, train_step: int, model_step: int) -> bool:
-        return is_model_expired_for_threshold(
-            stale_threshold=self.stale_threshold,
-            train_step=train_step,
-            model_step=model_step,
-        )
+        return calculate_seq_staleness(model_step, train_step) >= self.stale_threshold
 
     async def produce_batch(
         self,
@@ -621,7 +605,7 @@ class AsyncProduceStrategy(ProduceStrategy):
         completed = await ctx.replay_buffer.count(ctx.task_name, Status.COMPLETED)
 
         async def schedule_one() -> None:
-            group = await sample_retry_or_new_group(ctx, from_expired_pool=False)
+            group = await ctx.sample_group(from_expired_pool=False)
             pending.add(
                 asyncio.create_task(
                     ctx.generate_group(
@@ -828,8 +812,6 @@ async def pause_pending_tasks(
 
 
 class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
-    supports_multi_task = True
-
     def __init__(
         self,
         *,
@@ -852,11 +834,7 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
         self._pending_tasks = _PendingTasks()
 
     def is_model_expired(self, train_step: int, model_step: int) -> bool:
-        return is_model_expired_for_threshold(
-            stale_threshold=self.stale_threshold,
-            train_step=train_step,
-            model_step=model_step,
-        )
+        return calculate_seq_staleness(model_step, train_step) >= self.stale_threshold
 
     def pending_task_count(self) -> int:
         return self._pending_tasks.count()
@@ -885,7 +863,7 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
         scheduled_target = target_abs + oversample_budget
 
         async def spawn_one() -> asyncio.Task:
-            group = await sample_retry_or_new_group(ctx, from_expired_pool=False)
+            group = await ctx.sample_group(from_expired_pool=False)
             return asyncio.create_task(
                 ctx.generate_group(
                     group,
@@ -1023,23 +1001,6 @@ def task_names_of(task_runners: list[TaskRunner]) -> list[str]:
     return [task.task_name for task in task_runners]
 
 
-def single_task_runner(task_runners: list[TaskRunner]) -> TaskRunner:
-    assert len(task_runners) == 1
-    return task_runners[0]
-
-
-def validate_multi_task_strategy_support(task_runners: list[TaskRunner]) -> None:
-    if len(task_runners) <= 1:
-        return
-    unsupported = [
-        task.task_name
-        for task in task_runners
-        if not getattr(task.produce_strategy, "supports_multi_task", False)
-    ]
-    if unsupported:
-        raise ValueError(f"ProduceStrategy does not support multi-task production: {unsupported}")
-
-
 def allocate_task_batch_sizes(
     task_runners: list[TaskRunner],
     global_batch_size: int,
@@ -1121,7 +1082,6 @@ class AgentLoopManager:
         self.rollout_controller = rollout_controller
         self.logger = logger
         self.task_names = task_names_of(task_runners)
-        validate_multi_task_strategy_support(task_runners)
 
     def get_task_batch_sizes(self, global_batch_size: int, train_step: int) -> dict[str, int]:
         return allocate_task_batch_sizes(self.task_runners, global_batch_size, train_step)
@@ -1141,59 +1101,11 @@ class AgentLoopManager:
         - 返回必须是非空训练 batch。
         """
 
-        if len(self.task_runners) == 1:
-            return await self._produce_batch_single_task(
-                batch_size=batch_size,
-                train_step=train_step,
-                model_step=model_step,
-            )
-        return await self._produce_batch_multi_task(
-            batch_size=batch_size,
-            train_step=train_step,
-            model_step=model_step,
+        task_sizes = (
+            {self.task_runners[0].task_name: batch_size}
+            if len(self.task_runners) == 1
+            else self.get_task_batch_sizes(batch_size, train_step)
         )
-
-    async def _produce_batch_single_task(
-        self,
-        *,
-        batch_size: int,
-        train_step: int,
-        model_step: int,
-    ) -> ProduceBatchResult:
-        # 单 task 简单路径：不走 task weight 分配、active task 过滤、跨 task 结果聚合。
-        task = single_task_runner(self.task_runners)
-        task_sizes = {task.task_name: batch_size}
-        progress = ProduceProgress.build_local(target_samples=task_sizes, train_step=train_step)
-
-        await self.rollout_controller.continue_generation()
-        try:
-            await refresh_for_all_tasks(
-                task_runners=[task],
-                replay_buffer=self.replay_buffer,
-                train_step=train_step,
-            )
-            await self._produce_colocate_task(task, batch_size, progress, model_step=model_step)
-            result = await take_train_batch(
-                task_runners=[task],
-                replay_buffer=self.replay_buffer,
-                task_sizes=task_sizes,
-                progress=progress,
-            )
-        finally:
-            await self.rollout_controller.pause_generation()
-
-        assert result.rollout_states, "共卡 produce_batch 必须返回非空训练 batch。"
-        return result
-
-    async def _produce_batch_multi_task(
-        self,
-        *,
-        batch_size: int,
-        train_step: int,
-        model_step: int,
-    ) -> ProduceBatchResult:
-        # 多 task 路径集中处理 batch allocation、active task 过滤和聚合。
-        task_sizes = self.get_task_batch_sizes(batch_size, train_step)
         validate_task_batch_sizes(self.task_runners, task_sizes, batch_size)
         progress = ProduceProgress.build_local(target_samples=task_sizes, train_step=train_step)
 
@@ -1282,7 +1194,6 @@ class DisaggAgentLoopManager:
         self.model_step = 0
         self.pause_time_s = 0.0
         self.progress = DisaggProduceProgress.build(self.task_names)
-        validate_multi_task_strategy_support(task_runners)
 
     def get_task_batch_sizes(self, global_batch_size: int, train_step: int) -> dict[str, int]:
         return allocate_task_batch_sizes(self.task_runners, global_batch_size, train_step)

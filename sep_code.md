@@ -65,7 +65,7 @@ AsyncProduceStrategyConfig(...).build(mode=ProducerMode.DISAGGREGATED)
 - 共卡和非共卡的 strategy **Interface** 分开：`ProduceStrategy` 只定义共卡 `produce_batch(ctx)`；`DisaggProduceStrategy` 定义非共卡 `produce_batch(ctx)`、`pause_produce(ctx)`、`pending_task_count()`。两者没有公共抽象父类，避免把非共卡 pause/checkpoint 语义带进共卡。
 - `AgentLoopManager` 和 `DisaggAgentLoopManager` 不继承公共父类。task batch 分配、staleness refresh、take batch、result 聚合等共享逻辑用 module-level helper 函数表达。
 - `pause_produce` 的关键顺序和 pending drain 协议必须复用当前生产代码语义，抽成独立 helper，而不是藏在某个 manager 父类或 async strategy 父类里。
-- 不新增 `SingleTaskAgentLoopManager` / `MultiTaskAgentLoopManager`。single-task 和 multi-task 对 trainer 的 **Interface** 仍相同，当前差异主要是内部编排复杂度，所以在 public method 入口做一次分支，各自走私有函数。
+- 不新增 single-task / multi-task manager，也不在本次改造里新增 single/multi 私有分支；继续复用当前 task batch allocation 和结果聚合逻辑。
 
 ## 5. Module 职责
 
@@ -89,61 +89,9 @@ AsyncProduceStrategyConfig(...).build(mode=ProducerMode.DISAGGREGATED)
 | `validate_task_batch_sizes(...)` | 复用 batch size 校验 |
 | `refresh_for_all_tasks(...)` | 复用 completed / aborted staleness refresh |
 | `take_train_batch(...)` | 复用 replay buffer take、consumed 记账、leftover 统计、result 聚合 |
-| `sample_retry_or_new_group(...)` | 复用 async strategy 从 retry pool / dataloader 抽样的选择 |
-| `is_model_expired_for_threshold(...)` | 复用 staleness threshold 判定 |
 | `pause_pending_tasks(...)` | 复用 pending task pause / drain / cancel 协议 |
 
 这些 helper 是 Implementation 复用，不是新的业务 **Interface**。调用方仍只看到 mode-specific manager 和 strategy。
-
-## 5.1 Single-task / multi-task 分支
-
-`AgentLoopManager.produce_batch(...)` 可以在入口处显式拆成两个分支：
-
-```python
-async def produce_batch(...):
-    if self._is_single_task:
-        return await self._produce_batch_single_task(...)
-    return await self._produce_batch_multi_task(...)
-```
-
-这个规则只用于 colocate。disagg 的核心复杂度是后台 producer 状态机、**Expired Produce Batch**、pause/continue 和 `DisaggProduceProgress`，single-task / multi-task 不是主要复杂度来源。为了避免复制 disagg 状态机，`DisaggAgentLoopManager.produce_loop(...)`、`get_batch(...)`、`pause_produce(...)` 保持统一流程，不做 single/multi 私有分支。
-
-single-task 分支目标：
-
-- 不走 task weight allocation。
-- 不走 active task 过滤。
-- 不组装 `task_results`。
-- 不做跨 task status 聚合。
-- 直接使用唯一 `TaskRunner` 和 `{task_name: batch_size}`。
-
-multi-task 分支目标：
-
-- 集中处理 task batch allocation。
-- 校验所有 task batch size。
-- 过滤 batch size 为 0 的 inactive task。
-- 并发执行 active task。
-- 稳定排序并聚合 task results / status / 统计字段。
-
-这样做比新增 `SingleTaskAgentLoopManager` / `MultiTaskAgentLoopManager` 更合适，因为当前 single-task 和 multi-task 的 public 行为没有分化，只是 colocate 内部流程复杂度不同。等以后出现不同 checkpoint schema、不同 public capability 或 multi-task 专属状态时，再把 colocate 的两个私有分支提升成两个独立 manager **Adapter**。
-
-两个 strategy 接口都保留同名只读能力标记：
-
-```python
-class ProduceStrategy:
-    supports_multi_task: bool = True
-
-class DisaggProduceStrategy:
-    supports_multi_task: bool = True
-```
-
-含义是“这个 per-task strategy 能否被 multi-task manager 并发编排”，不是“strategy 自己处理 multi-task”。当前 `SyncProduceStrategy`、`AsyncProduceStrategy`、`DisaggAsyncProduceStrategy` 都返回 `True`。manager 在构建 multi-task runner 后 fail fast：
-
-```python
-if len(task_runners) > 1:
-    for task in task_runners:
-        if not task.produce_strategy.supports_multi_task:
-            raise ValueError(...)
-```
 
 ## 6. Config 构建规则
 
@@ -209,7 +157,7 @@ class DisaggProduceStrategy:
 
 原因是 `Progress` 仍按当前内部字段结构由 context 持有，但不应该变成 strategy 方法签名里的通用第二参数：
 
-- `BaseProduceContext` 保留当前 `ProduceContext` 的内部字段结构，例如 `task_batch_size`、`progress`、`stale_threshold`，以及 `generate_group()` / `put_generated_group()` 写 progress 统计字段的行为。
+- `BaseProduceContext` 保留当前 `ProduceContext` 的内部字段结构，例如 `task_batch_size`、`progress`、`stale_threshold`，以及 `sample_group()` / `generate_group()` / `put_generated_group()` 行为。
 - `ProduceContext` 是共卡简化版，只去掉非共卡需要的 `update_event`、绝对 consumed/target 访问和 checkpoint 语义，不把 raw rewards / produced samples / produce time 重构成一个 `metrics` 字段。
 - `DisaggProduceContext` 继承 `BaseProduceContext`，额外暴露 `update_event`、`available_count()`、`target_abs` 和 `DisaggProduceProgress`。
 - 这样可以保留原来 `SyncProduceStrategy.produce_batch(ctx)` 的简单形状；不是改成 `produce_batch(ctx, progress)`。
@@ -447,18 +395,14 @@ self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build_colocate(..
 4. 拆出 `ProduceProgress` 和 `DisaggProduceProgress`。
 5. 把当前 `AsyncProduceStrategy` 拆成 `AsyncProduceStrategy` 和 `DisaggAsyncProduceStrategy`。
 6. 把 batch allocation、refresh、take batch、pause pending drain 抽成 module-level helper。
-7. 在 `AgentLoopManager.produce_batch(...)` 入口加 single-task / multi-task 分支，并把两个分支落到私有函数；disagg 保持统一状态机流程。
-8. 给 `ProduceStrategy` 和 `DisaggProduceStrategy` 都增加 `supports_multi_task`，当前策略都返回 `True`，manager 在 multi-task 构建时 fail fast。
-9. trainer 按类型调用不同 build 方法。
-10. 保留必要兼容导出，减少配置文件修改。
+7. trainer 按类型调用不同 build 方法。
+8. 保留必要兼容导出，减少配置文件修改。
 
 ## 14. 测试建议
 
 共卡 manager：
 
 - `AsyncProduceStrategyConfig` 在共卡下构建 `AsyncProduceStrategy`。
-- single-task `produce_batch` 走 `_produce_batch_single_task`，不触发 task allocation / task result 聚合。
-- multi-task `produce_batch` 走 `_produce_batch_multi_task`，继续覆盖 batch allocation 和稳定聚合。
 - 共卡 async `produce_batch()` 每次调用后不保留 pending。
 - 共卡 `produce_batch()` 不访问 `_status/_update_event/DisaggProduceProgress`。
 - 共卡 multi-task batch allocation 仍稳定。
@@ -475,8 +419,6 @@ self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build_colocate(..
 
 策略：
 
-- 所有当前 strategy 的 `supports_multi_task` 都是 `True`。
-- multi-task manager 遇到 `supports_multi_task=False` 的 strategy 时 fail fast。
 - `AsyncProduceStrategy` 覆盖 oversample、partial rollout、tail batch、local pending drain。
 - `DisaggAsyncProduceStrategy` 覆盖 `_PendingTasks` claim/schedule/cancel、abort、expired。
 
