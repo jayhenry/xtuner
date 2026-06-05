@@ -358,6 +358,8 @@ class BackgroundProduceContext(ProduceContext):
 
 
 class ProduceStrategy(Protocol):
+    supports_multi_task: bool
+
     async def produce_batch(self, ctx: ProduceContext, progress: Any) -> ProduceBatchStatus: ...
 
     async def pause_produce(self, ctx: ProduceContext, progress: Any) -> float:
@@ -438,6 +440,8 @@ class AsyncProduceStrategyConfig:
 
 
 class SyncProduceStrategy:
+    supports_multi_task = True
+
     def __init__(
         self,
         *,
@@ -484,6 +488,8 @@ async def put_finished_task_result(task: asyncio.Task, ctx: ProduceContext, metr
 
 
 class ColocateAsyncProduceStrategy:
+    supports_multi_task = True
+
     def __init__(
         self,
         *,
@@ -727,6 +733,8 @@ async def pause_pending_tasks(
 
 
 class BackgroundAsyncProduceStrategy:
+    supports_multi_task = True
+
     def __init__(
         self,
         *,
@@ -925,6 +933,23 @@ def task_names_of(task_runners: list[TaskRunner]) -> list[str]:
     return [task.task_name for task in task_runners]
 
 
+def single_task_runner(task_runners: list[TaskRunner]) -> TaskRunner:
+    assert len(task_runners) == 1
+    return task_runners[0]
+
+
+def validate_multi_task_strategy_support(task_runners: list[TaskRunner]) -> None:
+    if len(task_runners) <= 1:
+        return
+    unsupported = [
+        task.task_name
+        for task in task_runners
+        if not getattr(task.produce_strategy, "supports_multi_task", False)
+    ]
+    if unsupported:
+        raise ValueError(f"ProduceStrategy does not support multi-task production: {unsupported}")
+
+
 def allocate_task_batch_sizes(
     task_runners: list[TaskRunner],
     global_batch_size: int,
@@ -1006,6 +1031,7 @@ class ColocateAgentLoopManager:
         self.rollout_controller = rollout_controller
         self.logger = logger
         self.task_names = task_names_of(task_runners)
+        validate_multi_task_strategy_support(task_runners)
 
     def get_task_batch_sizes(self, global_batch_size: int, train_step: int) -> dict[str, int]:
         return allocate_task_batch_sizes(self.task_runners, global_batch_size, train_step)
@@ -1025,6 +1051,58 @@ class ColocateAgentLoopManager:
         - 返回必须是非空训练 batch。
         """
 
+        if len(self.task_runners) == 1:
+            return await self._produce_batch_single_task(
+                batch_size=batch_size,
+                train_step=train_step,
+                model_step=model_step,
+            )
+        return await self._produce_batch_multi_task(
+            batch_size=batch_size,
+            train_step=train_step,
+            model_step=model_step,
+        )
+
+    async def _produce_batch_single_task(
+        self,
+        *,
+        batch_size: int,
+        train_step: int,
+        model_step: int,
+    ) -> ProduceBatchResult:
+        # 单 task 简单路径：不走 task weight 分配、active task 过滤、跨 task 结果聚合。
+        task = single_task_runner(self.task_runners)
+        task_sizes = {task.task_name: batch_size}
+        progress = ColocateProduceProgress(task_sizes, train_step, model_step)
+
+        await self.rollout_controller.continue_generation()
+        try:
+            await refresh_for_all_tasks(
+                task_runners=[task],
+                replay_buffer=self.replay_buffer,
+                train_step=train_step,
+            )
+            await self._produce_colocate_task(task, batch_size, progress)
+            result = await take_train_batch(
+                task_runners=[task],
+                replay_buffer=self.replay_buffer,
+                task_sizes=task_sizes,
+                progress=progress,
+            )
+        finally:
+            await self.rollout_controller.pause_generation()
+
+        assert result.rollout_states, "共卡 produce_batch 必须返回非空训练 batch。"
+        return result
+
+    async def _produce_batch_multi_task(
+        self,
+        *,
+        batch_size: int,
+        train_step: int,
+        model_step: int,
+    ) -> ProduceBatchResult:
+        # 多 task 路径集中处理 batch allocation、active task 过滤和聚合。
         task_sizes = self.get_task_batch_sizes(batch_size, train_step)
         validate_task_batch_sizes(self.task_runners, task_sizes, batch_size)
         progress = ColocateProduceProgress(task_sizes, train_step, model_step)
@@ -1105,6 +1183,7 @@ class DisaggregatedAgentLoopManager:
         self.model_step = 0
         self.pause_time_s = 0.0
         self.progress = BackgroundProduceProgress.build(self.task_names)
+        validate_multi_task_strategy_support(task_runners)
 
     def get_task_batch_sizes(self, global_batch_size: int, train_step: int) -> dict[str, int]:
         return allocate_task_batch_sizes(self.task_runners, global_batch_size, train_step)

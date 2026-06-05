@@ -64,6 +64,7 @@ AsyncProduceStrategyConfig(...).build(mode=ProducerMode.DISAGGREGATED)
 - `ColocateAsyncProduceStrategy` 和 `BackgroundAsyncProduceStrategy` 不继承公共父类。两者各自显式持有配置字段，少量共享算法用 module-level helper 函数表达。
 - `ColocateAgentLoopManager` 和 `DisaggregatedAgentLoopManager` 不继承公共父类。task batch 分配、staleness refresh、take batch、result 聚合等共享逻辑用 module-level helper 函数表达。
 - `pause_produce` 的关键顺序和 pending drain 协议必须复用当前生产代码语义，抽成独立 helper，而不是藏在某个 manager 父类或 async strategy 父类里。
+- 不新增 `SingleTaskAgentLoopManager` / `MultiTaskAgentLoopManager`。single-task 和 multi-task 对 trainer 的 **Interface** 仍相同，当前差异主要是内部编排复杂度，所以在 public method 入口做一次分支，各自走私有函数。
 
 ## 5. Module 职责
 
@@ -90,6 +91,53 @@ AsyncProduceStrategyConfig(...).build(mode=ProducerMode.DISAGGREGATED)
 | `pause_pending_tasks(...)` | 复用 pending task pause / drain / cancel 协议 |
 
 这些 helper 是 Implementation 复用，不是新的业务 **Interface**。调用方仍只看到 mode-specific manager 和 strategy。
+
+## 5.1 Single-task / multi-task 分支
+
+`ColocateAgentLoopManager.produce_batch(...)` 可以在入口处显式拆成两个分支：
+
+```python
+async def produce_batch(...):
+    if self._is_single_task:
+        return await self._produce_batch_single_task(...)
+    return await self._produce_batch_multi_task(...)
+```
+
+这个规则只用于 colocate。disagg 的核心复杂度是后台 producer 状态机、**Expired Produce Batch**、pause/continue 和 `BackgroundProduceProgress`，single-task / multi-task 不是主要复杂度来源。为了避免复制 disagg 状态机，`DisaggregatedAgentLoopManager.produce_loop(...)`、`get_batch(...)`、`pause_produce(...)` 保持统一流程，不做 single/multi 私有分支。
+
+single-task 分支目标：
+
+- 不走 task weight allocation。
+- 不走 active task 过滤。
+- 不组装 `task_results`。
+- 不做跨 task status 聚合。
+- 直接使用唯一 `TaskRunner` 和 `{task_name: batch_size}`。
+
+multi-task 分支目标：
+
+- 集中处理 task batch allocation。
+- 校验所有 task batch size。
+- 过滤 batch size 为 0 的 inactive task。
+- 并发执行 active task。
+- 稳定排序并聚合 task results / status / metrics。
+
+这样做比新增 `SingleTaskAgentLoopManager` / `MultiTaskAgentLoopManager` 更合适，因为当前 single-task 和 multi-task 的 public 行为没有分化，只是 colocate 内部流程复杂度不同。等以后出现不同 checkpoint schema、不同 public capability 或 multi-task 专属状态时，再把 colocate 的两个私有分支提升成两个独立 manager **Adapter**。
+
+`ProduceStrategy` 增加一个只读能力标记：
+
+```python
+class ProduceStrategy:
+    supports_multi_task: bool = True
+```
+
+含义是“这个 per-task strategy 能否被 multi-task manager 并发编排”，不是“strategy 自己处理 multi-task”。当前 `SyncProduceStrategy`、`ColocateAsyncProduceStrategy`、`BackgroundAsyncProduceStrategy` 都返回 `True`。manager 在构建 multi-task runner 后 fail fast：
+
+```python
+if len(task_runners) > 1:
+    for task in task_runners:
+        if not task.produce_strategy.supports_multi_task:
+            raise ValueError(...)
+```
 
 ## 6. Config 构建规则
 
@@ -342,14 +390,18 @@ self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build_colocate(..
 4. 拆出 `ColocateProduceProgress` 和 `BackgroundProduceProgress`。
 5. 把当前 `AsyncProduceStrategy` 拆成 `ColocateAsyncProduceStrategy` 和 `BackgroundAsyncProduceStrategy`。
 6. 把 batch allocation、refresh、take batch、pause pending drain 抽成 module-level helper。
-7. trainer 按类型调用不同 build 方法。
-8. 保留必要兼容导出，减少配置文件修改。
+7. 在 `ColocateAgentLoopManager.produce_batch(...)` 入口加 single-task / multi-task 分支，并把两个分支落到私有函数；disagg 保持统一状态机流程。
+8. 给 `ProduceStrategy` 增加 `supports_multi_task`，当前策略都返回 `True`，manager 在 multi-task 构建时 fail fast。
+9. trainer 按类型调用不同 build 方法。
+10. 保留必要兼容导出，减少配置文件修改。
 
 ## 14. 测试建议
 
 共卡 manager：
 
 - `AsyncProduceStrategyConfig` 在共卡下构建 `ColocateAsyncProduceStrategy`。
+- single-task `produce_batch` 走 `_produce_batch_single_task`，不触发 task allocation / task result 聚合。
+- multi-task `produce_batch` 走 `_produce_batch_multi_task`，继续覆盖 batch allocation 和稳定聚合。
 - 共卡 async `produce_batch()` 每次调用后不保留 pending。
 - 共卡 `produce_batch()` 不访问 `_status/_update_event/BackgroundProduceProgress`。
 - 共卡 multi-task batch allocation 仍稳定。
@@ -358,6 +410,7 @@ self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build_colocate(..
 非共卡 manager：
 
 - `AsyncProduceStrategyConfig` 在非共卡下构建 `BackgroundAsyncProduceStrategy`。
+- `produce_loop/get_batch/pause_produce` 不做 single/multi 私有分支，避免复制后台状态机。
 - `produce_loop/get_batch` 仍处理空/非空 **Expired Produce Batch**。
 - `pause_produce/continue_produce` 顺序不变。
 - `pause_produce` 先设置 update event / manager status，再暂停 rollout controller，然后调用 strategy pending drain。
@@ -365,6 +418,8 @@ self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build_colocate(..
 
 策略：
 
+- 所有当前 strategy 的 `supports_multi_task` 都是 `True`。
+- multi-task manager 遇到 `supports_multi_task=False` 的 strategy 时 fail fast。
 - `ColocateAsyncProduceStrategy` 覆盖 oversample、partial rollout、tail batch、local pending drain。
 - `BackgroundAsyncProduceStrategy` 覆盖 `_PendingTasks` claim/schedule/cancel、abort、expired。
 
