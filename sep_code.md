@@ -34,35 +34,36 @@
 
 把现在一个宽 `AgentLoopManager` 拆成两个 manager **Module**：
 
-- `ColocateAgentLoopManager`
-- `DisaggregatedAgentLoopManager`
+- `AgentLoopManager`
+- `DisaggAgentLoopManager`
 
 把现在一个 `ProduceProgress` 拆成两个进度 **Module**：
 
-- `ColocateProduceProgress`
-- `BackgroundProduceProgress`
+- `ProduceProgress`
+- `DisaggProduceProgress`
 
 把现在一个完整 `AsyncProduceStrategy` 拆成两个具体 strategy **Adapter**：
 
-- `ColocateAsyncProduceStrategy`
-- `BackgroundAsyncProduceStrategy`
+- `AsyncProduceStrategy`
+- `DisaggAsyncProduceStrategy`
 
 `AsyncProduceStrategyConfig` 保留，按 manager 模式构建具体 Adapter：
 
 ```python
 AsyncProduceStrategyConfig(...).build(mode=ProducerMode.COLOCATE)
-# -> ColocateAsyncProduceStrategy
+# -> AsyncProduceStrategy
 
 AsyncProduceStrategyConfig(...).build(mode=ProducerMode.DISAGGREGATED)
-# -> BackgroundAsyncProduceStrategy
+# -> DisaggAsyncProduceStrategy
 ```
 
 也就是说，拆分的是执行模式，不是删除共卡 async。
 
 设计约束：
 
-- `ColocateAsyncProduceStrategy` 和 `BackgroundAsyncProduceStrategy` 不继承公共父类。两者各自显式持有配置字段，少量共享算法用 module-level helper 函数表达。
-- `ColocateAgentLoopManager` 和 `DisaggregatedAgentLoopManager` 不继承公共父类。task batch 分配、staleness refresh、take batch、result 聚合等共享逻辑用 module-level helper 函数表达。
+- `AsyncProduceStrategy` 和 `DisaggAsyncProduceStrategy` 不继承公共父类。两者各自显式持有配置字段，少量共享算法用 module-level helper 函数表达。
+- 共卡和非共卡的 strategy **Interface** 分开：`ProduceStrategy` 只定义共卡 `produce_batch(ctx)`；`DisaggProduceStrategy` 定义非共卡 `produce_batch(ctx)`、`pause_produce(ctx)`、`pending_task_count()`。两者没有公共抽象父类，避免把非共卡 pause/checkpoint 语义带进共卡。
+- `AgentLoopManager` 和 `DisaggAgentLoopManager` 不继承公共父类。task batch 分配、staleness refresh、take batch、result 聚合等共享逻辑用 module-level helper 函数表达。
 - `pause_produce` 的关键顺序和 pending drain 协议必须复用当前生产代码语义，抽成独立 helper，而不是藏在某个 manager 父类或 async strategy 父类里。
 - 不新增 `SingleTaskAgentLoopManager` / `MultiTaskAgentLoopManager`。single-task 和 multi-task 对 trainer 的 **Interface** 仍相同，当前差异主要是内部编排复杂度，所以在 public method 入口做一次分支，各自走私有函数。
 
@@ -71,12 +72,14 @@ AsyncProduceStrategyConfig(...).build(mode=ProducerMode.DISAGGREGATED)
 | Module | Interface | Implementation |
 | --- | --- | --- |
 | `AgentLoopManagerConfig` | `build_colocate(...)`, `build_disaggregated(...)` | 构建 task runner、sampler、agent loop、mode-specific strategy |
-| `ColocateAgentLoopManager` | `produce_batch(batch_size, train_step, model_step)` | 共卡单次生产、局部收尾、取训练 batch |
-| `DisaggregatedAgentLoopManager` | `produce_loop`, `get_batch`, `pause_produce`, `continue_produce`, `shutdown` | 非共卡后台生产和消费状态机 |
-| `ColocateProduceProgress` | `target_for`, `record_metrics`, `cleanup` | 单次共卡生产窗口，不进 checkpoint |
-| `BackgroundProduceProgress` | `ensure_target_upto`, `begin_consume`, `mark_consumed`, `state_dict` | 非共卡绝对累计 target/consumed 和 resume 状态 |
-| `ColocateAsyncProduceStrategy` | `produce_batch(ctx)` | 局部 pending set，结束时 drain 当前 pending |
-| `BackgroundAsyncProduceStrategy` | `produce_batch(ctx)`, `pause_produce(ctx)` | `_PendingTasks` 跨调用保存，处理 update event 和 model expired |
+| `AgentLoopManager` | `produce_batch(batch_size, train_step, model_step)` | 共卡单次生产、局部收尾、取训练 batch |
+| `DisaggAgentLoopManager` | `produce_loop`, `get_batch`, `pause_produce`, `continue_produce`, `shutdown` | 非共卡后台生产和消费状态机 |
+| `ProduceProgress` | `target_for`, `add_raw_rewards`, `add_produced`, `add_produce_time` | 单次共卡生产窗口，不进 checkpoint |
+| `DisaggProduceProgress` | `ensure_target_upto`, `begin_consume`, `mark_consumed`, `state_dict` | 非共卡绝对累计 target/consumed 和 resume 状态 |
+| `ProduceStrategy` | `produce_batch(ctx)` | 共卡 strategy 抽象接口父类，只接收 `ProduceContext` |
+| `DisaggProduceStrategy` | `produce_batch(ctx)`, `pause_produce(ctx)`, `pending_task_count()` | 非共卡 strategy 抽象接口父类，只接收 `DisaggProduceContext` |
+| `AsyncProduceStrategy` | `ProduceStrategy` | 局部 pending set，结束时 drain 当前 pending |
+| `DisaggAsyncProduceStrategy` | `DisaggProduceStrategy` | `_PendingTasks` 跨调用保存，处理 update event 和 model expired |
 
 建议的共享 helper：
 
@@ -94,7 +97,7 @@ AsyncProduceStrategyConfig(...).build(mode=ProducerMode.DISAGGREGATED)
 
 ## 5.1 Single-task / multi-task 分支
 
-`ColocateAgentLoopManager.produce_batch(...)` 可以在入口处显式拆成两个分支：
+`AgentLoopManager.produce_batch(...)` 可以在入口处显式拆成两个分支：
 
 ```python
 async def produce_batch(...):
@@ -103,7 +106,7 @@ async def produce_batch(...):
     return await self._produce_batch_multi_task(...)
 ```
 
-这个规则只用于 colocate。disagg 的核心复杂度是后台 producer 状态机、**Expired Produce Batch**、pause/continue 和 `BackgroundProduceProgress`，single-task / multi-task 不是主要复杂度来源。为了避免复制 disagg 状态机，`DisaggregatedAgentLoopManager.produce_loop(...)`、`get_batch(...)`、`pause_produce(...)` 保持统一流程，不做 single/multi 私有分支。
+这个规则只用于 colocate。disagg 的核心复杂度是后台 producer 状态机、**Expired Produce Batch**、pause/continue 和 `DisaggProduceProgress`，single-task / multi-task 不是主要复杂度来源。为了避免复制 disagg 状态机，`DisaggAgentLoopManager.produce_loop(...)`、`get_batch(...)`、`pause_produce(...)` 保持统一流程，不做 single/multi 私有分支。
 
 single-task 分支目标：
 
@@ -119,18 +122,21 @@ multi-task 分支目标：
 - 校验所有 task batch size。
 - 过滤 batch size 为 0 的 inactive task。
 - 并发执行 active task。
-- 稳定排序并聚合 task results / status / metrics。
+- 稳定排序并聚合 task results / status / 统计字段。
 
 这样做比新增 `SingleTaskAgentLoopManager` / `MultiTaskAgentLoopManager` 更合适，因为当前 single-task 和 multi-task 的 public 行为没有分化，只是 colocate 内部流程复杂度不同。等以后出现不同 checkpoint schema、不同 public capability 或 multi-task 专属状态时，再把 colocate 的两个私有分支提升成两个独立 manager **Adapter**。
 
-`ProduceStrategy` 增加一个只读能力标记：
+两个 strategy 接口都保留同名只读能力标记：
 
 ```python
 class ProduceStrategy:
     supports_multi_task: bool = True
+
+class DisaggProduceStrategy:
+    supports_multi_task: bool = True
 ```
 
-含义是“这个 per-task strategy 能否被 multi-task manager 并发编排”，不是“strategy 自己处理 multi-task”。当前 `SyncProduceStrategy`、`ColocateAsyncProduceStrategy`、`BackgroundAsyncProduceStrategy` 都返回 `True`。manager 在构建 multi-task runner 后 fail fast：
+含义是“这个 per-task strategy 能否被 multi-task manager 并发编排”，不是“strategy 自己处理 multi-task”。当前 `SyncProduceStrategy`、`AsyncProduceStrategy`、`DisaggAsyncProduceStrategy` 都返回 `True`。manager 在构建 multi-task runner 后 fail fast：
 
 ```python
 if len(task_runners) > 1:
@@ -147,14 +153,30 @@ if len(task_runners) > 1:
 class AgentLoopManagerConfig:
     def build_colocate(...):
         task_runners = self._build_task_runners(mode=ProducerMode.COLOCATE, ...)
-        return ColocateAgentLoopManager(task_runners, replay_buffer, logger)
+        return AgentLoopManager(task_runners, replay_buffer, logger)
 
     def build_disaggregated(...):
         task_runners = self._build_task_runners(mode=ProducerMode.DISAGGREGATED, ...)
-        return DisaggregatedAgentLoopManager(task_runners, replay_buffer, logger)
+        return DisaggAgentLoopManager(task_runners, replay_buffer, logger)
 ```
 
-`SyncProduceStrategyConfig` 可以在两种模式下都构建 `SyncProduceStrategy`，但非共卡 trainer 可继续保持现有约束：如果非共卡不允许 early stopping，则检查 `should_continue_fn` 必须是默认函数。
+`SyncProduceStrategyConfig` 只构建普通 `SyncProduceStrategy`。非共卡训练 producer 只有 async 派生类，因此 `build_disaggregated(...)` 下遇到 sync config 应 fail fast；非共卡评估仍通过普通 `AgentLoopManager` 使用同一个 `SyncProduceStrategy`：
+
+```python
+class SyncProduceStrategyConfig:
+    def build(self, *, mode, sync_weights_interval, rollout_controller):
+        if mode == ProducerMode.COLOCATE:
+            return SyncProduceStrategy(...)
+        if mode == ProducerMode.DISAGGREGATED:
+            raise ValueError("Disagg training only supports AsyncProduceStrategyConfig")
+```
+
+非共卡评估不是后台 producer，不构建 `DisaggProduceStrategy`：
+
+```python
+self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build_colocate(...)
+# eval task 可以继续使用 SyncProduceStrategyConfig -> SyncProduceStrategy
+```
 
 `AsyncProduceStrategyConfig` 按模式分派：
 
@@ -162,12 +184,35 @@ class AgentLoopManagerConfig:
 class AsyncProduceStrategyConfig:
     def build(self, *, mode, sync_weights_interval, rollout_controller):
         if mode == ProducerMode.COLOCATE:
-            return ColocateAsyncProduceStrategy(...)
+            return AsyncProduceStrategy(...)
         if mode == ProducerMode.DISAGGREGATED:
-            return BackgroundAsyncProduceStrategy(...)
+            return DisaggAsyncProduceStrategy(...)
 ```
 
-这个 **Seam** 的价值是：调用方仍只关心 `ProduceStrategy` **Interface**，但共卡和非共卡拿到的是不同 **Adapter**。
+这个 **Seam** 的价值是：调用方仍只关心 strategy config；共卡 manager 拿到 `ProduceStrategy`，非共卡 manager 拿到 `DisaggProduceStrategy`。两个 strategy **Interface** 的名字和方法签名不同，因此非共卡 pause / pending / checkpoint 语义不会泄漏到共卡 strategy。
+
+## 6.1 Strategy Context
+
+strategy 方法只接收 mode-specific context，不把 `Progress` 作为第二个散装参数：
+
+```python
+class BaseProduceContext:
+    ...
+
+class ProduceStrategy:
+    async def produce_batch(self, ctx: ProduceContext): ...
+
+class DisaggProduceStrategy:
+    async def produce_batch(self, ctx: DisaggProduceContext): ...
+    async def pause_produce(self, ctx: DisaggProduceContext): ...
+```
+
+原因是 `Progress` 仍按当前内部字段结构由 context 持有，但不应该变成 strategy 方法签名里的通用第二参数：
+
+- `BaseProduceContext` 保留当前 `ProduceContext` 的内部字段结构，例如 `task_batch_size`、`progress`、`stale_threshold`，以及 `generate_group()` / `put_generated_group()` 写 progress 统计字段的行为。
+- `ProduceContext` 是共卡简化版，只去掉非共卡需要的 `update_event`、绝对 consumed/target 访问和 checkpoint 语义，不把 raw rewards / produced samples / produce time 重构成一个 `metrics` 字段。
+- `DisaggProduceContext` 继承 `BaseProduceContext`，额外暴露 `update_event`、`available_count()`、`target_abs` 和 `DisaggProduceProgress`。
+- 这样可以保留原来 `SyncProduceStrategy.produce_batch(ctx)` 的简单形状；不是改成 `produce_batch(ctx, progress)`。
 
 ## 7. 共卡生产流程
 
@@ -180,7 +225,7 @@ await manager.produce_batch(batch_size, train_step, model_step=model_step)
 流程：
 
 1. 根据 `train_step` 计算 task batch sizes。
-2. 创建 `ColocateProduceProgress`。
+2. 创建 `ProduceProgress`。
 3. `continue_generation()`，切到 rollout 阶段。
 4. 各 task 调用 mode-specific strategy 生产到 replay buffer。
 5. strategy 收尾本次调用的 pending task。
@@ -193,7 +238,7 @@ await manager.produce_batch(batch_size, train_step, model_step=model_step)
 - `_status`
 - `_update_event`
 - `_finish_event`
-- `BackgroundProduceProgress`
+- `DisaggProduceProgress`
 - `_PendingTasks`
 - `produce_loop`
 - `get_batch`
@@ -209,14 +254,14 @@ producer_task = create_task(manager.produce_loop(batch_size))
 produce_result = await manager.get_batch(batch_size, train_step=train_step)
 ```
 
-`DisaggregatedAgentLoopManager` 独占以下状态：
+`DisaggAgentLoopManager` 独占以下状态：
 
 - `status`
 - `update_event`
 - `finish_event`
 - `model_step`
 - `pause_time_s`
-- `BackgroundProduceProgress`
+- `DisaggProduceProgress`
 
 核心不变量：
 
@@ -229,13 +274,13 @@ produce_result = await manager.get_batch(batch_size, train_step=train_step)
 
 `AsyncProduceStrategyConfig` 不变，但旧 `AsyncProduceStrategy` 的完整实现拆成两个具体 Adapter。
 
-### 9.1 `ColocateAsyncProduceStrategy`
+### 9.1 `AsyncProduceStrategy`
 
 职责：
 
 - 本次 `produce_batch()` 内创建 `pending_tasks = set()`。
 - 按 `over_sample_threshold`、tail batch、partial rollout 规则调度 rollout group。
-- 收到完成结果后过滤、写 replay buffer、更新本次 metrics。
+- 收到完成结果后过滤、写 replay buffer、更新本次统计字段。
 - 达到本次 batch target 后，暂停 agent loop 并 drain 本次 pending。
 
 它不负责：
@@ -247,7 +292,7 @@ produce_result = await manager.get_batch(batch_size, train_step=train_step)
 - checkpoint pending task。
 - 继承公共 async 父类。
 
-### 9.2 `BackgroundAsyncProduceStrategy`
+### 9.2 `DisaggAsyncProduceStrategy`
 
 职责：
 
@@ -260,7 +305,7 @@ produce_result = await manager.get_batch(batch_size, train_step=train_step)
 它不负责：
 
 - 从 replay buffer 取训练 batch。
-- 推进 `BackgroundProduceProgress` 的 consumer step。
+- 推进 `DisaggProduceProgress` 的 consumer step。
 - 触发权重同步。
 - 继承公共 async 父类。
 
@@ -276,27 +321,29 @@ produce_result = await manager.get_batch(batch_size, train_step=train_step)
 ```python
 async def pause_pending_tasks(
     *,
-    pending_tasks,
+    pending_tasks: set[asyncio.Task] | _PendingTasks,
     ctx,
     put_claimed_task,
 ) -> float:
-    if pending_tasks.count() == 0:
+    pending = normalize_pending_tasks(pending_tasks)
+
+    if pending.count() == 0:
         return 0.0
 
     pending_pause_tasks = {create_task(request_agent_loop_pause(ctx))}
     deadline = now() + PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S
     next_periodic_pause = now() + PERIODIC_ABORT_INTERVAL_S
 
-    while pending_tasks.count() > 0:
+    while pending.count() > 0:
         if now() > deadline:
-            await pending_tasks.cancel_all()
+            await pending.cancel_all()
             break
 
         if now() >= next_periodic_pause:
             pending_pause_tasks.add(create_task(request_agent_loop_pause(ctx)))
             next_periodic_pause += PERIODIC_ABORT_INTERVAL_S
 
-        claimed = await pending_tasks.wait_and_claim(timeout_s=1)
+        claimed = await pending.wait_and_claim(timeout_s=1)
         for task in claimed:
             await put_claimed_task(task)
 
@@ -304,21 +351,30 @@ async def pause_pending_tasks(
     return elapsed()
 ```
 
-共卡路径把本次调用的局部 `set[Task]` 包成 `_LocalPendingTasks` 后调用这个 helper；非共卡路径直接把 `_PendingTasks` 传给它。这样 pause 协议复用，但 pending 的生命周期仍然独立：
+`normalize_pending_tasks(...)` 是 helper 内部细节：
+
+```python
+def normalize_pending_tasks(pending_tasks):
+    if isinstance(pending_tasks, set):
+        return _LocalPendingTasks(pending_tasks)
+    return pending_tasks
+```
+
+共卡路径直接把本次调用的局部 `set[Task]` 传给 helper，helper 内部自动包成 `_LocalPendingTasks`；非共卡路径直接传 `_PendingTasks`。这样 pause 协议复用，但 pending 的生命周期仍然独立：
 
 - 共卡：pending 生命周期等于一次 `produce_batch()`。
 - 非共卡：pending 生命周期跨多次后台 `produce_batch()`。
 
 ## 10. Progress 拆分
 
-### 10.1 `ColocateProduceProgress`
+### 10.1 `ProduceProgress`
 
 字段：
 
 - `task_batch_sizes`
 - `train_step`
 - `model_step`
-- 本次 raw reward / produced samples / produced tokens / produce time metrics
+- 本次 raw reward / produced samples / produced tokens / produce time 统计字段
 
 特点：
 
@@ -327,7 +383,7 @@ async def pause_pending_tasks(
 - 不维护 consumer step。
 - 不暴露 `state_dict()`。
 
-### 10.2 `BackgroundProduceProgress`
+### 10.2 `DisaggProduceProgress`
 
 字段：
 
@@ -336,7 +392,7 @@ async def pause_pending_tasks(
 - `target_samples`
 - `consumed_samples`
 - `target_upto_future_step`
-- 后台 producer metrics
+- 后台 producer 统计字段
 
 特点：
 
@@ -385,13 +441,13 @@ self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build_colocate(..
 ## 13. 迁移步骤
 
 1. 新增 `ProducerMode` 和 mode-specific `build_colocate / build_disaggregated`。
-2. 新增 `ColocateAgentLoopManager`，把当前 `produce_batch()` 的共卡逻辑迁移过去。
-3. 新增 `DisaggregatedAgentLoopManager`，把 `produce_loop/get_batch/pause/continue/shutdown/save/resume` 迁移过去。
-4. 拆出 `ColocateProduceProgress` 和 `BackgroundProduceProgress`。
-5. 把当前 `AsyncProduceStrategy` 拆成 `ColocateAsyncProduceStrategy` 和 `BackgroundAsyncProduceStrategy`。
+2. 新增 `AgentLoopManager`，把当前 `produce_batch()` 的共卡逻辑迁移过去。
+3. 新增 `DisaggAgentLoopManager`，把 `produce_loop/get_batch/pause/continue/shutdown/save/resume` 迁移过去。
+4. 拆出 `ProduceProgress` 和 `DisaggProduceProgress`。
+5. 把当前 `AsyncProduceStrategy` 拆成 `AsyncProduceStrategy` 和 `DisaggAsyncProduceStrategy`。
 6. 把 batch allocation、refresh、take batch、pause pending drain 抽成 module-level helper。
-7. 在 `ColocateAgentLoopManager.produce_batch(...)` 入口加 single-task / multi-task 分支，并把两个分支落到私有函数；disagg 保持统一状态机流程。
-8. 给 `ProduceStrategy` 增加 `supports_multi_task`，当前策略都返回 `True`，manager 在 multi-task 构建时 fail fast。
+7. 在 `AgentLoopManager.produce_batch(...)` 入口加 single-task / multi-task 分支，并把两个分支落到私有函数；disagg 保持统一状态机流程。
+8. 给 `ProduceStrategy` 和 `DisaggProduceStrategy` 都增加 `supports_multi_task`，当前策略都返回 `True`，manager 在 multi-task 构建时 fail fast。
 9. trainer 按类型调用不同 build 方法。
 10. 保留必要兼容导出，减少配置文件修改。
 
@@ -399,29 +455,29 @@ self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build_colocate(..
 
 共卡 manager：
 
-- `AsyncProduceStrategyConfig` 在共卡下构建 `ColocateAsyncProduceStrategy`。
+- `AsyncProduceStrategyConfig` 在共卡下构建 `AsyncProduceStrategy`。
 - single-task `produce_batch` 走 `_produce_batch_single_task`，不触发 task allocation / task result 聚合。
 - multi-task `produce_batch` 走 `_produce_batch_multi_task`，继续覆盖 batch allocation 和稳定聚合。
 - 共卡 async `produce_batch()` 每次调用后不保留 pending。
-- 共卡 `produce_batch()` 不访问 `_status/_update_event/BackgroundProduceProgress`。
+- 共卡 `produce_batch()` 不访问 `_status/_update_event/DisaggProduceProgress`。
 - 共卡 multi-task batch allocation 仍稳定。
 - 共卡 local pending cleanup 复用 `pause_pending_tasks(...)`，但不创建 `_PendingTasks`。
 
 非共卡 manager：
 
-- `AsyncProduceStrategyConfig` 在非共卡下构建 `BackgroundAsyncProduceStrategy`。
+- `AsyncProduceStrategyConfig` 在非共卡下构建 `DisaggAsyncProduceStrategy`。
 - `produce_loop/get_batch/pause_produce` 不做 single/multi 私有分支，避免复制后台状态机。
 - `produce_loop/get_batch` 仍处理空/非空 **Expired Produce Batch**。
 - `pause_produce/continue_produce` 顺序不变。
 - `pause_produce` 先设置 update event / manager status，再暂停 rollout controller，然后调用 strategy pending drain。
-- checkpoint/resume 恢复 `BackgroundProduceProgress` 和 `model_step`。
+- checkpoint/resume 恢复 `DisaggProduceProgress` 和 `model_step`。
 
 策略：
 
 - 所有当前 strategy 的 `supports_multi_task` 都是 `True`。
 - multi-task manager 遇到 `supports_multi_task=False` 的 strategy 时 fail fast。
-- `ColocateAsyncProduceStrategy` 覆盖 oversample、partial rollout、tail batch、local pending drain。
-- `BackgroundAsyncProduceStrategy` 覆盖 `_PendingTasks` claim/schedule/cancel、abort、expired。
+- `AsyncProduceStrategy` 覆盖 oversample、partial rollout、tail batch、local pending drain。
+- `DisaggAsyncProduceStrategy` 覆盖 `_PendingTasks` claim/schedule/cancel、abort、expired。
 
 trainer：
 
@@ -442,8 +498,8 @@ trainer：
 
 ```python
 AsyncProduceStrategyConfig
-    -> ColocateAsyncProduceStrategy
-    -> BackgroundAsyncProduceStrategy
+    -> AsyncProduceStrategy
+    -> DisaggAsyncProduceStrategy
 ```
 
 而不是：

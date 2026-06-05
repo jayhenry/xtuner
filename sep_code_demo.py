@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
@@ -36,7 +37,7 @@ class ProducerMode(Enum):
     DISAGGREGATED = auto()
 
 
-class DisaggregatedManagerStatus(Enum):
+class DisaggManagerStatus(Enum):
     NORMAL = auto()
     UPDATE_WEIGHT_AND_ABORT = auto()
     EXPIRED_BATCH = auto()
@@ -175,7 +176,7 @@ def default_is_valid_sample_fn(samples: list[Any]) -> bool:
 
 
 @dataclass
-class ColocateProduceProgress:
+class ProduceProgress:
     """共卡单次 produce_batch 的局部进度。
 
     中文不变量：
@@ -187,17 +188,36 @@ class ColocateProduceProgress:
     task_batch_sizes: dict[str, int]
     train_step: int
     model_step: int
-    metrics_by_task: dict[str, ProduceMetrics] = field(default_factory=dict)
+    raw_rewards_sum: dict[str, float] = field(default_factory=dict)
+    raw_rewards_count: dict[str, int] = field(default_factory=dict)
+    produced_samples: dict[str, int] = field(default_factory=dict)
+    produced_tokens: dict[str, int] = field(default_factory=dict)
+    produce_time_s: float = 0.0
+
+    def __post_init__(self) -> None:
+        for task_name in self.task_batch_sizes:
+            self.raw_rewards_sum.setdefault(task_name, 0.0)
+            self.raw_rewards_count.setdefault(task_name, 0)
+            self.produced_samples.setdefault(task_name, 0)
+            self.produced_tokens.setdefault(task_name, 0)
 
     def target_for(self, task_name: str) -> int:
         return self.task_batch_sizes[task_name]
 
-    def metrics_for(self, task_name: str) -> ProduceMetrics:
-        return self.metrics_by_task.setdefault(task_name, ProduceMetrics())
+    def add_raw_rewards(self, task_name: str, rewards_sum: float, rewards_count: int) -> None:
+        self.raw_rewards_sum[task_name] += rewards_sum
+        self.raw_rewards_count[task_name] += rewards_count
+
+    def add_produced(self, task_name: str, samples: int, tokens: int) -> None:
+        self.produced_samples[task_name] += samples
+        self.produced_tokens[task_name] += tokens
+
+    def add_produce_time(self, elapsed_s: float) -> None:
+        self.produce_time_s += elapsed_s
 
 
 @dataclass
-class BackgroundProduceProgress:
+class DisaggProduceProgress:
     """非共卡 Background Producer / Training Consumer 共享进度。
 
     中文不变量：
@@ -213,14 +233,22 @@ class BackgroundProduceProgress:
     target_upto_future_step: int = 0
     consumed_samples: dict[str, int] = field(default_factory=dict)
     target_samples: dict[str, int] = field(default_factory=dict)
-    metrics_by_task: dict[str, ProduceMetrics] = field(default_factory=dict)
+    raw_rewards_sum: dict[str, float] = field(default_factory=dict)
+    raw_rewards_count: dict[str, int] = field(default_factory=dict)
+    produced_samples: dict[str, int] = field(default_factory=dict)
+    produced_tokens: dict[str, int] = field(default_factory=dict)
+    produce_time_s: float = 0.0
 
     @classmethod
-    def build(cls, task_names: list[str]) -> "BackgroundProduceProgress":
+    def build(cls, task_names: list[str]) -> "DisaggProduceProgress":
         return cls(
             task_names=task_names,
             consumed_samples={name: 0 for name in task_names},
             target_samples={name: 0 for name in task_names},
+            raw_rewards_sum={name: 0.0 for name in task_names},
+            raw_rewards_count={name: 0 for name in task_names},
+            produced_samples={name: 0 for name in task_names},
+            produced_tokens={name: 0 for name in task_names},
         )
 
     def ensure_target_upto(
@@ -251,8 +279,16 @@ class BackgroundProduceProgress:
     def advance_future_step(self) -> None:
         self.producer_future_step += 1
 
-    def metrics_for(self, task_name: str) -> ProduceMetrics:
-        return self.metrics_by_task.setdefault(task_name, ProduceMetrics())
+    def add_raw_rewards(self, task_name: str, rewards_sum: float, rewards_count: int) -> None:
+        self.raw_rewards_sum[task_name] += rewards_sum
+        self.raw_rewards_count[task_name] += rewards_count
+
+    def add_produced(self, task_name: str, samples: int, tokens: int) -> None:
+        self.produced_samples[task_name] += samples
+        self.produced_tokens[task_name] += tokens
+
+    def add_produce_time(self, elapsed_s: float) -> None:
+        self.produce_time_s += elapsed_s
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -261,7 +297,11 @@ class BackgroundProduceProgress:
             "target_upto_future_step": self.target_upto_future_step,
             "consumed_samples": dict(self.consumed_samples),
             "target_samples": dict(self.target_samples),
-            "metrics_by_task": self.metrics_by_task,
+            "raw_rewards_sum": dict(self.raw_rewards_sum),
+            "raw_rewards_count": dict(self.raw_rewards_count),
+            "produced_samples": dict(self.produced_samples),
+            "produced_tokens": dict(self.produced_tokens),
+            "produce_time_s": self.produce_time_s,
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -272,22 +312,32 @@ class BackgroundProduceProgress:
         self.consumed_samples.update(state["consumed_samples"])
         self.target_samples.clear()
         self.target_samples.update(state["target_samples"])
-        self.metrics_by_task = state.get("metrics_by_task", {})
+        self.raw_rewards_sum.clear()
+        self.raw_rewards_sum.update(state.get("raw_rewards_sum", {}))
+        self.raw_rewards_count.clear()
+        self.raw_rewards_count.update(state.get("raw_rewards_count", {}))
+        self.produced_samples.clear()
+        self.produced_samples.update(state.get("produced_samples", {}))
+        self.produced_tokens.clear()
+        self.produced_tokens.update(state.get("produced_tokens", {}))
+        self.produce_time_s = state.get("produce_time_s", 0.0)
 
 
 @dataclass
-class ProduceContext:
+class BaseProduceContext:
     """strategy 生产一个 task 时看到的公共上下文。
 
-    共卡和非共卡共享生成、采样、入库能力；是否允许 abort、target 如何计算由子类表达。
+    共卡和非共卡共享生成、采样、入库能力；具体 target / abort 语义由子类表达。
     """
 
     task_name: str
     agent_loop: AgentLoop
     sampler: Sampler
     replay_buffer: ReplayBuffer
+    task_batch_size: int
     train_step: int
     model_step: int
+    progress: ProduceProgress | DisaggProduceProgress
     is_valid_sample_fn: IsValidSampleFn
     stale_threshold: int | None
 
@@ -295,23 +345,21 @@ class ProduceContext:
     def current_train_step_for_staleness(self) -> int:
         return self.train_step
 
-    def should_abort(self) -> bool:
-        return False
-
     async def generate_group(
         self,
         group: list[Any],
         *,
         enable_partial_rollout: bool,
-    ) -> tuple[list[Any], float]:
+    ) -> list[Any]:
         start = time.perf_counter()
         result = await self.agent_loop.generate_group(
             group,
             enable_partial_rollout=enable_partial_rollout,
         )
-        return result, time.perf_counter() - start
+        self.progress.add_produce_time(time.perf_counter() - start)
+        return result
 
-    async def put_generated_group(self, group: list[Any], metrics: ProduceMetrics) -> bool:
+    async def put_generated_group(self, group: list[Any]) -> bool:
         """统一处理生成结果过滤、统计和入库。
 
         中文设计点：
@@ -320,7 +368,11 @@ class ProduceContext:
         - put 之后重新判断 group 状态，因为 completed 可能在入库前被转成 expired。
         """
 
-        if get_group_status(group) == Status.COMPLETED:
+        is_completed = get_group_status(group) == Status.COMPLETED
+        produced_tokens = sum(len(getattr(item, "response_ids", []) or []) for item in group)
+        if is_completed:
+            # 真实实现按当前字段结构写 raw_rewards_sum/raw_rewards_count，不把这些字段重构成 metrics 对象。
+            self.progress.add_raw_rewards(self.task_name, rewards_sum=0.0, rewards_count=0)
             if not self.is_valid_sample_fn(group):
                 for item in group:
                     item.status = Status.FILTERED
@@ -332,14 +384,27 @@ class ProduceContext:
             current_train_step=self.current_train_step_for_staleness,
             stale_threshold=self.stale_threshold,
         )
-        metrics.produced_samples += len(group)
+        self.progress.add_produced(self.task_name, samples=len(group), tokens=produced_tokens)
         return get_group_status(group) == Status.COMPLETED
 
 
 @dataclass
-class BackgroundProduceContext(ProduceContext):
+class ProduceContext(BaseProduceContext):
+    """共卡生产 context。
+
+    中文设计点：
+    - 去掉非共卡 update_event / absolute consumed / checkpoint progress 语义。
+    - 保留当前 ProduceContext 内部字段结构：task_batch_size、progress、stale_threshold 等仍按原形状传递。
+    """
+
+    def should_abort(self) -> bool:
+        return False
+
+
+@dataclass
+class DisaggProduceContext(BaseProduceContext):
     update_event: asyncio.Event
-    progress: BackgroundProduceProgress
+    progress: DisaggProduceProgress
 
     @property
     def current_train_step_for_staleness(self) -> int:
@@ -357,12 +422,23 @@ class BackgroundProduceContext(ProduceContext):
         return self.progress.target_samples[self.task_name]
 
 
-class ProduceStrategy(Protocol):
-    supports_multi_task: bool
+class ProduceStrategy(ABC):
+    supports_multi_task: bool = True
 
-    async def produce_batch(self, ctx: ProduceContext, progress: Any) -> ProduceBatchStatus: ...
+    @abstractmethod
+    async def produce_batch(self, ctx: ProduceContext) -> ProduceBatchStatus: ...
 
-    async def pause_produce(self, ctx: ProduceContext, progress: Any) -> float:
+    def is_model_expired(self, train_step: int, model_step: int) -> bool:
+        return False
+
+
+class DisaggProduceStrategy(ABC):
+    supports_multi_task: bool = True
+
+    @abstractmethod
+    async def produce_batch(self, ctx: DisaggProduceContext) -> ProduceBatchStatus: ...
+
+    async def pause_produce(self, ctx: DisaggProduceContext) -> float:
         return 0.0
 
     def is_model_expired(self, train_step: int, model_step: int) -> bool:
@@ -372,6 +448,9 @@ class ProduceStrategy(Protocol):
         return 0
 
 
+ModeSpecificProduceStrategy = ProduceStrategy | DisaggProduceStrategy
+
+
 class ProduceStrategyConfig(Protocol):
     def build(
         self,
@@ -379,7 +458,7 @@ class ProduceStrategyConfig(Protocol):
         mode: ProducerMode,
         sync_weights_interval: int,
         rollout_controller: RolloutController,
-    ) -> ProduceStrategy: ...
+    ) -> ModeSpecificProduceStrategy: ...
 
 
 @dataclass
@@ -393,10 +472,15 @@ class SyncProduceStrategyConfig:
         mode: ProducerMode,
         sync_weights_interval: int,
         rollout_controller: RolloutController,
-    ) -> ProduceStrategy:
-        return SyncProduceStrategy(
-            is_valid_sample_fn=self.is_valid_sample_fn,
-            should_continue_fn=self.should_continue_fn,
+    ) -> ModeSpecificProduceStrategy:
+        if mode == ProducerMode.COLOCATE:
+            return SyncProduceStrategy(
+                is_valid_sample_fn=self.is_valid_sample_fn,
+                should_continue_fn=self.should_continue_fn,
+            )
+        raise ValueError(
+            "Disagg training only supports AsyncProduceStrategyConfig; "
+            "disagg evaluation should build a normal AgentLoopManager and use SyncProduceStrategy."
         )
 
 
@@ -415,10 +499,10 @@ class AsyncProduceStrategyConfig:
         mode: ProducerMode,
         sync_weights_interval: int,
         rollout_controller: RolloutController,
-    ) -> ProduceStrategy:
+    ) -> ModeSpecificProduceStrategy:
         # 同一个 AsyncProduceStrategyConfig 按执行模式构建不同 Adapter。
         if mode == ProducerMode.COLOCATE:
-            return ColocateAsyncProduceStrategy(
+            return AsyncProduceStrategy(
                 over_sample_threshold=self.over_sample_threshold,
                 enable_partial_rollout=self.enable_partial_rollout,
                 max_staleness=self.max_staleness,
@@ -428,7 +512,7 @@ class AsyncProduceStrategyConfig:
                 should_continue_fn=self.should_continue_fn,
             )
 
-        return BackgroundAsyncProduceStrategy(
+        return DisaggAsyncProduceStrategy(
             over_sample_threshold=self.over_sample_threshold,
             enable_partial_rollout=self.enable_partial_rollout,
             max_staleness=self.max_staleness,
@@ -439,7 +523,7 @@ class AsyncProduceStrategyConfig:
         )
 
 
-class SyncProduceStrategy:
+class SyncProduceStrategy(ProduceStrategy):
     supports_multi_task = True
 
     def __init__(
@@ -451,28 +535,25 @@ class SyncProduceStrategy:
         self.is_valid_sample_fn = is_valid_sample_fn
         self.should_continue_fn = should_continue_fn
 
-    async def produce_batch(self, ctx: ProduceContext, progress: ColocateProduceProgress) -> ProduceBatchStatus:
+    async def produce_batch(self, ctx: ProduceContext) -> ProduceBatchStatus:
         pending: set[asyncio.Task] = set()
-        metrics = progress.metrics_for(ctx.task_name)
-        target = progress.target_for(ctx.task_name)
 
-        for _ in range(target):
+        for _ in range(ctx.task_batch_size):
             group = await ctx.sampler.sample(task_name=ctx.task_name)
             pending.add(asyncio.create_task(ctx.generate_group(group, enable_partial_rollout=False)))
 
         completed = 0
-        while self.should_continue_fn(completed, target):
+        while self.should_continue_fn(completed, ctx.task_batch_size):
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
-                group, elapsed_s = task.result()
-                metrics.add_group_time(elapsed_s)
-                if await ctx.put_generated_group(group, metrics):
+                group = task.result()
+                if await ctx.put_generated_group(group):
                     completed += 1
 
         return ProduceBatchStatus.NORMAL
 
 
-async def sample_retry_or_new_group(ctx: ProduceContext, *, from_expired_pool: bool) -> list[Any]:
+async def sample_retry_or_new_group(ctx: BaseProduceContext, *, from_expired_pool: bool) -> list[Any]:
     statuses = [Status.EXPIRED, Status.ABORTED] if from_expired_pool else [Status.ABORTED]
     return await ctx.sampler.sample(task_name=ctx.task_name, group_status=statuses)
 
@@ -481,13 +562,12 @@ def is_model_expired_for_threshold(*, stale_threshold: int, train_step: int, mod
     return calculate_seq_staleness(model_step, train_step) >= stale_threshold
 
 
-async def put_finished_task_result(task: asyncio.Task, ctx: ProduceContext, metrics: ProduceMetrics) -> bool:
-    group, elapsed_s = task.result()
-    metrics.add_group_time(elapsed_s)
-    return await ctx.put_generated_group(group, metrics)
+async def put_finished_task_result(task: asyncio.Task, ctx: BaseProduceContext) -> bool:
+    group = task.result()
+    return await ctx.put_generated_group(group)
 
 
-class ColocateAsyncProduceStrategy:
+class AsyncProduceStrategy(ProduceStrategy):
     supports_multi_task = True
 
     def __init__(
@@ -520,7 +600,6 @@ class ColocateAsyncProduceStrategy:
     async def produce_batch(
         self,
         ctx: ProduceContext,
-        progress: ColocateProduceProgress,
     ) -> ProduceBatchStatus:
         """共卡 async 生产。
 
@@ -531,9 +610,7 @@ class ColocateAsyncProduceStrategy:
         """
 
         pending: set[asyncio.Task] = set()
-        metrics = progress.metrics_for(ctx.task_name)
-        target = progress.target_for(ctx.task_name)
-        scheduled_target = target + int(target * self.over_sample_threshold)
+        scheduled_target = ctx.task_batch_size + int(ctx.task_batch_size * self.over_sample_threshold)
         completed = await ctx.replay_buffer.count(ctx.task_name, Status.COMPLETED)
 
         async def schedule_one() -> None:
@@ -551,31 +628,32 @@ class ColocateAsyncProduceStrategy:
             await schedule_one()
 
         try:
-            while self.should_continue_fn(completed, target):
+            while self.should_continue_fn(completed, ctx.task_batch_size):
                 if not pending:
                     break
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
-                    if await put_finished_task_result(task, ctx, metrics):
+                    if await put_finished_task_result(task, ctx):
                         completed += 1
 
-                while len(pending) + completed < scheduled_target and self.should_continue_fn(completed, target):
+                while len(pending) + completed < scheduled_target and self.should_continue_fn(
+                    completed, ctx.task_batch_size
+                ):
                     await schedule_one()
         finally:
-            metrics.pause_time_s += await self._cleanup_local_pending(pending, ctx, metrics)
+            await self._cleanup_local_pending(pending, ctx)
 
         return ProduceBatchStatus.NORMAL
 
     async def _cleanup_local_pending(
         self,
         pending: set[asyncio.Task],
-        ctx: ProduceContext,
-        metrics: ProduceMetrics,
+        ctx: BaseProduceContext,
     ) -> float:
         return await pause_pending_tasks(
-            pending_tasks=_LocalPendingTasks(pending),
+            pending_tasks=pending,
             ctx=ctx,
-            put_claimed_task=lambda task: put_finished_task_result(task, ctx, metrics),
+            put_claimed_task=lambda task: put_finished_task_result(task, ctx),
         )
 
 
@@ -655,7 +733,16 @@ class _PendingTasks:
         return len(tasks)
 
 
-async def request_agent_loop_pause(ctx: ProduceContext, *, pending_count: int) -> None:
+PendingTasksInput = set[asyncio.Task] | _PendingTasks
+
+
+def _normalize_pending_tasks(pending_tasks: PendingTasksInput) -> _LocalPendingTasks | _PendingTasks:
+    if isinstance(pending_tasks, set):
+        return _LocalPendingTasks(pending_tasks)
+    return pending_tasks
+
+
+async def request_agent_loop_pause(ctx: BaseProduceContext, *, pending_count: int) -> None:
     """发送一次 agent loop pause 请求。
 
     最新生产代码里 pause_produce 会周期性调用 agent_loop.pause()，这里把这段协议抽成全局工具函数，
@@ -676,8 +763,8 @@ async def request_agent_loop_pause(ctx: ProduceContext, *, pending_count: int) -
 
 async def pause_pending_tasks(
     *,
-    pending_tasks: _LocalPendingTasks | _PendingTasks,
-    ctx: ProduceContext,
+    pending_tasks: PendingTasksInput,
+    ctx: BaseProduceContext,
     put_claimed_task: Callable[[asyncio.Task], Awaitable[Any]],
 ) -> float:
     """复用当前 pause_produce 的 pending drain 协议。
@@ -689,12 +776,13 @@ async def pause_pending_tasks(
     - 已完成任务必须 claim 后再 put，避免 produce 和 pause 重复入库同一个 done task。
     """
 
+    pending = _normalize_pending_tasks(pending_tasks)
     pause_start = time.perf_counter()
-    if pending_tasks.count() == 0:
+    if pending.count() == 0:
         return 0.0
 
     pending_pause_tasks = {
-        asyncio.create_task(request_agent_loop_pause(ctx, pending_count=pending_tasks.count()))
+        asyncio.create_task(request_agent_loop_pause(ctx, pending_count=pending.count()))
     }
     cleanup_start_time = time.perf_counter()
     next_periodic_abort_time = cleanup_start_time + PERIODIC_ABORT_INTERVAL_S
@@ -702,25 +790,25 @@ async def pause_pending_tasks(
     while True:
         elapsed_time = time.perf_counter() - cleanup_start_time
         if elapsed_time > PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S:
-            cancelled_count = await pending_tasks.cancel_all()
+            cancelled_count = await pending.cancel_all()
             print(
                 f"Cleanup timeout reached. Forcefully cancelling {cancelled_count} "
                 f"remaining tasks for task={ctx.task_name}."
             )
             break
 
-        if pending_tasks.count() == 0:
+        if pending.count() == 0:
             break
 
         current_time = time.perf_counter()
         pending_pause_tasks = {task for task in pending_pause_tasks if not task.done()}
         if PERIODIC_ABORT_INTERVAL_S > 0 and current_time >= next_periodic_abort_time:
             pending_pause_tasks.add(
-                asyncio.create_task(request_agent_loop_pause(ctx, pending_count=pending_tasks.count()))
+                asyncio.create_task(request_agent_loop_pause(ctx, pending_count=pending.count()))
             )
             next_periodic_abort_time += PERIODIC_ABORT_INTERVAL_S
 
-        claimed_done = await pending_tasks.wait_and_claim(timeout_s=1.0)
+        claimed_done = await pending.wait_and_claim(timeout_s=1.0)
         for task in claimed_done:
             await put_claimed_task(task)
 
@@ -732,7 +820,7 @@ async def pause_pending_tasks(
     return time.perf_counter() - pause_start
 
 
-class BackgroundAsyncProduceStrategy:
+class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
     supports_multi_task = True
 
     def __init__(
@@ -768,8 +856,7 @@ class BackgroundAsyncProduceStrategy:
 
     async def produce_batch(
         self,
-        ctx: BackgroundProduceContext,
-        progress: BackgroundProduceProgress,
+        ctx: DisaggProduceContext,
     ) -> ProduceBatchStatus:
         """非共卡后台 async 生产。
 
@@ -781,11 +868,10 @@ class BackgroundAsyncProduceStrategy:
 
         if ctx.should_abort():
             return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
-        if self.is_model_expired(progress.producer_future_step, ctx.model_step):
+        if self.is_model_expired(ctx.progress.producer_future_step, ctx.model_step):
             return ProduceBatchStatus.EXPIRED_BATCH
 
-        metrics = progress.metrics_for(ctx.task_name)
-        await self._put_claimed(await self._pending_tasks.claim_ready(), ctx, metrics)
+        await self._put_claimed(await self._pending_tasks.claim_ready(), ctx)
 
         target_abs = ctx.target_abs
         oversample_budget = int(ctx.train_step * self.over_sample_threshold)
@@ -803,7 +889,7 @@ class BackgroundAsyncProduceStrategy:
         while True:
             if ctx.should_abort():
                 return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
-            if self.is_model_expired(progress.producer_future_step, ctx.model_step):
+            if self.is_model_expired(ctx.progress.producer_future_step, ctx.model_step):
                 return ProduceBatchStatus.EXPIRED_BATCH
 
             available = await ctx.available_count()
@@ -819,28 +905,25 @@ class BackgroundAsyncProduceStrategy:
                 pass
 
             claimed = await self._pending_tasks.wait_and_claim(timeout_s=1.0)
-            await self._put_claimed(claimed, ctx, metrics)
+            await self._put_claimed(claimed, ctx)
 
     async def pause_produce(
         self,
-        ctx: BackgroundProduceContext,
-        progress: BackgroundProduceProgress,
+        ctx: DisaggProduceContext,
     ) -> float:
-        metrics = progress.metrics_for(ctx.task_name)
         return await pause_pending_tasks(
             pending_tasks=self._pending_tasks,
             ctx=ctx,
-            put_claimed_task=lambda task: put_finished_task_result(task, ctx, metrics),
+            put_claimed_task=lambda task: put_finished_task_result(task, ctx),
         )
 
     async def _put_claimed(
         self,
         claimed: set[asyncio.Task],
-        ctx: ProduceContext,
-        metrics: ProduceMetrics,
+        ctx: BaseProduceContext,
     ) -> None:
         for task in claimed:
-            await put_finished_task_result(task, ctx, metrics)
+            await put_finished_task_result(task, ctx)
 
 
 @dataclass(frozen=True)
@@ -848,7 +931,7 @@ class TaskRunner:
     task_name: str
     agent_loop: AgentLoop
     sampler: Sampler
-    produce_strategy: ProduceStrategy
+    produce_strategy: ModeSpecificProduceStrategy
     weight: float = 1.0
     order: int = 0
 
@@ -869,7 +952,7 @@ class AgentLoopManagerConfig:
         replay_buffer: ReplayBuffer,
         logger: Any,
         sync_weights_interval: int,
-    ) -> "ColocateAgentLoopManager":
+    ) -> "AgentLoopManager":
         runners = self._build_task_runners(
             mode=ProducerMode.COLOCATE,
             rollout_controller=rollout_controller,
@@ -878,7 +961,7 @@ class AgentLoopManagerConfig:
             logger=logger,
             sync_weights_interval=sync_weights_interval,
         )
-        return ColocateAgentLoopManager(runners, replay_buffer, rollout_controller, logger)
+        return AgentLoopManager(runners, replay_buffer, rollout_controller, logger)
 
     def build_disaggregated(
         self,
@@ -888,7 +971,7 @@ class AgentLoopManagerConfig:
         replay_buffer: ReplayBuffer,
         logger: Any,
         sync_weights_interval: int,
-    ) -> "DisaggregatedAgentLoopManager":
+    ) -> "DisaggAgentLoopManager":
         runners = self._build_task_runners(
             mode=ProducerMode.DISAGGREGATED,
             rollout_controller=rollout_controller,
@@ -897,7 +980,7 @@ class AgentLoopManagerConfig:
             logger=logger,
             sync_weights_interval=sync_weights_interval,
         )
-        return DisaggregatedAgentLoopManager(runners, replay_buffer, rollout_controller, logger)
+        return DisaggAgentLoopManager(runners, replay_buffer, rollout_controller, logger)
 
     def _build_task_runners(
         self,
@@ -989,10 +1072,10 @@ async def take_train_batch(
     task_runners: list[TaskRunner],
     replay_buffer: ReplayBuffer,
     task_sizes: dict[str, int],
-    progress: ColocateProduceProgress | BackgroundProduceProgress,
+    progress: ProduceProgress | DisaggProduceProgress,
 ) -> ProduceBatchResult:
     batch_by_task, consumed_counts = await replay_buffer.take_batch(task_sizes)
-    if isinstance(progress, BackgroundProduceProgress):
+    if isinstance(progress, DisaggProduceProgress):
         progress.mark_consumed(consumed_counts)
 
     counts = await replay_buffer.count_statuses(
@@ -1012,13 +1095,13 @@ def build_produce_batch_result(
     task_runners: list[TaskRunner],
     batch_by_task: dict[str, list[list[Any]]],
     leftover_counts: dict[str, dict[Status, int]],
-    progress: ColocateProduceProgress | BackgroundProduceProgress,
+    progress: ProduceProgress | DisaggProduceProgress,
 ) -> ProduceBatchResult:
     # 真实实现负责 task result 聚合、timing 聚合、leftover 聚合。
     ...
 
 
-class ColocateAgentLoopManager:
+class AgentLoopManager:
     def __init__(
         self,
         task_runners: list[TaskRunner],
@@ -1073,7 +1156,7 @@ class ColocateAgentLoopManager:
         # 单 task 简单路径：不走 task weight 分配、active task 过滤、跨 task 结果聚合。
         task = single_task_runner(self.task_runners)
         task_sizes = {task.task_name: batch_size}
-        progress = ColocateProduceProgress(task_sizes, train_step, model_step)
+        progress = ProduceProgress(task_sizes, train_step, model_step)
 
         await self.rollout_controller.continue_generation()
         try:
@@ -1105,7 +1188,7 @@ class ColocateAgentLoopManager:
         # 多 task 路径集中处理 batch allocation、active task 过滤和聚合。
         task_sizes = self.get_task_batch_sizes(batch_size, train_step)
         validate_task_batch_sizes(self.task_runners, task_sizes, batch_size)
-        progress = ColocateProduceProgress(task_sizes, train_step, model_step)
+        progress = ProduceProgress(task_sizes, train_step, model_step)
 
         await self.rollout_controller.continue_generation()
         try:
@@ -1137,22 +1220,24 @@ class ColocateAgentLoopManager:
         self,
         task: TaskRunner,
         task_batch_size: int,
-        progress: ColocateProduceProgress,
+        progress: ProduceProgress,
     ) -> ProduceBatchStatus:
         ctx = ProduceContext(
             task_name=task.task_name,
             agent_loop=task.agent_loop,
             sampler=task.sampler,
             replay_buffer=self.replay_buffer,
+            task_batch_size=task_batch_size,
             train_step=progress.train_step,
             model_step=progress.model_step,
+            progress=progress,
             is_valid_sample_fn=getattr(task.produce_strategy, "is_valid_sample_fn", default_is_valid_sample_fn),
             stale_threshold=task.stale_threshold,
         )
-        return await task.produce_strategy.produce_batch(ctx, progress)
+        return await task.produce_strategy.produce_batch(ctx)
 
     async def save(self, checkpoint_path: Path, model_step: int) -> None:
-        # 共卡 checkpoint 不保存 BackgroundProduceProgress。
+        # 共卡 checkpoint 不保存 DisaggProduceProgress。
         for task in self.task_runners:
             task.sampler.save(checkpoint_path / "tasks" / task.task_name)
         await self.replay_buffer.save(checkpoint_path)
@@ -1164,7 +1249,7 @@ class ColocateAgentLoopManager:
         return 0
 
 
-class DisaggregatedAgentLoopManager:
+class DisaggAgentLoopManager:
     def __init__(
         self,
         task_runners: list[TaskRunner],
@@ -1177,12 +1262,12 @@ class DisaggregatedAgentLoopManager:
         self.rollout_controller = rollout_controller
         self.logger = logger
         self.task_names = task_names_of(task_runners)
-        self.status = DisaggregatedManagerStatus.NORMAL
+        self.status = DisaggManagerStatus.NORMAL
         self.update_event = asyncio.Event()
         self.finish_event = asyncio.Event()
         self.model_step = 0
         self.pause_time_s = 0.0
-        self.progress = BackgroundProduceProgress.build(self.task_names)
+        self.progress = DisaggProduceProgress.build(self.task_names)
         validate_multi_task_strategy_support(task_runners)
 
     def get_task_batch_sizes(self, global_batch_size: int, train_step: int) -> dict[str, int]:
@@ -1192,11 +1277,11 @@ class DisaggregatedAgentLoopManager:
         """非共卡 Background Producer。"""
 
         while not self.finish_event.is_set():
-            if self.status == DisaggregatedManagerStatus.FINISH:
+            if self.status == DisaggManagerStatus.FINISH:
                 break
             if self.status in (
-                DisaggregatedManagerStatus.UPDATE_WEIGHT_AND_ABORT,
-                DisaggregatedManagerStatus.EXPIRED_BATCH,
+                DisaggManagerStatus.UPDATE_WEIGHT_AND_ABORT,
+                DisaggManagerStatus.EXPIRED_BATCH,
             ):
                 await self._wait_for_status_exit(self.status)
                 continue
@@ -1216,9 +1301,9 @@ class DisaggregatedAgentLoopManager:
             )
 
             if ProduceBatchStatus.EXPIRED_BATCH in statuses:
-                self.status = DisaggregatedManagerStatus.EXPIRED_BATCH
+                self.status = DisaggManagerStatus.EXPIRED_BATCH
             elif ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT in statuses:
-                self.status = DisaggregatedManagerStatus.UPDATE_WEIGHT_AND_ABORT
+                self.status = DisaggManagerStatus.UPDATE_WEIGHT_AND_ABORT
             else:
                 self.progress.advance_future_step()
 
@@ -1238,7 +1323,7 @@ class DisaggregatedAgentLoopManager:
         current_model_step = train_step - 1
 
         while not self.finish_event.is_set():
-            if self.status == DisaggregatedManagerStatus.EXPIRED_BATCH:
+            if self.status == DisaggManagerStatus.EXPIRED_BATCH:
                 if current_model_step > self.model_step:
                     return ProduceBatchResult([], status=ProduceBatchStatus.EXPIRED_BATCH)
                 if not await self.replay_buffer.is_ready(task_sizes):
@@ -1251,7 +1336,7 @@ class DisaggregatedAgentLoopManager:
                     task_sizes=task_sizes,
                     progress=self.progress,
                 )
-                if self.status == DisaggregatedManagerStatus.EXPIRED_BATCH:
+                if self.status == DisaggManagerStatus.EXPIRED_BATCH:
                     result.status = ProduceBatchStatus.EXPIRED_BATCH
                 if result.rollout_states:
                     self.progress.finish_consume(train_step)
@@ -1270,24 +1355,24 @@ class DisaggregatedAgentLoopManager:
         """非共卡权重同步前的显式暂停入口。"""
 
         self.update_event.set()
-        self.status = DisaggregatedManagerStatus.UPDATE_WEIGHT_AND_ABORT
+        self.status = DisaggManagerStatus.UPDATE_WEIGHT_AND_ABORT
         await self.rollout_controller.pause_generation()
 
         pause_time_s = 0.0
         for task in self.task_runners:
             ctx = self._build_background_context(task, task_batch_size=0)
-            pause_time_s += await task.produce_strategy.pause_produce(ctx, self.progress)
+            pause_time_s += await task.produce_strategy.pause_produce(ctx)
         self.pause_time_s = pause_time_s
         return pause_time_s
 
     async def continue_produce(self, model_step: int) -> None:
         self.model_step = model_step
         await self.rollout_controller.continue_generation()
-        self.status = DisaggregatedManagerStatus.NORMAL
+        self.status = DisaggManagerStatus.NORMAL
         self.update_event.clear()
 
     def shutdown(self) -> None:
-        self.status = DisaggregatedManagerStatus.FINISH
+        self.status = DisaggManagerStatus.FINISH
         self.update_event.set()
         self.finish_event.set()
 
@@ -1314,29 +1399,30 @@ class DisaggregatedAgentLoopManager:
         self.update_event = asyncio.Event()
         self.finish_event = asyncio.Event()
         self.update_event.set()
-        self.status = DisaggregatedManagerStatus.UPDATE_WEIGHT_AND_ABORT
+        self.status = DisaggManagerStatus.UPDATE_WEIGHT_AND_ABORT
         self.model_step = saved_model_step
         return saved_model_step
 
     async def _produce_background_task(self, task: TaskRunner, task_batch_size: int) -> ProduceBatchStatus:
         ctx = self._build_background_context(task, task_batch_size)
-        return await task.produce_strategy.produce_batch(ctx, self.progress)
+        return await task.produce_strategy.produce_batch(ctx)
 
-    def _build_background_context(self, task: TaskRunner, task_batch_size: int) -> BackgroundProduceContext:
-        return BackgroundProduceContext(
+    def _build_background_context(self, task: TaskRunner, task_batch_size: int) -> DisaggProduceContext:
+        return DisaggProduceContext(
             task_name=task.task_name,
             agent_loop=task.agent_loop,
             sampler=task.sampler,
             replay_buffer=self.replay_buffer,
+            task_batch_size=task_batch_size,
             train_step=self.progress.producer_future_step,
             model_step=self.model_step,
+            progress=self.progress,
             is_valid_sample_fn=getattr(task.produce_strategy, "is_valid_sample_fn", default_is_valid_sample_fn),
             stale_threshold=task.stale_threshold,
             update_event=self.update_event,
-            progress=self.progress,
         )
 
-    async def _wait_for_status_exit(self, blocked_status: DisaggregatedManagerStatus) -> None:
+    async def _wait_for_status_exit(self, blocked_status: DisaggManagerStatus) -> None:
         while not self.finish_event.is_set() and self.status == blocked_status:
             await asyncio.sleep(1.0)
 
@@ -1347,7 +1433,7 @@ class DisaggregatedAgentLoopManager:
         ...
 
 
-class RLColocateTrainer:
+class RLTrainer:
     def __init__(self, cfg: Any) -> None:
         self.agent_loop_manager = cfg.agent_loop_manager_cfg.build_colocate(
             rollout_controller=cfg.rollout_controller,
@@ -1371,7 +1457,7 @@ class RLColocateTrainer:
             self._train_one_batch(produce_result.rollout_states, train_step)
 
 
-class RLDisaggregatedTrainer:
+class RLDisaggTrainer:
     def __init__(self, cfg: Any) -> None:
         train_replay_buffer = cfg.replay_buffer_config.build()
         self.agent_loop_manager = cfg.agent_loop_manager_cfg.build_disaggregated(
