@@ -371,16 +371,17 @@ def normalize_pending_tasks(pending_tasks):
 
 字段：
 
-- `task_batch_sizes`
-- `train_step`
-- `model_step`
+- `producer_future_step`
+- `target_samples`
 - 本次 raw reward / produced samples / produced tokens / produce time 统计字段
 
 特点：
 
 - 不保存到 checkpoint。
-- 不维护绝对累计 target。
-- 不维护 consumer step。
+- 不维护 `next_consumer_step / consumed_samples / target_upto_future_step`。
+- 不新增 `model_step` 字段；`model_step` 仍是 manager 构建 `ProduceContext` 时传入的运行时参数。
+- 不把当前 `target_samples` 改名为 `task_batch_sizes`。共卡路径里 `target_samples` 表达本次 `produce_batch()` 的局部 target，不是非共卡的绝对累计 target。
+- 不维护非共卡后台 producer 推进语义；`producer_future_step` 只作为本次 staleness / future step 写入字段。
 - 不暴露 `state_dict()`。
 
 ### 10.2 `DisaggProduceProgress`

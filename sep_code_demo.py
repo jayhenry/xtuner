@@ -182,27 +182,34 @@ class ProduceProgress:
     中文不变量：
     - 只表达本次调用，不进入 checkpoint。
     - pending task 由具体 strategy 在本次调用内持有。
-    - 不维护 producer_future_step / consumed_samples 等非共卡绝对累计状态。
+    - 字段名沿用当前 ProduceProgress；只裁剪非共卡需要的 next_consumer_step / consumed_samples / target_upto_future_step / state_dict。
+    - 不新增 model_step，model_step 仍由 manager 放进 ProduceContext。
     """
 
-    task_batch_sizes: dict[str, int]
-    train_step: int
-    model_step: int
+    producer_future_step: int
+    target_samples: dict[str, int]
     raw_rewards_sum: dict[str, float] = field(default_factory=dict)
     raw_rewards_count: dict[str, int] = field(default_factory=dict)
     produced_samples: dict[str, int] = field(default_factory=dict)
     produced_tokens: dict[str, int] = field(default_factory=dict)
     produce_time_s: float = 0.0
 
+    @classmethod
+    def build_local(cls, *, target_samples: dict[str, int], train_step: int) -> "ProduceProgress":
+        return cls(
+            producer_future_step=train_step,
+            target_samples=dict(target_samples),
+        )
+
     def __post_init__(self) -> None:
-        for task_name in self.task_batch_sizes:
+        for task_name in self.target_samples:
             self.raw_rewards_sum.setdefault(task_name, 0.0)
             self.raw_rewards_count.setdefault(task_name, 0)
             self.produced_samples.setdefault(task_name, 0)
             self.produced_tokens.setdefault(task_name, 0)
 
     def target_for(self, task_name: str) -> int:
-        return self.task_batch_sizes[task_name]
+        return self.target_samples[task_name]
 
     def add_raw_rewards(self, task_name: str, rewards_sum: float, rewards_count: int) -> None:
         self.raw_rewards_sum[task_name] += rewards_sum
@@ -1156,7 +1163,7 @@ class AgentLoopManager:
         # 单 task 简单路径：不走 task weight 分配、active task 过滤、跨 task 结果聚合。
         task = single_task_runner(self.task_runners)
         task_sizes = {task.task_name: batch_size}
-        progress = ProduceProgress(task_sizes, train_step, model_step)
+        progress = ProduceProgress.build_local(target_samples=task_sizes, train_step=train_step)
 
         await self.rollout_controller.continue_generation()
         try:
@@ -1165,7 +1172,7 @@ class AgentLoopManager:
                 replay_buffer=self.replay_buffer,
                 train_step=train_step,
             )
-            await self._produce_colocate_task(task, batch_size, progress)
+            await self._produce_colocate_task(task, batch_size, progress, model_step=model_step)
             result = await take_train_batch(
                 task_runners=[task],
                 replay_buffer=self.replay_buffer,
@@ -1188,7 +1195,7 @@ class AgentLoopManager:
         # 多 task 路径集中处理 batch allocation、active task 过滤和聚合。
         task_sizes = self.get_task_batch_sizes(batch_size, train_step)
         validate_task_batch_sizes(self.task_runners, task_sizes, batch_size)
-        progress = ProduceProgress(task_sizes, train_step, model_step)
+        progress = ProduceProgress.build_local(target_samples=task_sizes, train_step=train_step)
 
         await self.rollout_controller.continue_generation()
         try:
@@ -1199,7 +1206,12 @@ class AgentLoopManager:
             )
             await asyncio.gather(
                 *[
-                    self._produce_colocate_task(task, task_sizes[task.task_name], progress)
+                    self._produce_colocate_task(
+                        task,
+                        task_sizes[task.task_name],
+                        progress,
+                        model_step=model_step,
+                    )
                     for task in self.task_runners
                     if task_sizes[task.task_name] > 0
                 ]
@@ -1221,6 +1233,8 @@ class AgentLoopManager:
         task: TaskRunner,
         task_batch_size: int,
         progress: ProduceProgress,
+        *,
+        model_step: int,
     ) -> ProduceBatchStatus:
         ctx = ProduceContext(
             task_name=task.task_name,
@@ -1228,8 +1242,8 @@ class AgentLoopManager:
             sampler=task.sampler,
             replay_buffer=self.replay_buffer,
             task_batch_size=task_batch_size,
-            train_step=progress.train_step,
-            model_step=progress.model_step,
+            train_step=progress.producer_future_step,
+            model_step=model_step,
             progress=progress,
             is_valid_sample_fn=getattr(task.produce_strategy, "is_valid_sample_fn", default_is_valid_sample_fn),
             stale_threshold=task.stale_threshold,
