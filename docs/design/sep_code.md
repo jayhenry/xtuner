@@ -263,6 +263,7 @@ produce_result = get_batch_task.result()
 - 持有 `_PendingTasks`，允许 pending task 跨多次 `produce_batch()` 调用存在。
 - 观察 `ctx.should_abort()`。
 - 根据 `model_step / producer_future_step` 判断 **Expired Produce Batch**。
+- 保留当前 async producer 的生产预算语义：normal 模式的 oversample 预算按 `ceil(over_sample_threshold * task_batch_size)` 计算；tail-batch 模式从 expired / aborted pool 采样，且不再扩大 oversample 窗口。
 - `pause_produce()` drain 或 cancel pending。
 - 为 checkpoint 提供 `pending_task_count()`。
 

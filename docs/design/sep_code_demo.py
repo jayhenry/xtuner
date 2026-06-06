@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -354,6 +355,9 @@ class BaseProduceContext:
     async def sample_group(self, *, from_expired_pool: bool) -> list[Any]:
         statuses = [Status.EXPIRED, Status.ABORTED] if from_expired_pool else [Status.ABORTED]
         return await self.sampler.sample(task_name=self.task_name, group_status=statuses)
+
+    async def expired_count(self) -> int:
+        return await self.replay_buffer.count(self.task_name, Status.EXPIRED)
 
     async def generate_group(
         self,
@@ -846,12 +850,17 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
 
         await self._put_claimed(await self._pending_tasks.claim_ready(), ctx)
 
+        expired_count = await ctx.expired_count()
+        sample_from_expired = self.tail_batch_trigger_size > 0 and expired_count >= self.tail_batch_trigger_size
+
+        # 保持当前实现语义：normal 模式只按本 task batch size 追加固定超发预算；
+        # tail-batch 模式只补必要缺口，并固定从 expired/aborted pool 取样。
         target_abs = ctx.target_abs
-        oversample_budget = int(ctx.train_step * self.over_sample_threshold)
+        oversample_budget = 0 if sample_from_expired else math.ceil(self.over_sample_threshold * ctx.task_batch_size)
         scheduled_target = target_abs + oversample_budget
 
         async def spawn_one() -> asyncio.Task:
-            group = await ctx.sample_group(from_expired_pool=False)
+            group = await ctx.sample_group(from_expired_pool=sample_from_expired)
             return asyncio.create_task(
                 ctx.generate_group(
                     group,
