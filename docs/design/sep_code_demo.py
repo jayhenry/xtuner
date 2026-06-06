@@ -3,7 +3,8 @@
 说明：
 - 这是设计伪代码，用来展示 Module、Interface 和 Adapter 关系，不是可直接运行实现。
 - 重点是把共卡同步生产和非共卡 Background Producer / Training Consumer 分开。
-- AsyncProduceStrategyConfig 仍可用于共卡；区别是按模式构建不同的具体 ProduceStrategy Adapter。
+- 共卡 AsyncProduceStrategyConfig 和非共卡 DisaggAsyncProduceStrategyConfig 是不同配置类型，
+  不在 strategy config.build(...) 里用 mode 切换。
 """
 
 from __future__ import annotations
@@ -468,10 +469,18 @@ class ProduceStrategyConfig(Protocol):
     def build(
         self,
         *,
-        mode: ProducerMode,
         sync_weights_interval: int,
         rollout_controller: RolloutController,
-    ) -> ModeSpecificProduceStrategy: ...
+    ) -> ProduceStrategy: ...
+
+
+class DisaggProduceStrategyConfig(Protocol):
+    def build(
+        self,
+        *,
+        sync_weights_interval: int,
+        rollout_controller: RolloutController,
+    ) -> DisaggProduceStrategy: ...
 
 
 @dataclass
@@ -482,18 +491,12 @@ class SyncProduceStrategyConfig:
     def build(
         self,
         *,
-        mode: ProducerMode,
         sync_weights_interval: int,
         rollout_controller: RolloutController,
-    ) -> ModeSpecificProduceStrategy:
-        if mode == "colocate":
-            return SyncProduceStrategy(
-                is_valid_sample_fn=self.is_valid_sample_fn,
-                should_continue_fn=self.should_continue_fn,
-            )
-        raise ValueError(
-            "Disagg training only supports AsyncProduceStrategyConfig; "
-            "disagg evaluation should build a normal AgentLoopManager and use SyncProduceStrategy."
+    ) -> ProduceStrategy:
+        return SyncProduceStrategy(
+            is_valid_sample_fn=self.is_valid_sample_fn,
+            should_continue_fn=self.should_continue_fn,
         )
 
 
@@ -509,22 +512,35 @@ class AsyncProduceStrategyConfig:
     def build(
         self,
         *,
-        mode: ProducerMode,
         sync_weights_interval: int,
         rollout_controller: RolloutController,
-    ) -> ModeSpecificProduceStrategy:
-        # 同一个 AsyncProduceStrategyConfig 按执行模式构建不同 Adapter。
-        if mode == "colocate":
-            return AsyncProduceStrategy(
-                over_sample_threshold=self.over_sample_threshold,
-                enable_partial_rollout=self.enable_partial_rollout,
-                max_staleness=self.max_staleness,
-                sync_weights_interval=sync_weights_interval,
-                tail_batch_trigger_size=self.tail_batch_trigger_size,
-                is_valid_sample_fn=self.is_valid_sample_fn,
-                should_continue_fn=self.should_continue_fn,
-            )
+    ) -> ProduceStrategy:
+        return AsyncProduceStrategy(
+            over_sample_threshold=self.over_sample_threshold,
+            enable_partial_rollout=self.enable_partial_rollout,
+            max_staleness=self.max_staleness,
+            sync_weights_interval=sync_weights_interval,
+            tail_batch_trigger_size=self.tail_batch_trigger_size,
+            is_valid_sample_fn=self.is_valid_sample_fn,
+            should_continue_fn=self.should_continue_fn,
+        )
 
+
+@dataclass
+class DisaggAsyncProduceStrategyConfig:
+    over_sample_threshold: float = 0.0
+    enable_partial_rollout: bool = False
+    max_staleness: int = 0
+    tail_batch_trigger_size: int = 0
+    is_valid_sample_fn: IsValidSampleFn = default_is_valid_sample_fn
+    should_continue_fn: ShouldContinueFn = default_should_continue_fn
+
+    def build(
+        self,
+        *,
+        sync_weights_interval: int,
+        rollout_controller: RolloutController,
+    ) -> DisaggProduceStrategy:
         return DisaggAsyncProduceStrategy(
             over_sample_threshold=self.over_sample_threshold,
             enable_partial_rollout=self.enable_partial_rollout,
@@ -976,8 +992,18 @@ class AgentLoopManagerConfig:
     ) -> list[TaskRunner]:
         runners: list[TaskRunner] = []
         for task_cfg in self.tasks:
+            # manager mode 只选择 manager 类型；strategy 的执行环境由 config 类型表达。
+            if mode == "colocate" and not isinstance(
+                task_cfg.produce_strategy_config,
+                (SyncProduceStrategyConfig, AsyncProduceStrategyConfig),
+            ):
+                raise ValueError("colocate mode expects ProduceStrategyConfig")
+            if mode == "disaggregated" and not isinstance(
+                task_cfg.produce_strategy_config,
+                DisaggAsyncProduceStrategyConfig,
+            ):
+                raise ValueError("disaggregated mode expects DisaggProduceStrategyConfig")
             strategy = task_cfg.produce_strategy_config.build(
-                mode=mode,
                 sync_weights_interval=sync_weights_interval,
                 rollout_controller=rollout_controller,
             )

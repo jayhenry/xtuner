@@ -13,19 +13,19 @@
 - 非共卡路径修改容易改变共卡 `produce_batch()` 的同步行为。
 - `AsyncProduceStrategy` 的 pending task 既被当作单次调用局部状态，又被当作非共卡跨调用后台状态。
 
-本设计目标是拆开生产侧代码，让共卡生产和非共卡生产各自有独立 **Module**、独立 **Interface** 和独立状态；同时保留 `AsyncProduceStrategyConfig` 在共卡训练中的异步生产能力。
+本设计目标是拆开生产侧代码，让共卡生产和非共卡生产各自有独立 **Module**、独立 **Interface** 和独立状态；同时保留 `AsyncProduceStrategyConfig` 在共卡训练中的异步生产能力，并用 `DisaggAsyncProduceStrategyConfig` 显式表达非共卡后台 producer。
 
 ## 2. 目标
 
 1. 共卡生产修改不影响非共卡生产。
 2. 非共卡 **Background Producer** / **Training Consumer** 状态机修改不影响共卡 `produce_batch()`。
-3. `AsyncProduceStrategyConfig` 保持可用于共卡训练和非共卡训练，但构建出不同的具体 strategy **Adapter**。
+3. 共卡和非共卡使用不同的 strategy config：`AsyncProduceStrategyConfig` 构建共卡 `AsyncProduceStrategy`，`DisaggAsyncProduceStrategyConfig` 构建非共卡 `DisaggAsyncProduceStrategy`。
 4. 共卡 async 生产保持简单：pending task 只属于单次 `AgentLoopManager.produce_batch()`，不跨 manager 调用保存。
 5. 非共卡 async 生产保留后台 pending、pause/continue、Expired Produce Batch、checkpoint/resume 等能力。
 
 ## 3. 非目标
 
-- 不改变 trainer 配置文件中的 `AsyncProduceStrategyConfig(...)` 用法。
+- 不兼容把 `AsyncProduceStrategyConfig(...)` 同时用于共卡和非共卡训练；非共卡训练配置必须显式使用 `DisaggAsyncProduceStrategyConfig(...)`。
 - 不改变 replay buffer 的领域语义。
 - 不在共卡路径引入非共卡状态机。
 - 不把所有共享 helper 都拆成公开接口；共享逻辑可以作为私有 Implementation 留在 manager 包内部。
@@ -47,13 +47,13 @@
 - `AsyncProduceStrategy`
 - `DisaggAsyncProduceStrategy`
 
-`AsyncProduceStrategyConfig` 保留，按 manager 模式构建具体 Adapter：
+共卡和非共卡使用不同 config 构建具体 Adapter，不在 strategy config 的 `build(...)` 里传 `mode`：
 
 ```python
-AsyncProduceStrategyConfig(...).build(mode="colocate")
+AsyncProduceStrategyConfig(...).build(...)
 # -> AsyncProduceStrategy
 
-AsyncProduceStrategyConfig(...).build(mode="disaggregated")
+DisaggAsyncProduceStrategyConfig(...).build(...)
 # -> DisaggAsyncProduceStrategy
 ```
 
@@ -65,14 +65,14 @@ AsyncProduceStrategyConfig(...).build(mode="disaggregated")
 - 共卡和非共卡的 strategy **Interface** 分开：`ProduceStrategy` 定义共卡 `produce_batch(ctx)`、`pause_produce(ctx)`；`DisaggProduceStrategy` 定义非共卡 `produce_batch(ctx)`、`pause_produce(ctx)`、`pending_task_count()`。共卡 `pause_produce(ctx)` 只收尾本次 manager 调用的 pending，不承载非共卡 checkpoint / update-event 语义。
 - `AgentLoopManager` 和 `DisaggAgentLoopManager` 不继承公共父类。task batch 分配、staleness refresh、take batch、result 聚合等共享逻辑用 module-level helper 函数表达。
 - `pause_produce` 的关键顺序和 pending drain 协议必须复用当前生产代码语义，核心 drain 协议抽成 `pause_pending_tasks(...)`，而不是藏在某个 manager 父类或 async strategy 父类里。
-- 所有 Config 只暴露一个 `build(...)`；具体构建哪类对象由 Config 属性决定，例如 `AgentLoopManagerConfig.mode = "colocate"`。
+- 所有 Config 只暴露一个 `build(...)`；`AgentLoopManagerConfig.mode` 只选择 manager 类型，strategy 类型由 `ProduceStrategyConfig` / `DisaggProduceStrategyConfig` 的具体 config 类型决定。
 - 不新增 single-task / multi-task manager，也不在本次改造里新增 single/multi 私有分支；继续复用当前 task batch allocation 和结果聚合逻辑。
 
 ## 5. Module 职责
 
 | Module | Interface | Implementation |
 | --- | --- | --- |
-| `AgentLoopManagerConfig` | `build(...)` | 根据 `mode` 构建 task runner、sampler、agent loop、mode-specific strategy 和 manager |
+| `AgentLoopManagerConfig` | `build(...)` | 根据 `mode` 构建 task runner、sampler、agent loop 和 manager，并校验 strategy config 类型 |
 | `AgentLoopManager` | `produce_batch(batch_size, train_step, model_step)` | 共卡单次生产、局部收尾、取训练 batch |
 | `DisaggAgentLoopManager` | `produce_loop`, `get_batch`, `pause_produce`, `continue_produce`, `shutdown` | 非共卡后台生产和消费状态机 |
 | `ProduceProgress` | `build`, `add_raw_rewards`, `add_produced`, `add_produce_time` | 单次共卡生产窗口，不进 checkpoint |
@@ -96,51 +96,66 @@ AsyncProduceStrategyConfig(...).build(mode="disaggregated")
 
 ## 6. Config 构建规则
 
-`TaskSpecConfig.produce_strategy_config` 继续接受 `SyncProduceStrategyConfig` 或 `AsyncProduceStrategyConfig`。差异只发生在 `build()` 阶段。所有 Config 都只保留一个 `build(...)`，不再提供 `build_colocate(...)` / `build_disaggregated(...)` 这类 mode-specific wrapper：
+`TaskSpecConfig.produce_strategy_config` 接受两类 config：
+
+- 共卡：`ProduceStrategyConfig`，例如 `SyncProduceStrategyConfig` / `AsyncProduceStrategyConfig`。
+- 非共卡：`DisaggProduceStrategyConfig`，例如 `DisaggAsyncProduceStrategyConfig`。
+
+所有 Config 都只保留一个 `build(...)`，不提供 `build_colocate(...)` / `build_disaggregated(...)` 这类 mode-specific wrapper，也不在 strategy config 的 `build(...)` 里传 `mode`：
 
 ```python
 class AgentLoopManagerConfig:
     mode: Literal["colocate", "disaggregated"] = "colocate"
 
     def build(...):
-        task_runners = self._build_task_runners(mode=self.mode, ...)
+        if self.mode == "colocate":
+            assert isinstance(task_cfg.produce_strategy_config, ProduceStrategyConfig)
+        if self.mode == "disaggregated":
+            assert isinstance(task_cfg.produce_strategy_config, DisaggProduceStrategyConfig)
+
+        strategy = task_cfg.produce_strategy_config.build(
+            sync_weights_interval=sync_weights_interval,
+            rollout_controller=rollout_controller,
+        )
         if self.mode == "colocate":
             return AgentLoopManager(task_runners, replay_buffer, logger)
         if self.mode == "disaggregated":
             return DisaggAgentLoopManager(task_runners, replay_buffer, logger)
 ```
 
-`SyncProduceStrategyConfig` 只构建普通 `SyncProduceStrategy`。非共卡训练 producer 只有 async 派生类，因此 `AgentLoopManagerConfig(mode="disaggregated").build(...)` 下遇到 sync config 应 fail fast；非共卡评估仍通过 `mode="colocate"` 的普通 `AgentLoopManager` 使用同一个 `SyncProduceStrategy`：
+`SyncProduceStrategyConfig` 只构建普通 `SyncProduceStrategy`。非共卡训练 producer 只有非共卡 async config，因此 `AgentLoopManagerConfig(mode="disaggregated").build(...)` 下遇到 sync / 共卡 async config 应 fail fast：
 
 ```python
 class SyncProduceStrategyConfig:
-    def build(self, *, mode, sync_weights_interval, rollout_controller):
-        if mode == "colocate":
-            return SyncProduceStrategy(...)
-        if mode == "disaggregated":
-            raise ValueError("Disagg training only supports AsyncProduceStrategyConfig")
+    def build(self, *, sync_weights_interval, rollout_controller):
+        return SyncProduceStrategy(...)
+```
+
+`AsyncProduceStrategyConfig` 只构建共卡 async strategy：
+
+```python
+class AsyncProduceStrategyConfig:
+    def build(self, *, sync_weights_interval, rollout_controller):
+        return AsyncProduceStrategy(...)
+```
+
+`DisaggAsyncProduceStrategyConfig` 只构建非共卡后台 async strategy：
+
+```python
+class DisaggAsyncProduceStrategyConfig:
+    def build(self, *, sync_weights_interval, rollout_controller):
+        return DisaggAsyncProduceStrategy(...)
 ```
 
 非共卡评估不是后台 producer，不构建 `DisaggProduceStrategy`：
 
 ```python
-cfg.eval_agent_loop_manager_cfg.mode = "colocate"
-self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build(...)
+eval_agent_loop_manager_cfg = cfg.eval_agent_loop_manager_cfg.model_copy(update={"mode": "colocate"})
+self.eval_agent_loop_manager = eval_agent_loop_manager_cfg.build(...)
 # eval task 可以继续使用 SyncProduceStrategyConfig -> SyncProduceStrategy
 ```
 
-`AsyncProduceStrategyConfig` 按模式分派：
-
-```python
-class AsyncProduceStrategyConfig:
-    def build(self, *, mode, sync_weights_interval, rollout_controller):
-        if mode == "colocate":
-            return AsyncProduceStrategy(...)
-        if mode == "disaggregated":
-            return DisaggAsyncProduceStrategy(...)
-```
-
-这个构建边界的价值是：调用方仍只关心 strategy config；共卡 manager 拿到 `ProduceStrategy`，非共卡 manager 拿到 `DisaggProduceStrategy`。两个 strategy **Interface** 的名字和方法签名不同，因此非共卡 pending / checkpoint 语义不会泄漏到共卡 strategy。
+这个构建边界的价值是：共卡 manager 拿到 `ProduceStrategy`，非共卡 manager 拿到 `DisaggProduceStrategy`，配置类型本身表达执行环境。两个 strategy **Interface** 的名字和方法签名不同，因此非共卡 pending / checkpoint 语义不会泄漏到共卡 strategy，也不会藏在 strategy config 的 `mode` 分支里。
 
 ## 6.1 Strategy Context
 
@@ -179,7 +194,7 @@ await manager.produce_batch(batch_size, train_step, model_step=model_step)
 1. 根据 `train_step` 计算 task batch sizes。
 2. 创建 `ProduceProgress`。
 3. `continue_generation()`，切到 rollout 阶段。
-4. 各 task 并发调用 mode-specific strategy 的 `produce_batch(ctx)`，只生产到 replay buffer。
+4. 各 task 并发调用对应 strategy 的 `produce_batch(ctx)`，只生产到 replay buffer。
 5. 等所有 active task 的 `produce_batch(ctx)` 都返回后，manager 再逐个调用 `pause_produce(ctx)`，由 strategy 内部复用 `pause_pending_tasks(...)` 收尾本次 pending。
 6. 从 replay buffer 取 completed rollout groups。
 7. `pause_generation()`，切回静止态。
@@ -235,7 +250,7 @@ produce_result = get_batch_task.result()
 
 ## 9. Async 策略拆分
 
-`AsyncProduceStrategyConfig` 不变，但旧 `AsyncProduceStrategy` 的完整实现拆成两个具体 Adapter。
+旧 `AsyncProduceStrategy` 的完整实现拆成两个具体 Adapter，并由两个 config 分别构建。
 
 ### 9.1 `AsyncProduceStrategy`
 
@@ -393,6 +408,7 @@ Replay buffer 是真正共享的深 **Module**，不按共卡/非共卡拆。它
 
 ```python
 cfg.agent_loop_manager_cfg.mode = "colocate"
+# task.produce_strategy_config = SyncProduceStrategyConfig(...) 或 AsyncProduceStrategyConfig(...)
 self.agent_loop_manager = cfg.agent_loop_manager_cfg.build(...)
 ```
 
@@ -400,6 +416,7 @@ self.agent_loop_manager = cfg.agent_loop_manager_cfg.build(...)
 
 ```python
 cfg.agent_loop_manager_cfg.mode = "disaggregated"
+# task.produce_strategy_config = DisaggAsyncProduceStrategyConfig(...)
 self.agent_loop_manager = cfg.agent_loop_manager_cfg.build(...)
 ```
 
@@ -418,10 +435,10 @@ self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build(...)
 2. 新增 `AgentLoopManager`，把当前 `produce_batch()` 的共卡逻辑迁移过去。
 3. 新增 `DisaggAgentLoopManager`，把 `produce_loop/get_batch/pause/continue/shutdown/save/resume` 迁移过去。
 4. 拆出 `ProduceProgress` 和 `DisaggProduceProgress`，`ProduceProgress` 只保留 `build(...)` 构造入口。
-5. 把当前 `AsyncProduceStrategy` 拆成 `AsyncProduceStrategy` 和 `DisaggAsyncProduceStrategy`。
+5. 把当前 `AsyncProduceStrategy` 拆成 `AsyncProduceStrategy` 和 `DisaggAsyncProduceStrategy`，并新增 `DisaggAsyncProduceStrategyConfig`。
 6. 把 batch allocation、refresh、take batch、pause pending drain 抽成 module-level helper。
-7. trainer 通过设置 config `mode` 后调用同一个 `build(...)`。
-8. 保留必要兼容导出，减少配置文件修改。
+7. trainer 通过设置 manager config `mode` 后调用同一个 `build(...)`；非共卡训练配置同步替换为 `DisaggAsyncProduceStrategyConfig`。
+8. 保留必要兼容导出，但不保留“同一个 strategy config 靠 mode 切换”的兼容语义。
 
 ## 14. 测试建议
 
@@ -453,7 +470,7 @@ trainer：
 
 ## 15. 关键判断
 
-`AsyncProduceStrategy` 的领域含义不是“非共卡策略”，而是“异步 rollout 生产策略”。因此它应继续支持共卡训练。
+`AsyncProduceStrategy` 的领域含义不是“非共卡策略”，而是“共卡异步 rollout 生产策略”。非共卡后台 producer 需要显式的 `DisaggAsyncProduceStrategyConfig` / `DisaggAsyncProduceStrategy`。
 
 真正需要隔离的是执行环境：
 
@@ -465,15 +482,11 @@ trainer：
 ```python
 AsyncProduceStrategyConfig
     -> AsyncProduceStrategy
+
+DisaggAsyncProduceStrategyConfig
     -> DisaggAsyncProduceStrategy
 ```
 
-而不是：
+而不是让 `AsyncProduceStrategyConfig` 内部继续同时认识共卡和非共卡两套执行协议。
 
-```python
-AsyncProduceStrategy
-    .colocate_runtime
-    .background_runtime
-```
-
-后者会让一个 Module 继续知道两套执行协议，复杂度只是换位置，不能提供足够的 **Locality**。
+后者会让一个 Config 继续知道两套执行协议，复杂度只是换位置，不能提供足够的 **Locality**。
