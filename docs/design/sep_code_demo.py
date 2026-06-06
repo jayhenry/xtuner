@@ -14,7 +14,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Literal, Protocol, TypeAlias
 
 
 class Status(Enum):
@@ -32,9 +32,7 @@ class ProduceBatchStatus(Enum):
     EXPIRED_BATCH = auto()
 
 
-class ProducerMode(Enum):
-    COLOCATE = auto()
-    DISAGGREGATED = auto()
+ProducerMode: TypeAlias = Literal["colocate", "disaggregated"]
 
 
 class DisaggManagerStatus(Enum):
@@ -196,21 +194,21 @@ class ProduceProgress:
     produce_time_s: float = 0.0
 
     @classmethod
-    def build_local(cls, *, target_samples: dict[str, int], train_step: int) -> "ProduceProgress":
+    def build(
+        cls,
+        *,
+        task_names: list[str],
+        target_samples: dict[str, int],
+        train_step: int,
+    ) -> "ProduceProgress":
         return cls(
             producer_future_step=train_step,
             target_samples=dict(target_samples),
+            raw_rewards_sum={name: 0.0 for name in task_names},
+            raw_rewards_count={name: 0 for name in task_names},
+            produced_samples={name: 0 for name in task_names},
+            produced_tokens={name: 0 for name in task_names},
         )
-
-    def __post_init__(self) -> None:
-        for task_name in self.target_samples:
-            self.raw_rewards_sum.setdefault(task_name, 0.0)
-            self.raw_rewards_count.setdefault(task_name, 0)
-            self.produced_samples.setdefault(task_name, 0)
-            self.produced_tokens.setdefault(task_name, 0)
-
-    def target_for(self, task_name: str) -> int:
-        return self.target_samples[task_name]
 
     def add_raw_rewards(self, task_name: str, rewards_sum: float, rewards_count: int) -> None:
         self.raw_rewards_sum[task_name] += rewards_sum
@@ -438,6 +436,9 @@ class ProduceStrategy(ABC):
     @abstractmethod
     async def produce_batch(self, ctx: ProduceContext) -> ProduceBatchStatus: ...
 
+    async def pause_produce(self, ctx: ProduceContext) -> float:
+        return 0.0
+
     def is_model_expired(self, train_step: int, model_step: int) -> bool:
         return False
 
@@ -481,7 +482,7 @@ class SyncProduceStrategyConfig:
         sync_weights_interval: int,
         rollout_controller: RolloutController,
     ) -> ModeSpecificProduceStrategy:
-        if mode == ProducerMode.COLOCATE:
+        if mode == "colocate":
             return SyncProduceStrategy(
                 is_valid_sample_fn=self.is_valid_sample_fn,
                 should_continue_fn=self.should_continue_fn,
@@ -509,7 +510,7 @@ class AsyncProduceStrategyConfig:
         rollout_controller: RolloutController,
     ) -> ModeSpecificProduceStrategy:
         # 同一个 AsyncProduceStrategyConfig 按执行模式构建不同 Adapter。
-        if mode == ProducerMode.COLOCATE:
+        if mode == "colocate":
             return AsyncProduceStrategy(
                 over_sample_threshold=self.over_sample_threshold,
                 enable_partial_rollout=self.enable_partial_rollout,
@@ -559,11 +560,6 @@ class SyncProduceStrategy(ProduceStrategy):
         return ProduceBatchStatus.NORMAL
 
 
-async def put_finished_task_result(task: asyncio.Task, ctx: BaseProduceContext) -> bool:
-    group = task.result()
-    return await ctx.put_generated_group(group)
-
-
 class AsyncProduceStrategy(ProduceStrategy):
     def __init__(
         self,
@@ -584,6 +580,7 @@ class AsyncProduceStrategy(ProduceStrategy):
         self.is_valid_sample_fn = is_valid_sample_fn
         self.should_continue_fn = should_continue_fn
         self.stale_threshold = calculate_stale_threshold(max_staleness, sync_weights_interval)
+        self._pending_tasks: set[asyncio.Task] = set()
 
     def is_model_expired(self, train_step: int, model_step: int) -> bool:
         return calculate_seq_staleness(model_step, train_step) >= self.stale_threshold
@@ -595,18 +592,19 @@ class AsyncProduceStrategy(ProduceStrategy):
         """共卡 async 生产。
 
         中文不变量：
-        - pending 是本次调用局部变量。
-        - 本函数结束前 drain pending。
+        - pending 只属于本次 manager.produce_batch 调用，不跨 manager 调用保存。
+        - 本函数只生产到 replay buffer，不在这里 pause/drain。
+        - manager 必须等所有 task 的 produce_batch 都返回后，再调用 pause_produce 收尾 pending。
         - 不读取 update_event，不返回 UPDATE_WEIGHT_AND_ABORT。
         """
 
-        pending: set[asyncio.Task] = set()
+        self._pending_tasks = set()
         scheduled_target = ctx.task_batch_size + int(ctx.task_batch_size * self.over_sample_threshold)
         completed = await ctx.replay_buffer.count(ctx.task_name, Status.COMPLETED)
 
         async def schedule_one() -> None:
             group = await ctx.sample_group(from_expired_pool=False)
-            pending.add(
+            self._pending_tasks.add(
                 asyncio.create_task(
                     ctx.generate_group(
                         group,
@@ -615,36 +613,32 @@ class AsyncProduceStrategy(ProduceStrategy):
                 )
             )
 
-        while len(pending) + completed < scheduled_target:
+        while len(self._pending_tasks) + completed < scheduled_target:
             await schedule_one()
 
-        try:
-            while self.should_continue_fn(completed, ctx.task_batch_size):
-                if not pending:
-                    break
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    if await put_finished_task_result(task, ctx):
-                        completed += 1
+        while self.should_continue_fn(completed, ctx.task_batch_size):
+            if not self._pending_tasks:
+                break
+            done, pending = await asyncio.wait(self._pending_tasks, return_when=asyncio.FIRST_COMPLETED)
+            self._pending_tasks = pending
+            for task in done:
+                if await ctx.put_generated_group(task.result()):
+                    completed += 1
 
-                while len(pending) + completed < scheduled_target and self.should_continue_fn(
-                    completed, ctx.task_batch_size
-                ):
-                    await schedule_one()
-        finally:
-            await self._cleanup_local_pending(pending, ctx)
+            while len(self._pending_tasks) + completed < scheduled_target and self.should_continue_fn(
+                completed, ctx.task_batch_size
+            ):
+                await schedule_one()
 
         return ProduceBatchStatus.NORMAL
 
-    async def _cleanup_local_pending(
-        self,
-        pending: set[asyncio.Task],
-        ctx: BaseProduceContext,
-    ) -> float:
+    async def pause_produce(self, ctx: ProduceContext) -> float:
+        pending_tasks = self._pending_tasks
+        self._pending_tasks = set()
         return await pause_pending_tasks(
-            pending_tasks=pending,
+            pending_tasks=pending_tasks,
             ctx=ctx,
-            put_claimed_task=lambda task: put_finished_task_result(task, ctx),
+            put_claimed_task=lambda task: ctx.put_generated_group(task.result()),
         )
 
 
@@ -727,12 +721,6 @@ class _PendingTasks:
 PendingTasksInput = set[asyncio.Task] | _PendingTasks
 
 
-def _normalize_pending_tasks(pending_tasks: PendingTasksInput) -> _LocalPendingTasks | _PendingTasks:
-    if isinstance(pending_tasks, set):
-        return _LocalPendingTasks(pending_tasks)
-    return pending_tasks
-
-
 async def request_agent_loop_pause(ctx: BaseProduceContext, *, pending_count: int) -> None:
     """发送一次 agent loop pause 请求。
 
@@ -767,7 +755,7 @@ async def pause_pending_tasks(
     - 已完成任务必须 claim 后再 put，避免 produce 和 pause 重复入库同一个 done task。
     """
 
-    pending = _normalize_pending_tasks(pending_tasks)
+    pending = _LocalPendingTasks(pending_tasks) if isinstance(pending_tasks, set) else pending_tasks
     pause_start = time.perf_counter()
     if pending.count() == 0:
         return 0.0
@@ -899,7 +887,7 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
         return await pause_pending_tasks(
             pending_tasks=self._pending_tasks,
             ctx=ctx,
-            put_claimed_task=lambda task: put_finished_task_result(task, ctx),
+            put_claimed_task=lambda task: ctx.put_generated_group(task.result()),
         )
 
     async def _put_claimed(
@@ -908,7 +896,7 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
         ctx: BaseProduceContext,
     ) -> None:
         for task in claimed:
-            await put_finished_task_result(task, ctx)
+            await ctx.put_generated_group(task.result())
 
 
 @dataclass(frozen=True)
@@ -926,10 +914,11 @@ class TaskRunner:
 
 
 class AgentLoopManagerConfig:
-    def __init__(self, tasks: list[Any]) -> None:
+    def __init__(self, tasks: list[Any], mode: ProducerMode = "colocate") -> None:
         self.tasks = tasks
+        self.mode = mode
 
-    def build_colocate(
+    def build(
         self,
         *,
         rollout_controller: RolloutController,
@@ -937,34 +926,18 @@ class AgentLoopManagerConfig:
         replay_buffer: ReplayBuffer,
         logger: Any,
         sync_weights_interval: int,
-    ) -> "AgentLoopManager":
+    ) -> "AgentLoopManager | DisaggAgentLoopManager":
+        mode = self.mode
         runners = self._build_task_runners(
-            mode=ProducerMode.COLOCATE,
+            mode=mode,
             rollout_controller=rollout_controller,
             tokenizer=tokenizer,
             replay_buffer=replay_buffer,
             logger=logger,
             sync_weights_interval=sync_weights_interval,
         )
-        return AgentLoopManager(runners, replay_buffer, rollout_controller, logger)
-
-    def build_disaggregated(
-        self,
-        *,
-        rollout_controller: RolloutController,
-        tokenizer: Any,
-        replay_buffer: ReplayBuffer,
-        logger: Any,
-        sync_weights_interval: int,
-    ) -> "DisaggAgentLoopManager":
-        runners = self._build_task_runners(
-            mode=ProducerMode.DISAGGREGATED,
-            rollout_controller=rollout_controller,
-            tokenizer=tokenizer,
-            replay_buffer=replay_buffer,
-            logger=logger,
-            sync_weights_interval=sync_weights_interval,
-        )
+        if mode == "colocate":
+            return AgentLoopManager(runners, replay_buffer, rollout_controller, logger)
         return DisaggAgentLoopManager(runners, replay_buffer, rollout_controller, logger)
 
     def _build_task_runners(
@@ -995,10 +968,6 @@ class AgentLoopManagerConfig:
                 )
             )
         return runners
-
-
-def task_names_of(task_runners: list[TaskRunner]) -> list[str]:
-    return [task.task_name for task in task_runners]
 
 
 def allocate_task_batch_sizes(
@@ -1047,7 +1016,7 @@ async def take_train_batch(
         progress.mark_consumed(consumed_counts)
 
     counts = await replay_buffer.count_statuses(
-        task_names_of(task_runners),
+        [task.task_name for task in task_runners],
         [Status.INIT, Status.COMPLETED, Status.ABORTED, Status.EXPIRED, Status.FAILED, Status.FILTERED],
     )
     return build_produce_batch_result(
@@ -1081,7 +1050,7 @@ class AgentLoopManager:
         self.replay_buffer = replay_buffer
         self.rollout_controller = rollout_controller
         self.logger = logger
-        self.task_names = task_names_of(task_runners)
+        self.task_names = [task.task_name for task in task_runners]
 
     def get_task_batch_sizes(self, global_batch_size: int, train_step: int) -> dict[str, int]:
         return allocate_task_batch_sizes(self.task_runners, global_batch_size, train_step)
@@ -1097,7 +1066,7 @@ class AgentLoopManager:
 
         中文不变量：
         - 不触碰非共卡 status/update_event。
-        - Async strategy 也必须在本次调用内收尾 pending。
+        - 所有 active task 生产结束后，再统一收尾 pending。
         - 返回必须是非空训练 batch。
         """
 
@@ -1107,7 +1076,30 @@ class AgentLoopManager:
             else self.get_task_batch_sizes(batch_size, train_step)
         )
         validate_task_batch_sizes(self.task_runners, task_sizes, batch_size)
-        progress = ProduceProgress.build_local(target_samples=task_sizes, train_step=train_step)
+        progress = ProduceProgress.build(
+            task_names=self.task_names,
+            target_samples=task_sizes,
+            train_step=train_step,
+        )
+        active_contexts = [
+            (
+                task,
+                ProduceContext(
+                    task_name=task.task_name,
+                    agent_loop=task.agent_loop,
+                    sampler=task.sampler,
+                    replay_buffer=self.replay_buffer,
+                    task_batch_size=task_sizes[task.task_name],
+                    train_step=progress.producer_future_step,
+                    model_step=model_step,
+                    progress=progress,
+                    is_valid_sample_fn=getattr(task.produce_strategy, "is_valid_sample_fn", default_is_valid_sample_fn),
+                    stale_threshold=task.stale_threshold,
+                ),
+            )
+            for task in self.task_runners
+            if task_sizes[task.task_name] > 0
+        ]
 
         await self.rollout_controller.continue_generation()
         try:
@@ -1117,16 +1109,11 @@ class AgentLoopManager:
                 train_step=train_step,
             )
             await asyncio.gather(
-                *[
-                    self._produce_colocate_task(
-                        task,
-                        task_sizes[task.task_name],
-                        progress,
-                        model_step=model_step,
-                    )
-                    for task in self.task_runners
-                    if task_sizes[task.task_name] > 0
-                ]
+                *[task.produce_strategy.produce_batch(ctx) for task, ctx in active_contexts]
+            )
+            # 共卡 multi-task 的关键顺序：必须等所有 task 都生产结束，再统一 pause/drain pending。
+            await asyncio.gather(
+                *[task.produce_strategy.pause_produce(ctx) for task, ctx in active_contexts]
             )
             result = await take_train_batch(
                 task_runners=self.task_runners,
@@ -1139,28 +1126,6 @@ class AgentLoopManager:
 
         assert result.rollout_states, "共卡 produce_batch 必须返回非空训练 batch。"
         return result
-
-    async def _produce_colocate_task(
-        self,
-        task: TaskRunner,
-        task_batch_size: int,
-        progress: ProduceProgress,
-        *,
-        model_step: int,
-    ) -> ProduceBatchStatus:
-        ctx = ProduceContext(
-            task_name=task.task_name,
-            agent_loop=task.agent_loop,
-            sampler=task.sampler,
-            replay_buffer=self.replay_buffer,
-            task_batch_size=task_batch_size,
-            train_step=progress.producer_future_step,
-            model_step=model_step,
-            progress=progress,
-            is_valid_sample_fn=getattr(task.produce_strategy, "is_valid_sample_fn", default_is_valid_sample_fn),
-            stale_threshold=task.stale_threshold,
-        )
-        return await task.produce_strategy.produce_batch(ctx)
 
     async def save(self, checkpoint_path: Path, model_step: int) -> None:
         # 共卡 checkpoint 不保存 DisaggProduceProgress。
@@ -1187,7 +1152,7 @@ class DisaggAgentLoopManager:
         self.replay_buffer = replay_buffer
         self.rollout_controller = rollout_controller
         self.logger = logger
-        self.task_names = task_names_of(task_runners)
+        self.task_names = [task.task_name for task in task_runners]
         self.status = DisaggManagerStatus.NORMAL
         self.update_event = asyncio.Event()
         self.finish_event = asyncio.Event()
@@ -1219,7 +1184,25 @@ class DisaggAgentLoopManager:
             validate_task_batch_sizes(self.task_runners, task_sizes, batch_size)
             statuses = await asyncio.gather(
                 *[
-                    self._produce_background_task(task, task_sizes[task.task_name])
+                    task.produce_strategy.produce_batch(
+                        DisaggProduceContext(
+                            task_name=task.task_name,
+                            agent_loop=task.agent_loop,
+                            sampler=task.sampler,
+                            replay_buffer=self.replay_buffer,
+                            task_batch_size=task_sizes[task.task_name],
+                            train_step=self.progress.producer_future_step,
+                            model_step=self.model_step,
+                            progress=self.progress,
+                            is_valid_sample_fn=getattr(
+                                task.produce_strategy,
+                                "is_valid_sample_fn",
+                                default_is_valid_sample_fn,
+                            ),
+                            stale_threshold=task.stale_threshold,
+                            update_event=self.update_event,
+                        )
+                    )
                     for task in self.task_runners
                     if task_sizes[task.task_name] > 0
                 ]
@@ -1285,7 +1268,19 @@ class DisaggAgentLoopManager:
 
         pause_time_s = 0.0
         for task in self.task_runners:
-            ctx = self._build_background_context(task, task_batch_size=0)
+            ctx = DisaggProduceContext(
+                task_name=task.task_name,
+                agent_loop=task.agent_loop,
+                sampler=task.sampler,
+                replay_buffer=self.replay_buffer,
+                task_batch_size=0,
+                train_step=self.progress.producer_future_step,
+                model_step=self.model_step,
+                progress=self.progress,
+                is_valid_sample_fn=getattr(task.produce_strategy, "is_valid_sample_fn", default_is_valid_sample_fn),
+                stale_threshold=task.stale_threshold,
+                update_event=self.update_event,
+            )
             pause_time_s += await task.produce_strategy.pause_produce(ctx)
         self.pause_time_s = pause_time_s
         return pause_time_s
@@ -1328,25 +1323,6 @@ class DisaggAgentLoopManager:
         self.model_step = saved_model_step
         return saved_model_step
 
-    async def _produce_background_task(self, task: TaskRunner, task_batch_size: int) -> ProduceBatchStatus:
-        ctx = self._build_background_context(task, task_batch_size)
-        return await task.produce_strategy.produce_batch(ctx)
-
-    def _build_background_context(self, task: TaskRunner, task_batch_size: int) -> DisaggProduceContext:
-        return DisaggProduceContext(
-            task_name=task.task_name,
-            agent_loop=task.agent_loop,
-            sampler=task.sampler,
-            replay_buffer=self.replay_buffer,
-            task_batch_size=task_batch_size,
-            train_step=self.progress.producer_future_step,
-            model_step=self.model_step,
-            progress=self.progress,
-            is_valid_sample_fn=getattr(task.produce_strategy, "is_valid_sample_fn", default_is_valid_sample_fn),
-            stale_threshold=task.stale_threshold,
-            update_event=self.update_event,
-        )
-
     async def _wait_for_status_exit(self, blocked_status: DisaggManagerStatus) -> None:
         while not self.finish_event.is_set() and self.status == blocked_status:
             await asyncio.sleep(1.0)
@@ -1360,7 +1336,8 @@ class DisaggAgentLoopManager:
 
 class RLTrainer:
     def __init__(self, cfg: Any) -> None:
-        self.agent_loop_manager = cfg.agent_loop_manager_cfg.build_colocate(
+        cfg.agent_loop_manager_cfg.mode = "colocate"
+        self.agent_loop_manager = cfg.agent_loop_manager_cfg.build(
             rollout_controller=cfg.rollout_controller,
             tokenizer=cfg.tokenizer,
             replay_buffer=cfg.replay_buffer_config.build(),
@@ -1368,7 +1345,8 @@ class RLTrainer:
             sync_weights_interval=cfg.sync_weights_interval,
         )
         if cfg.eval_agent_loop_manager_cfg is not None:
-            self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build_colocate(...)
+            cfg.eval_agent_loop_manager_cfg.mode = "colocate"
+            self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build(...)
 
     def fit(self) -> None:
         for train_step in range(1, self.total_train_steps + 1):
@@ -1385,7 +1363,8 @@ class RLTrainer:
 class RLDisaggTrainer:
     def __init__(self, cfg: Any) -> None:
         train_replay_buffer = cfg.replay_buffer_config.build()
-        self.agent_loop_manager = cfg.agent_loop_manager_cfg.build_disaggregated(
+        cfg.agent_loop_manager_cfg.mode = "disaggregated"
+        self.agent_loop_manager = cfg.agent_loop_manager_cfg.build(
             rollout_controller=cfg.rollout_controller,
             tokenizer=cfg.tokenizer,
             replay_buffer=train_replay_buffer,
@@ -1394,7 +1373,8 @@ class RLDisaggTrainer:
         )
         # eval 是一次性同步 produce_batch，不应构建成后台 manager。
         if cfg.eval_agent_loop_manager_cfg is not None:
-            self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build_colocate(
+            cfg.eval_agent_loop_manager_cfg.mode = "colocate"
+            self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build(
                 rollout_controller=cfg.rollout_controller,
                 tokenizer=cfg.tokenizer,
                 replay_buffer=train_replay_buffer,
