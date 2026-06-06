@@ -243,6 +243,7 @@ produce_result = get_batch_task.result()
 
 - 本次 manager `produce_batch()` 期间持有局部 `pending_tasks = set()`。
 - 按 `over_sample_threshold`、tail batch、partial rollout 规则调度 rollout group。
+- 保留当前 async producer 的生产预算语义：normal 模式的 oversample 预算按 `ceil(over_sample_threshold * task_batch_size)` 计算；tail-batch 模式从 expired / aborted pool 采样，且不再扩大 oversample 窗口。
 - 收到完成结果后过滤、写 replay buffer、更新本次统计字段。
 - 达到本次 batch target 后返回；不在 `produce_batch(ctx)` 内暂停 agent loop。
 - `pause_produce(ctx)` 复用 `pause_pending_tasks(...)` drain 本次 pending；只能由 manager 在所有 task 的 `produce_batch(ctx)` 都返回后调用。

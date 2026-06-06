@@ -548,18 +548,27 @@ class SyncProduceStrategy(ProduceStrategy):
 
     async def produce_batch(self, ctx: ProduceContext) -> ProduceBatchStatus:
         pending: set[asyncio.Task] = set()
+        completed = await ctx.replay_buffer.count(ctx.task_name, Status.COMPLETED)
 
         for _ in range(ctx.task_batch_size):
             group = await ctx.sampler.sample(task_name=ctx.task_name)
             pending.add(asyncio.create_task(ctx.generate_group(group, enable_partial_rollout=False)))
 
-        completed = 0
         while self.should_continue_fn(completed, ctx.task_batch_size):
+            if not pending:
+                break
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 group = task.result()
                 if await ctx.put_generated_group(group):
                     completed += 1
+
+            while len(pending) + completed < ctx.task_batch_size and self.should_continue_fn(
+                completed,
+                ctx.task_batch_size,
+            ):
+                group = await ctx.sampler.sample(task_name=ctx.task_name)
+                pending.add(asyncio.create_task(ctx.generate_group(group, enable_partial_rollout=False)))
 
         return ProduceBatchStatus.NORMAL
 
@@ -603,11 +612,17 @@ class AsyncProduceStrategy(ProduceStrategy):
         """
 
         self._pending_tasks = set()
-        scheduled_target = ctx.task_batch_size + int(ctx.task_batch_size * self.over_sample_threshold)
+        expired_count = await ctx.expired_count()
+        sample_from_expired = self.tail_batch_trigger_size > 0 and expired_count >= self.tail_batch_trigger_size
+
+        # 保持当前实现语义：normal 模式只按本 task batch size 追加固定超发预算；
+        # tail-batch 模式只补必要缺口，并固定从 expired/aborted pool 取样。
+        oversample_budget = 0 if sample_from_expired else math.ceil(self.over_sample_threshold * ctx.task_batch_size)
+        scheduled_target = ctx.task_batch_size + oversample_budget
         completed = await ctx.replay_buffer.count(ctx.task_name, Status.COMPLETED)
 
         async def schedule_one() -> None:
-            group = await ctx.sample_group(from_expired_pool=False)
+            group = await ctx.sample_group(from_expired_pool=sample_from_expired)
             self._pending_tasks.add(
                 asyncio.create_task(
                     ctx.generate_group(
