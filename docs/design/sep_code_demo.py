@@ -1067,6 +1067,7 @@ class AgentLoopManager:
         中文不变量：
         - 不触碰非共卡 status/update_event。
         - 所有 active task 生产结束后，再统一收尾 pending。
+        - 同一 manager 实例不并发调用 produce_batch；strategy pending 是本次调用的局部状态。
         - 返回必须是非空训练 batch。
         """
 
@@ -1102,27 +1103,23 @@ class AgentLoopManager:
         ]
 
         await self.rollout_controller.continue_generation()
-        try:
-            await refresh_for_all_tasks(
-                task_runners=self.task_runners,
-                replay_buffer=self.replay_buffer,
-                train_step=train_step,
-            )
-            await asyncio.gather(
-                *[task.produce_strategy.produce_batch(ctx) for task, ctx in active_contexts]
-            )
-            # 共卡 multi-task 的关键顺序：必须等所有 task 都生产结束，再统一 pause/drain pending。
-            await asyncio.gather(
-                *[task.produce_strategy.pause_produce(ctx) for task, ctx in active_contexts]
-            )
-            result = await take_train_batch(
-                task_runners=self.task_runners,
-                replay_buffer=self.replay_buffer,
-                task_sizes=task_sizes,
-                progress=progress,
-            )
-        finally:
-            await self.rollout_controller.pause_generation()
+        await refresh_for_all_tasks(
+            task_runners=self.task_runners,
+            replay_buffer=self.replay_buffer,
+            train_step=train_step,
+        )
+        await asyncio.gather(*[task.produce_strategy.produce_batch(ctx) for task, ctx in active_contexts])
+        # 共卡 multi-task 的关键顺序：所有 task 正常完成生产后，才统一 pause/drain pending。
+        # 如果上面的生产抛异常，异常直接冒泡中断训练，不在 manager 内做 best-effort cleanup。
+        for task, ctx in active_contexts:
+            await task.produce_strategy.pause_produce(ctx)
+        result = await take_train_batch(
+            task_runners=self.task_runners,
+            replay_buffer=self.replay_buffer,
+            task_sizes=task_sizes,
+            progress=progress,
+        )
+        await self.rollout_controller.pause_generation()
 
         assert result.rollout_states, "共卡 produce_batch 必须返回非空训练 batch。"
         return result

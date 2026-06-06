@@ -187,6 +187,10 @@ await manager.produce_batch(batch_size, train_step, model_step=model_step)
 
 关键不变量：共卡 multi-task 下，先达到 target 的 task 不能在自己的 `produce_batch(ctx)` 结束时立刻调用 `pause_pending_tasks(...)`。否则它会提前向 rollout worker 发送 pause，阻塞其他还在生产的 task。pending 收尾必须由 `AgentLoopManager.produce_batch()` 在所有 task 生产结束后统一编排。
 
+异常语义：`asyncio.gather(...)` 只有在所有 task 的 `produce_batch(ctx)` 正常返回时才会进入后续 pause/drain 和 take batch。任一 task 抛异常时，manager 不捕获、不转换成 `ProduceBatchStatus`、不做 best-effort cleanup，让原始异常直接向 trainer 传播并中断训练，避免 `finally` 里的二次异常覆盖真正的失败栈。
+
+业务约束：同一个共卡 `AgentLoopManager` 实例不支持并发调用 `produce_batch()`。`AsyncProduceStrategy` 持有的是本次 manager 调用的局部 pending set，这个约束由 trainer 调用模型保证，不在 manager 里增加复杂防御。
+
 共卡路径不出现：
 
 - `_status`
