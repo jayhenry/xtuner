@@ -1383,33 +1383,44 @@ class RLDisaggTrainer:
         producer_task = asyncio.create_task(
             self.agent_loop_manager.produce_loop(batch_size=self.train_batch_size)
         )
-        try:
-            train_step = self.cur_step + 1
-            while train_step <= self.total_train_steps:
-                produce_result = await self.agent_loop_manager.get_batch(
+        train_step = self.cur_step + 1
+        while train_step <= self.total_train_steps:
+            get_batch_task = asyncio.create_task(
+                self.agent_loop_manager.get_batch(
                     self.train_batch_size,
                     train_step=train_step,
                 )
+            )
+            # 非共卡 fail-fast：consumer 等 batch 时必须同时观察后台 producer。
+            # producer 异常不是业务 status，直接通过 result() 暴露原始异常栈。
+            done, _ = await asyncio.wait(
+                {producer_task, get_batch_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if producer_task in done:
+                producer_task.result()
+                raise RuntimeError("非共卡后台 producer 在训练结束前退出。")
+            produce_result = get_batch_task.result()
 
-                empty_expired = (
-                    produce_result.status == ProduceBatchStatus.EXPIRED_BATCH
-                    and not produce_result.rollout_states
-                )
-                if not empty_expired:
-                    self._train_one_batch(produce_result.rollout_states, train_step)
-                    sync_model_step = train_step
-                else:
-                    sync_model_step = train_step - 1
+            empty_expired = (
+                produce_result.status == ProduceBatchStatus.EXPIRED_BATCH
+                and not produce_result.rollout_states
+            )
+            if not empty_expired:
+                self._train_one_batch(produce_result.rollout_states, train_step)
+                sync_model_step = train_step
+            else:
+                sync_model_step = train_step - 1
 
-                if self._need_sync(sync_model_step, produce_result):
-                    await self.agent_loop_manager.pause_produce()
-                    await self._sync_weights_and_save(sync_model_step)
-                    await self.agent_loop_manager.continue_produce(model_step=sync_model_step)
+            if self._need_sync(sync_model_step, produce_result):
+                await self.agent_loop_manager.pause_produce()
+                await self._sync_weights_and_save(sync_model_step)
+                await self.agent_loop_manager.continue_produce(model_step=sync_model_step)
 
-                if empty_expired:
-                    continue
-                self.cur_step = train_step
-                train_step += 1
-        finally:
-            self.agent_loop_manager.shutdown()
-            await producer_task
+            if empty_expired:
+                continue
+            self.cur_step = train_step
+            train_step += 1
+
+        self.agent_loop_manager.shutdown()
+        await producer_task

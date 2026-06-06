@@ -208,7 +208,11 @@ await manager.produce_batch(batch_size, train_step, model_step=model_step)
 
 ```python
 producer_task = create_task(manager.produce_loop(batch_size))
-produce_result = await manager.get_batch(batch_size, train_step=train_step)
+get_batch_task = create_task(manager.get_batch(batch_size, train_step=train_step))
+done, _ = await wait({producer_task, get_batch_task}, return_when=FIRST_COMPLETED)
+if producer_task in done:
+    producer_task.result()
+produce_result = get_batch_task.result()
 ```
 
 `DisaggAgentLoopManager` 独占以下状态：
@@ -226,6 +230,8 @@ produce_result = await manager.get_batch(batch_size, train_step=train_step)
 - **Training Consumer** 成功取出非空 batch 后推进 `consumed_samples` 和 `next_consumer_step`。
 - **Expired Produce Batch** 只有在训练侧已有更新 **Model Step** 时，才允许返回空 batch 跳过训练。
 - 权重同步前必须 `pause_produce()`，同步/评测后必须 `continue_produce(model_step=...)`。
+- **Background Producer** 异常是终止性训练失败，不转换成 manager status；trainer 在等待 `get_batch()` 时必须同时观察 `producer_task`，用 `producer_task.result()` 暴露原始异常栈并中断训练。
+- 非共卡异常路径也不做 best-effort cleanup；正常训练结束时才显式 `shutdown()` 并等待后台 producer 退出。
 
 ## 9. Async 策略拆分
 
