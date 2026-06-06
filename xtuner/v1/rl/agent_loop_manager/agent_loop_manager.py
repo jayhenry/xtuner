@@ -818,18 +818,16 @@ class AgentLoopManager:
             train_step=train_step,
         )
         status = ProduceBatchStatus.NORMAL
-        try:
-            # 共卡 produce_batch 也是消费入口；生产前先刷新 buffer 中已有 completed / aborted。
-            await self._refresh_for_all_tasks(train_step, [Status.COMPLETED, Status.ABORTED])
-            status = await self._produce_batch_to_buffer(
-                task_batch_sizes=current_sizes,
-                progress=local_progress,
-            )
-        finally:
-            await self.pause_produce(
-                use_global_progress=False,
-                progress=local_progress,
-            )
+        # 共卡 produce_batch 也是消费入口；生产前先刷新 buffer 中已有 completed / aborted。
+        await self._refresh_for_all_tasks(train_step, [Status.COMPLETED, Status.ABORTED])
+        status = await self._produce_batch_to_buffer(
+            task_batch_sizes=current_sizes,
+            progress=local_progress,
+        )
+        await self.pause_produce(
+            use_global_progress=False,
+            progress=local_progress,
+        )
         result = await self._get_batch_from_buffer(
             batch_size=batch_size,
             task_batch_sizes=current_sizes,

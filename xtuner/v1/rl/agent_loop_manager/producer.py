@@ -736,14 +736,14 @@ class AsyncProduceStrategy(ProduceStrategy):
         self.sync_weights_interval = sync_weights_interval
         self.stale_threshold = calculate_stale_threshold(max_staleness, sync_weights_interval)
         self.tail_batch_trigger_size = tail_batch_trigger_size
-        self._pending_tasks = _PendingTasks()
+        self._local_pending_tasks: set[asyncio.Task] = set()
 
     def is_model_expired(self, train_step: int, model_step: int) -> bool:
         staleness = calculate_seq_staleness(model_step, train_step)
         return staleness >= self.stale_threshold
 
     def pending_task_count(self) -> int:
-        return self._pending_tasks.count()
+        return len(self._local_pending_tasks)
 
     async def _put_claimed(
         self,
@@ -773,14 +773,190 @@ class AsyncProduceStrategy(ProduceStrategy):
             logger.warning(
                 f"Agent loop pause timed out: task={ctx.task_name}, timeout_s={AGENT_LOOP_PAUSE_REQUEST_TIMEOUT_S}, "
                 f"elapsed={time.perf_counter() - pause_request_start:.2f}s, "
-                f"pending={self._pending_tasks.count()}"
+                f"pending={self.pending_task_count()}"
             )
         except Exception:
             logger.exception(
                 f"Agent loop pause failed: task={ctx.task_name}, "
                 f"elapsed={time.perf_counter() - pause_request_start:.2f}s, "
-                f"pending={self._pending_tasks.count()}"
+                f"pending={self.pending_task_count()}"
             )
+
+    async def pause_produce(self, ctx: ProduceContext) -> float:
+        pause_start = time.perf_counter()
+        if not self._local_pending_tasks:
+            return 0.0
+
+        pending_pause_tasks = {create_task(self._pause_agent_loop(ctx))}
+        initial_pending_count = len(self._local_pending_tasks)
+
+        logger.info(
+            f"Pause signal loop started for task {ctx.task_name}. "
+            f"Waiting for {initial_pending_count} pending tasks to complete. "
+            f"periodic_abort_interval_s={self.PERIODIC_ABORT_INTERVAL_S}, "
+            f"producer_pause_pending_task_timeout_s={PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S}"
+        )
+        cleanup_start_time = time.perf_counter()
+        next_periodic_abort_time = cleanup_start_time + self.PERIODIC_ABORT_INTERVAL_S
+        while True:
+            elapsed_time = time.perf_counter() - cleanup_start_time
+            if elapsed_time > PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S:
+                # 超时强制取消所有pending的任务
+                tasks = set(self._local_pending_tasks)
+                self._local_pending_tasks.clear()
+                cancelled_count = len(tasks)
+                await cancel_and_drain(list(tasks))
+                logger.warning(
+                    f"Cleanup timeout of {PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S}s reached. "
+                    f"Forcefully cancelling {cancelled_count} remaining tasks. "
+                    f"task={ctx.task_name}"
+                )
+                break
+
+            if not self._local_pending_tasks:
+                break
+            current_time = time.perf_counter()
+            pending_pause_tasks = {task for task in pending_pause_tasks if not task.done()}
+
+            # 定时发送 pause 信号
+            if self.PERIODIC_ABORT_INTERVAL_S > 0 and current_time >= next_periodic_abort_time:
+                pending_pause_tasks.add(create_task(self._pause_agent_loop(ctx)))
+                next_periodic_abort_time += self.PERIODIC_ABORT_INTERVAL_S
+
+            done_tasks, _ = await asyncio.wait(
+                set(self._local_pending_tasks), timeout=1, return_when=asyncio.FIRST_COMPLETED
+            )
+            self._local_pending_tasks.difference_update(done_tasks)
+            claimed_done = done_tasks
+            for task in claimed_done:
+                paused_items = task.result()
+                await ctx.put_generated_group(paused_items)
+        await cancel_and_drain(list(pending_pause_tasks))
+        pause_time = time.perf_counter() - pause_start
+        logger.info(f"pause_produce completed for task {ctx.task_name} within {pause_time}s.")
+        return pause_time
+
+    async def produce_batch(self, ctx: ProduceContext) -> ProduceBatchStatus:
+        if ctx.task_name not in ctx.progress.consumed_samples:
+            raise KeyError(f"ProduceProgress.consumed_samples missing task_name={ctx.task_name!r}")
+        if ctx.task_name not in ctx.progress.target_samples:
+            raise KeyError(f"ProduceProgress.target_samples missing task_name={ctx.task_name!r}")
+
+        # 共卡 async 的 pending 生命周期只属于本次 produce_batch 调用。
+        # Manager 会在所有 active task produce_batch 正常返回后统一调用 pause_produce 收尾。
+        self._local_pending_tasks = set()
+
+        if ctx.target_abs <= 0:
+            return ProduceBatchStatus.NORMAL
+
+        if ctx.should_abort():
+            return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
+        if self.is_model_expired(ctx.train_step, ctx.model_step):
+            return ProduceBatchStatus.EXPIRED_BATCH
+
+        expired_count = await ctx.expired_count()
+        sample_from_expired = self.tail_batch_trigger_size > 0 and expired_count >= self.tail_batch_trigger_size
+        if sample_from_expired:
+            logger.info(
+                f"Tail batch trigger condition met: {expired_count} expired samples "
+                f"(threshold: {self.tail_batch_trigger_size}). Enabling tail batch mode."
+            )
+
+        # 本轮 produce_batch 的必要累计目标固定；normal 模式只按当前 task batch 追加固定超发预算。
+        # tail-batch 模式只补必要缺口，新增任务固定从 EXPIRED pool 取，不再扩大超发窗口。
+        target_abs = ctx.target_abs
+        oversample_budget = 0 if sample_from_expired else math.ceil(self.over_sample_threshold * ctx.task_batch_size)
+        scheduled_target = target_abs + oversample_budget
+        logger.info(
+            f"Starting produce_batch for task {ctx.task_name} with target_abs={target_abs}, "
+            f"oversample_budget={oversample_budget}, scheduled_target={scheduled_target}."
+        )
+
+        async def spawn_one() -> asyncio.Task:
+            rollout_state = await ctx.sample_group(from_expired_pool=sample_from_expired)
+            return create_task(
+                ctx.generate_group(
+                    rollout_state,
+                    enable_partial_rollout=self.enable_partial_rollout,
+                )
+            )
+
+        initial_available = await ctx.available_count()
+        progress_displayer = _ProgressDisplayer.create(
+            strategy_name=self.__class__.__name__,
+            task_name=ctx.task_name,
+            total=ctx.target_abs,
+            initial=initial_available,
+        )
+        try:
+            while True:
+                if ctx.should_abort():
+                    return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
+                if self.is_model_expired(ctx.train_step, ctx.model_step):
+                    return ProduceBatchStatus.EXPIRED_BATCH
+
+                available = await ctx.available_count()
+                progress_displayer.update(available)
+                if not self.should_continue_fn(available, target_abs):
+                    return ProduceBatchStatus.NORMAL
+
+                pending_count = len(self._local_pending_tasks)
+                desired_pending = max(0, scheduled_target - available)
+                if available + pending_count < scheduled_target:
+                    while not ctx.should_abort() and len(self._local_pending_tasks) < desired_pending:
+                        self._local_pending_tasks.add(await spawn_one())
+                    if ctx.should_abort():
+                        return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
+
+                if ctx.should_abort():
+                    return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
+                if not self._local_pending_tasks:
+                    logger.warning("All tasks are done but not enough samples collected.")
+                    return ProduceBatchStatus.NORMAL
+
+                done_tasks, _ = await asyncio.wait(
+                    set(self._local_pending_tasks), timeout=1, return_when=asyncio.FIRST_COMPLETED
+                )
+                self._local_pending_tasks.difference_update(done_tasks)
+                await self._put_claimed(
+                    done_tasks,
+                    ctx,
+                    available_base=available,
+                    progress_displayer=progress_displayer,
+                )
+        finally:
+            progress_displayer.close()
+
+
+class DisaggAsyncProduceStrategy(AsyncProduceStrategy):
+    """非共卡后台 producer 使用的 async strategy。
+
+    当前第一步拆分只先固定 public 类型边界；pending 跨调用语义沿用现有 AsyncProduceStrategy 实现。
+    """
+
+    def __init__(
+        self,
+        over_sample_threshold: float,
+        enable_partial_rollout: bool,
+        tail_batch_trigger_size: int,
+        max_staleness: int,
+        sync_weights_interval: int,
+        is_valid_sample_fn: IsValidSampleFn,
+        should_continue_fn: ShouldContinueFn,
+    ):
+        super().__init__(
+            over_sample_threshold=over_sample_threshold,
+            enable_partial_rollout=enable_partial_rollout,
+            tail_batch_trigger_size=tail_batch_trigger_size,
+            max_staleness=max_staleness,
+            sync_weights_interval=sync_weights_interval,
+            is_valid_sample_fn=is_valid_sample_fn,
+            should_continue_fn=should_continue_fn,
+        )
+        self._pending_tasks = _PendingTasks()
+
+    def pending_task_count(self) -> int:
+        return self._pending_tasks.count()
 
     async def pause_produce(self, ctx: ProduceContext) -> float:
         pause_start = time.perf_counter()
@@ -838,17 +1014,15 @@ class AsyncProduceStrategy(ProduceStrategy):
         if ctx.target_abs <= 0:
             return ProduceBatchStatus.NORMAL
 
-        # TODO: place this check just before while loop
         if ctx.should_abort():
             return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
         if self.is_model_expired(ctx.train_step, ctx.model_step):
             return ProduceBatchStatus.EXPIRED_BATCH
 
-        # 先回收跨 produce_batch 调用遗留的已完成任务，避免 done task 长期留在 pending 集合里。
+        # 非共卡 pending 跨后台 produce_batch 调用存在；进入下一轮时先回收已经完成的旧任务。
         claimed_done = await self._pending_tasks.claim_ready()
         await self._put_claimed(claimed_done, ctx)
 
-        # TODO: remove this check
         if ctx.should_abort():
             return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
         if self.is_model_expired(ctx.train_step, ctx.model_step):
@@ -909,7 +1083,6 @@ class AsyncProduceStrategy(ProduceStrategy):
                         spawn_one=spawn_one,
                     ):
                         pass
-                    # TODO: remove this check, because will check it when exit if statement, it's redundant
                     if ctx.should_abort():
                         return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
 
@@ -928,10 +1101,3 @@ class AsyncProduceStrategy(ProduceStrategy):
                 )
         finally:
             progress_displayer.close()
-
-
-class DisaggAsyncProduceStrategy(AsyncProduceStrategy):
-    """非共卡后台 producer 使用的 async strategy。
-
-    当前第一步拆分只先固定 public 类型边界；pending 跨调用语义沿用现有 AsyncProduceStrategy 实现。
-    """

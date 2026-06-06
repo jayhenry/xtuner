@@ -610,8 +610,8 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed[0][0].response_model_steps, [1, 3, 3])
         self.assertEqual(completed[0][0].seq_staleness, 3)
 
-    async def test_async_produce_strategy_reclaims_cross_call_pending_and_records_timing(self):
-        # 验证跨 produce_batch 调用遗留的 pending task 会被回收，并写入生成耗时指标。
+    async def test_async_produce_strategy_does_not_reclaim_previous_call_pending(self):
+        # 共卡 async 的 pending 只属于一次 produce_batch；下一次调用不能回收上一次遗留结果。
         task_name = "test_task"
         mock_agent_loop = self._build_agent_loop({0: 0.01, 1: 0.05, 2: 0.05})
         produce_strategy_cfg = AsyncProduceStrategyConfig(over_sample_threshold=2.0, enable_partial_rollout=True)
@@ -648,8 +648,8 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(strategy.pending_task_count(), 0)
 
         final_data = await self.replay_buffer.get(10, task_name, Status.COMPLETED)
-        self.assertEqual(len(final_data), 3)
-        self.assertEqual(sorted(group[0].message_uid for group in final_data), [0, 1, 2])
+        self.assertEqual(len(final_data), 1)
+        self.assertEqual(final_data[0][0].message_uid, 0)
         for group in final_data:
             self.assertIn("group_generate_time_s", group[0].extra_fields)
             self.assertGreater(group[0].extra_fields["group_generate_time_s"], 0.0)

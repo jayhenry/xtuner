@@ -10,6 +10,7 @@
 非共卡 get_batch / produce_loop / pause_continue 编排暂不迁入 PR-fast。
 """
 
+import asyncio
 import unittest
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -97,6 +98,17 @@ class _FakeStatusProduceStrategy:
         self.cleanup_model_steps.append(ctx.model_step)
         self.cleanup_progresses.append(ctx.progress)
         return self.pause_time_s
+
+    def is_model_expired(self, train_step: int, model_step: int) -> bool:
+        return False
+
+
+class _FailingProduceStrategy:
+    async def produce_batch(self, ctx) -> ProduceBatchStatus:
+        raise RuntimeError("original produce failure")
+
+    async def pause_produce(self, ctx) -> float:
+        raise RuntimeError("cleanup failure")
 
     def is_model_expired(self, train_step: int, model_step: int) -> bool:
         return False
@@ -391,3 +403,80 @@ class TestMultiTaskAgentLoopManager(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT)
         self.assertEqual(result.rollout_states, [["a-0"], ["b-0"], ["c-0"]])
+
+    async def test_produce_batch_waits_all_tasks_before_any_pause(self):
+        # fast task 不能在 slow task 仍在生产时提前 pause rollout worker。
+        events: list[str] = []
+        fast_done = asyncio.Event()
+        test_case = self
+
+        class _FastStrategy(_FakeProduceStrategy):
+            async def produce_batch(self, ctx) -> ProduceBatchStatus:
+                events.append("fast_produce_done")
+                fast_done.set()
+                return ProduceBatchStatus.NORMAL
+
+            async def pause_produce(self, ctx) -> float:
+                test_case.assertIn("slow_produce_done", events)
+                events.append("fast_pause")
+                return 0.0
+
+        class _SlowStrategy(_FakeProduceStrategy):
+            async def produce_batch(self, ctx) -> ProduceBatchStatus:
+                await fast_done.wait()
+                events.append("slow_produce_done")
+                return ProduceBatchStatus.NORMAL
+
+            async def pause_produce(self, ctx) -> float:
+                test_case.assertIn("slow_produce_done", events)
+                events.append("slow_pause")
+                return 0.0
+
+        manager = AgentLoopManager(
+            task_runners=[
+                _TaskRunner(
+                    task_name="task_fast",
+                    agent_loop=_fake_agent_loop(),
+                    produce_strategy=_FastStrategy(),
+                    sampler=_FakeSampler(),
+                    weight=1.0,
+                    order=0,
+                ),
+                _TaskRunner(
+                    task_name="task_slow",
+                    agent_loop=_fake_agent_loop(),
+                    produce_strategy=_SlowStrategy(),
+                    sampler=_FakeSampler(),
+                    weight=1.0,
+                    order=1,
+                ),
+            ],
+            replay_buffer=_FakeReplayBuffer(
+                rollout_states_by_task={"task_fast": [["fast-0"]], "task_slow": [["slow-0"]]},
+                leftover_counts={},
+            ),
+        )
+
+        result = await manager.produce_batch(batch_size=2, train_step=4, model_step=3)
+
+        self.assertEqual(result.rollout_states, [["fast-0"], ["slow-0"]])
+        self.assertEqual(events[:2], ["fast_produce_done", "slow_produce_done"])
+
+    async def test_produce_batch_preserves_original_terminal_exception(self):
+        # 终止性生产异常应直接暴露给 trainer，不能被 cleanup 的二次异常覆盖。
+        manager = AgentLoopManager(
+            task_runners=[
+                _TaskRunner(
+                    task_name="task_a",
+                    agent_loop=_fake_agent_loop(),
+                    produce_strategy=_FailingProduceStrategy(),
+                    sampler=_FakeSampler(),
+                    weight=1.0,
+                    order=0,
+                ),
+            ],
+            replay_buffer=_FakeReplayBuffer(rollout_states_by_task={}, leftover_counts={}),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "original produce failure"):
+            await manager.produce_batch(batch_size=1, train_step=3, model_step=2)
