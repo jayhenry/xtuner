@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,6 +19,7 @@ from xtuner.v1.utils import get_logger
 
 from .producer import (
     GROUP_GENERATE_TIME_KEY,
+    DisaggProduceStrategyConfig,
     ProduceBatchStatus,
     ProduceContext,
     ProduceProgress,
@@ -228,8 +230,11 @@ class TaskSpecConfig(BaseModel):
         judger_config (JudgerConfig | ComposedJudgerConfig | None): Optional
             judger configuration used to score generated samples. Defaults to
             None.
-        produce_strategy_config (ProduceStrategyConfig): Strategy used to
-            produce rollout samples. Defaults to ``SyncProduceStrategyConfig``.
+        produce_strategy_config (ProduceStrategyConfig | DisaggProduceStrategyConfig):
+            Strategy used to produce rollout samples. Colocate managers accept
+            ``ProduceStrategyConfig`` subclasses; disaggregated managers accept
+            ``DisaggProduceStrategyConfig`` subclasses. Defaults to
+            ``SyncProduceStrategyConfig``.
         sampler_config (SamplerConfig): Dataset sampler configuration for this
             task.
 
@@ -255,7 +260,7 @@ class TaskSpecConfig(BaseModel):
     weight: float = Field(default=1.0, ge=0.0)
     agent_loop_config: AgentLoopConfig
     judger_config: JudgerConfig | ComposedJudgerConfig | None = None
-    produce_strategy_config: ProduceStrategyConfig = SyncProduceStrategyConfig()
+    produce_strategy_config: ProduceStrategyConfig | DisaggProduceStrategyConfig = SyncProduceStrategyConfig()
     sampler_config: SamplerConfig
 
 
@@ -291,6 +296,7 @@ class AgentLoopManagerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     tasks: list[TaskSpecConfig] | TaskSpecConfig
+    mode: Literal["colocate", "disaggregated"] = "colocate"
 
     def build(
         self,
@@ -316,6 +322,18 @@ class AgentLoopManagerConfig(BaseModel):
                 judger=build_judger(task_cfg.judger_config) if task_cfg.judger_config is not None else None,
                 logger=logger,
             )
+            if self.mode == "colocate" and not isinstance(task_cfg.produce_strategy_config, ProduceStrategyConfig):
+                raise ValueError(
+                    "AgentLoopManagerConfig(mode='colocate') expects ProduceStrategyConfig, "
+                    f"got {type(task_cfg.produce_strategy_config).__name__} for task {task_cfg.task_name!r}."
+                )
+            if self.mode == "disaggregated" and not isinstance(
+                task_cfg.produce_strategy_config, DisaggProduceStrategyConfig
+            ):
+                raise ValueError(
+                    "AgentLoopManagerConfig(mode='disaggregated') expects DisaggProduceStrategyConfig, "
+                    f"got {type(task_cfg.produce_strategy_config).__name__} for task {task_cfg.task_name!r}."
+                )
             produce_strategy = task_cfg.produce_strategy_config.build(
                 sync_weights_interval=sync_weights_interval,
                 rollout_controller=rollout_controller,
@@ -332,7 +350,8 @@ class AgentLoopManagerConfig(BaseModel):
                 )
             )
 
-        return AgentLoopManager(
+        manager_cls = AgentLoopManager if self.mode == "colocate" else DisaggAgentLoopManager
+        return manager_cls(
             task_runners=task_runners,
             replay_buffer=replay_buffer,
             logger=logger,
@@ -793,7 +812,11 @@ class AgentLoopManager:
         #
         # 共卡路径下，produce_batch() 对应 rollout worker 当前持有的权重版本。
         await self.continue_produce(model_step=model_step)
-        local_progress = ProduceProgress.build_local(self.task_names, current_sizes, train_step)
+        local_progress = ProduceProgress.build(
+            self.task_names,
+            task_batch_sizes=current_sizes,
+            train_step=train_step,
+        )
         status = ProduceBatchStatus.NORMAL
         try:
             # 共卡 produce_batch 也是消费入口；生产前先刷新 buffer 中已有 completed / aborted。
@@ -995,3 +1018,10 @@ class AgentLoopManager:
         self._pause_time_s = 0.0
         self._model_step = saved_model_step
         return saved_model_step
+
+
+class DisaggAgentLoopManager(AgentLoopManager):
+    """非共卡 producer / consumer manager。
+
+    第一阶段先建立 mode-aware public 类型边界，复用现有后台 producer 状态机，避免在拆分入口时改变训练语义。
+    """

@@ -71,12 +71,17 @@ class TestProduceProgress(unittest.TestCase):
             allocate_batch_sizes=lambda batch_size, step: {"task_a": step, "task_b": batch_size - step},
         )
 
-        local_progress = ProduceProgress.build_local(["task_a", "task_b"], {"task_a": 1, "task_b": 3}, 7)
+        local_progress = ProduceProgress.build(
+            ["task_a", "task_b"],
+            task_batch_sizes={"task_a": 1, "task_b": 3},
+            train_step=7,
+        )
 
         self.assertEqual(local_progress.next_consumer_step, 7)
         self.assertEqual(local_progress.producer_future_step, 7)
         self.assertEqual(local_progress.target_samples, {"task_a": 1, "task_b": 3})
         self.assertEqual(global_progress.target_samples, {"task_a": 3, "task_b": 5})
+        self.assertFalse(hasattr(ProduceProgress, "build_local"))
 
     def test_load_state_dict_updates_existing_dicts_in_place(self):
         # 验证 resume/load 原地更新 dict，避免 strategy 或 context 持有的旧引用失效。

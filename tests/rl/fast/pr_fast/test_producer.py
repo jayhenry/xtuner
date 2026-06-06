@@ -261,6 +261,50 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final_data[0][0].message_uid, 0)
         self.assertEqual(final_data[1][0].message_uid, 1)
 
+    async def test_sync_produce_strategy_refills_after_filtered_and_aborted_groups(self):
+        # 验证 filtered / aborted group 不占用 completed quota，sync producer 会继续补齐训练 batch。
+        task_name = "test_sync_refill"
+
+        def is_valid_sample_fn(samples):
+            return samples[0].message_uid != 0
+
+        async def mock_gen(rs, **kwargs):
+            for r in rs:
+                if r.message_uid == 1:
+                    r.status = Status.ABORTED
+                    r.response = ""
+                    r.response_ids = []
+                else:
+                    r.status = Status.COMPLETED
+                    r.response = "ok"
+                    r.response_ids = [1, 2]
+                    r.reward = {"score": 1.0}
+            return rs
+
+        mock_agent_loop = self._build_agent_loop()
+        mock_agent_loop.generate_group = mock_gen
+        strategy = SyncProduceStrategyConfig(is_valid_sample_fn=is_valid_sample_fn).build()
+        sampler = self._build_sampler()
+        ctx = self._build_context(
+            strategy,
+            task_name,
+            mock_agent_loop,
+            sampler,
+            batch_size=2,
+            train_step=4,
+            model_step=3,
+            progress=self._build_progress(task_name, target=2, train_step=4),
+        )
+
+        status = await strategy.produce_batch(ctx)
+
+        self.assertEqual(status, ProduceBatchStatus.NORMAL)
+        completed = await self.replay_buffer.get(10, task_name, Status.COMPLETED)
+        self.assertEqual(len(completed), 2)
+        self.assertEqual(sorted(group[0].message_uid for group in completed), [2, 3])
+        self.assertEqual(await self.replay_buffer.count(task_name, Status.FILTERED), 1)
+        self.assertEqual(await self.replay_buffer.count(task_name, Status.ABORTED), 1)
+
     async def test_async_produce_strategy_oversamples_and_retries_aborted_groups(self):
         # 验证异步生产策略会按超发预算生产，并优先重试 replay buffer 中的 aborted group。
         # 这个async_produce_strategy的测试主要验证超发逻辑 + staleness 优先get的逻辑

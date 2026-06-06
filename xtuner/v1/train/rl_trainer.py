@@ -686,7 +686,9 @@ class BaseRLTrainer:
 
         if self._enable_evaluate:
             assert cfg.eval_agent_loop_manager_cfg is not None
-            self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build(
+            # 评测是一次同步 rollout，不继承训练侧非共卡后台 producer mode。
+            eval_agent_loop_manager_cfg = cfg.eval_agent_loop_manager_cfg.model_copy(update={"mode": "colocate"})
+            self.eval_agent_loop_manager = eval_agent_loop_manager_cfg.build(
                 rollout_controller=self.rollout_controller,
                 tokenizer=self.tokenizer,
                 replay_buffer=replay_buffer,

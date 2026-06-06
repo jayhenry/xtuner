@@ -120,30 +120,25 @@ class ProduceProgress:
     produce_time_s: float = 0.0
 
     @classmethod
-    def build(cls, task_names: list[str]) -> "ProduceProgress":
-        return cls(
-            consumed_samples={task_name: 0 for task_name in task_names},
-            target_samples={task_name: 0 for task_name in task_names},
-            raw_rewards_sum={task_name: 0.0 for task_name in task_names},
-            raw_rewards_count={task_name: 0 for task_name in task_names},
-            produced_samples={task_name: 0 for task_name in task_names},
-            produced_tokens={task_name: 0 for task_name in task_names},
-        )
-
-    @classmethod
-    def build_local(
+    def build(
         cls,
         task_names: list[str],
-        task_batch_sizes: dict[str, int],
-        train_step: int,
+        *,
+        task_batch_sizes: dict[str, int] | None = None,
+        train_step: int = 1,
     ) -> "ProduceProgress":
-        # 共卡路径使用局部 progress，只表达本次 produce_batch 的目标，不污染非共卡累计窗口。
+        # task_batch_sizes 为空时表示非共卡全局累计窗口；非空时表示一次共卡 produce_batch 的局部窗口。
+        target_samples = {task_name: 0 for task_name in task_names}
+        target_upto_future_step = 0
+        if task_batch_sizes is not None:
+            target_samples = dict(task_batch_sizes)
+            target_upto_future_step = train_step
         return cls(
             next_consumer_step=train_step,
             producer_future_step=train_step,
             consumed_samples={task_name: 0 for task_name in task_names},
-            target_samples=dict(task_batch_sizes),
-            target_upto_future_step=train_step,
+            target_samples=target_samples,
+            target_upto_future_step=target_upto_future_step,
             raw_rewards_sum={task_name: 0.0 for task_name in task_names},
             raw_rewards_count={task_name: 0 for task_name in task_names},
             produced_samples={task_name: 0 for task_name in task_names},
@@ -426,6 +421,25 @@ class ProduceStrategyConfig(ABC, BaseModel):
     ) -> "ProduceStrategy": ...
 
 
+class DisaggProduceStrategyConfig(ABC, BaseModel):
+    """非共卡后台 producer strategy 配置。
+
+    共卡和非共卡使用不同 Config 类型表达执行环境，避免在 strategy build 里用 mode 分支切换语义。
+    """
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    is_valid_sample_fn: IsValidSampleFn = default_is_valid_sample_fn
+    should_continue_fn: ShouldContinueFn = default_should_continue_fn
+
+    @abstractmethod
+    def build(
+        self,
+        *,
+        sync_weights_interval: int = 1,
+        rollout_controller: "Optional[RolloutControllerProxy]" = None,
+    ) -> "ProduceStrategy": ...
+
+
 class SyncProduceStrategyConfig(ProduceStrategyConfig):
     """Configuration for synchronous rollout production.
 
@@ -460,12 +474,12 @@ class SyncProduceStrategyConfig(ProduceStrategyConfig):
 
 
 class AsyncProduceStrategyConfig(ProduceStrategyConfig):
-    """Configuration for asynchronous rollout production.
+    """Configuration for colocated asynchronous rollout production.
 
-    The asynchronous strategy keeps producing rollout samples in the background
-    and stores them in the replay buffer. It can oversample, allow partial
-    rollout continuation, and discard samples that are too stale relative to the
-    current training step.
+    The colocated asynchronous strategy produces rollout samples concurrently
+    within one ``AgentLoopManager.produce_batch`` call and stores them in the
+    replay buffer. It can oversample, allow partial rollout continuation, and
+    discard samples that are too stale relative to the current training step.
 
     Args:
         is_valid_sample_fn (IsValidSampleFn): Function used to decide whether a
@@ -510,6 +524,35 @@ class AsyncProduceStrategyConfig(ProduceStrategyConfig):
 
             ray.get(rollout_controller.set_enable_partial_rollout.remote(self.enable_partial_rollout))
         return AsyncProduceStrategy(
+            over_sample_threshold=self.over_sample_threshold,
+            enable_partial_rollout=self.enable_partial_rollout,
+            max_staleness=self.max_staleness,
+            sync_weights_interval=sync_weights_interval,
+            tail_batch_trigger_size=self.tail_batch_trigger_size,
+            is_valid_sample_fn=self.is_valid_sample_fn,
+            should_continue_fn=self.should_continue_fn,
+        )
+
+
+class DisaggAsyncProduceStrategyConfig(DisaggProduceStrategyConfig):
+    """非共卡异步 rollout production 配置。"""
+
+    over_sample_threshold: float = 0.0
+    enable_partial_rollout: bool = False
+    max_staleness: int = Field(default=0, ge=0)
+    tail_batch_trigger_size: int = 0
+
+    def build(
+        self,
+        *,
+        sync_weights_interval: int = 1,
+        rollout_controller: "Optional[RolloutControllerProxy]" = None,
+    ) -> "DisaggAsyncProduceStrategy":
+        if rollout_controller is not None:
+            import ray
+
+            ray.get(rollout_controller.set_enable_partial_rollout.remote(self.enable_partial_rollout))
+        return DisaggAsyncProduceStrategy(
             over_sample_threshold=self.over_sample_threshold,
             enable_partial_rollout=self.enable_partial_rollout,
             max_staleness=self.max_staleness,
@@ -885,3 +928,10 @@ class AsyncProduceStrategy(ProduceStrategy):
                 )
         finally:
             progress_displayer.close()
+
+
+class DisaggAsyncProduceStrategy(AsyncProduceStrategy):
+    """非共卡后台 producer 使用的 async strategy。
+
+    当前第一步拆分只先固定 public 类型边界；pending 跨调用语义沿用现有 AsyncProduceStrategy 实现。
+    """
