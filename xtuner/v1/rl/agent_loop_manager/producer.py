@@ -417,7 +417,7 @@ class ProduceContext(BaseProduceContext):
     """
 
     @property
-    def target_count(self) -> int:
+    def batch_target(self) -> int:
         return self.progress.target_samples[self.task_name]
 
     async def completed_count(self) -> int:
@@ -436,7 +436,7 @@ class DisaggProduceContext(BaseProduceContext):
         return self.progress.next_consumer_step
 
     @property
-    def target_abs(self) -> int:
+    def total_target(self) -> int:
         return self.progress.target_samples[self.task_name]
 
     def should_abort(self) -> bool:
@@ -865,37 +865,35 @@ class SyncProduceStrategy(ProduceStrategy):
         progress_displayer = _ProgressDisplayer.create(
             strategy_name=self.__class__.__name__,
             task_name=ctx.task_name,
-            total=ctx.target_count,
+            total=ctx.batch_target,
             initial=completed_sample_count,
         )
-        try:
-            while self.should_continue_fn(completed_sample_count, ctx.task_batch_size):
-                if not pending_tasks:
-                    logger.warning("[SyncProduceStrategy] All tasks are done but not enough samples collected.")
-                    break
-                done_tasks, pending_tasks = await asyncio.wait(
-                    pending_tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED
-                )
-                # 如果要过滤，在这个地方处理，然后加入到 replay buffer
-                # 如果被过滤的数据就放到 put_to_filtered pool 中
-                for task in done_tasks:
-                    items = task.result()
+        while self.should_continue_fn(completed_sample_count, ctx.task_batch_size):
+            if not pending_tasks:
+                logger.warning("[SyncProduceStrategy] All tasks are done but not enough samples collected.")
+                break
+            done_tasks, pending_tasks = await asyncio.wait(
+                pending_tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED
+            )
+            # 如果要过滤，在这个地方处理，然后加入到 replay buffer
+            # 如果被过滤的数据就放到 put_to_filtered pool 中
+            for task in done_tasks:
+                items = task.result()
 
-                    is_completed = await ctx.put_generated_group(items)
-                    if not is_completed:
-                        continue
+                is_completed = await ctx.put_generated_group(items)
+                if not is_completed:
+                    continue
 
-                    completed_sample_count += 1
-                    progress_displayer.update(completed_sample_count)
+                completed_sample_count += 1
+                progress_displayer.update(completed_sample_count)
 
-                while len(pending_tasks) + completed_sample_count < ctx.task_batch_size and self.should_continue_fn(
-                    completed_sample_count, ctx.task_batch_size
-                ):
-                    rollout_state = await ctx.sampler.sample(task_name=ctx.task_name)
-                    task = create_task(ctx.generate_group(rollout_state))
-                    pending_tasks.add(task)
-        finally:
-            progress_displayer.close()
+            while len(pending_tasks) + completed_sample_count < ctx.task_batch_size and self.should_continue_fn(
+                completed_sample_count, ctx.task_batch_size
+            ):
+                rollout_state = await ctx.sampler.sample(task_name=ctx.task_name)
+                task = create_task(ctx.generate_group(rollout_state))
+                pending_tasks.add(task)
+        progress_displayer.close()
 
 
 class AsyncProduceStrategy(ProduceStrategy):
@@ -952,7 +950,7 @@ class AsyncProduceStrategy(ProduceStrategy):
         # Manager 会在所有 active task produce_batch 正常返回后统一调用 pause_produce 收尾。
         self._local_pending_tasks = set()
 
-        if ctx.target_count <= 0:
+        if ctx.batch_target <= 0:
             return
 
         expired_count = await ctx.expired_count()
@@ -965,11 +963,11 @@ class AsyncProduceStrategy(ProduceStrategy):
 
         # 本轮 produce_batch 的必要累计目标固定；normal 模式只按当前 task batch 追加固定超发预算。
         # tail-batch 模式只补必要缺口，新增任务固定从 EXPIRED pool 取，不再扩大超发窗口。
-        target_count = ctx.target_count
+        batch_target = ctx.batch_target
         oversample_budget = 0 if sample_from_expired else math.ceil(self.over_sample_threshold * ctx.task_batch_size)
-        scheduled_target = target_count + oversample_budget
+        scheduled_target = batch_target + oversample_budget
         logger.info(
-            f"Starting produce_batch for task {ctx.task_name} with target_count={target_count}, "
+            f"Starting produce_batch for task {ctx.task_name} with batch_target={batch_target}, "
             f"oversample_budget={oversample_budget}, scheduled_target={scheduled_target}."
         )
 
@@ -986,38 +984,36 @@ class AsyncProduceStrategy(ProduceStrategy):
         progress_displayer = _ProgressDisplayer.create(
             strategy_name=self.__class__.__name__,
             task_name=ctx.task_name,
-            total=ctx.target_count,
+            total=ctx.batch_target,
             initial=initial_available,
         )
-        try:
-            while True:
-                available = await ctx.completed_count()
-                progress_displayer.update(available)
-                if not self.should_continue_fn(available, target_count):
-                    return
+        while True:
+            available = await ctx.completed_count()
+            progress_displayer.update(available)
+            if not self.should_continue_fn(available, batch_target):
+                break
 
-                pending_count = len(self._local_pending_tasks)
-                desired_pending = max(0, scheduled_target - available)
-                if available + pending_count < scheduled_target:
-                    while len(self._local_pending_tasks) < desired_pending:
-                        self._local_pending_tasks.add(await spawn_one())
+            pending_count = len(self._local_pending_tasks)
+            desired_pending = max(0, scheduled_target - available)
+            if available + pending_count < scheduled_target:
+                while len(self._local_pending_tasks) < desired_pending:
+                    self._local_pending_tasks.add(await spawn_one())
 
-                if not self._local_pending_tasks:
-                    logger.warning("All tasks are done but not enough samples collected.")
-                    return
+            if not self._local_pending_tasks:
+                logger.warning("All tasks are done but not enough samples collected.")
+                break
 
-                done_tasks, _ = await asyncio.wait(
-                    set(self._local_pending_tasks), timeout=1, return_when=asyncio.FIRST_COMPLETED
-                )
-                self._local_pending_tasks.difference_update(done_tasks)
-                await _put_claimed_tasks(
-                    done_tasks,
-                    ctx,
-                    available_base=available,
-                    progress_displayer=progress_displayer,
-                )
-        finally:
-            progress_displayer.close()
+            done_tasks, _ = await asyncio.wait(
+                set(self._local_pending_tasks), timeout=1, return_when=asyncio.FIRST_COMPLETED
+            )
+            self._local_pending_tasks.difference_update(done_tasks)
+            await _put_claimed_tasks(
+                done_tasks,
+                ctx,
+                available_base=available,
+                progress_displayer=progress_displayer,
+            )
+        progress_displayer.close()
 
 
 class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
@@ -1074,7 +1070,7 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
         if ctx.task_name not in ctx.progress.target_samples:
             raise KeyError(f"DisaggProduceProgress.target_samples missing task_name={ctx.task_name!r}")
 
-        if ctx.target_abs <= 0:
+        if ctx.total_target <= 0:
             return ProduceBatchStatus.NORMAL
 
         if ctx.should_abort():
@@ -1101,11 +1097,11 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
 
         # 本轮 produce_batch 的必要累计目标固定；normal 模式只按当前 task batch 追加固定超发预算。
         # tail-batch 模式只补必要缺口，新增任务固定从 EXPIRED pool 取，不再扩大超发窗口。
-        target_abs = ctx.target_abs
+        total_target = ctx.total_target
         oversample_budget = 0 if sample_from_expired else math.ceil(self.over_sample_threshold * ctx.task_batch_size)
-        scheduled_target = target_abs + oversample_budget
+        scheduled_target = total_target + oversample_budget
         logger.info(
-            f"Starting produce_batch for task {ctx.task_name} with target_abs={target_abs}, "
+            f"Starting produce_batch for task {ctx.task_name} with total_target={total_target}, "
             f"oversample_budget={oversample_budget}, scheduled_target={scheduled_target}."
         )
 
@@ -1122,45 +1118,49 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
         progress_displayer = _ProgressDisplayer.create(
             strategy_name=self.__class__.__name__,
             task_name=ctx.task_name,
-            total=ctx.target_abs,
+            total=ctx.total_target,
             initial=initial_available,
         )
-        try:
-            while True:
+        produce_status = ProduceBatchStatus.NORMAL
+        while True:
+            if ctx.should_abort():
+                produce_status = ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
+                break
+            if self.is_model_expired(ctx.train_step, ctx.model_step):
+                produce_status = ProduceBatchStatus.EXPIRED_BATCH
+                break
+
+            available = await ctx.available_count()
+            progress_displayer.update(available)
+            if not self.should_continue_fn(available, total_target):
+                break
+
+            pending_count = self._pending_tasks.count()
+            desired_pending = max(0, scheduled_target - available)
+            if available + pending_count < scheduled_target:
+                while await self._pending_tasks.schedule_one(
+                    max_pending=desired_pending,
+                    should_abort=ctx.should_abort,
+                    spawn_one=spawn_one,
+                ):
+                    pass
                 if ctx.should_abort():
-                    return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
-                if self.is_model_expired(ctx.train_step, ctx.model_step):
-                    return ProduceBatchStatus.EXPIRED_BATCH
+                    produce_status = ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
+                    break
 
-                available = await ctx.available_count()
-                progress_displayer.update(available)
-                if not self.should_continue_fn(available, target_abs):
-                    return ProduceBatchStatus.NORMAL
+            if ctx.should_abort():
+                produce_status = ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
+                break
+            if self._pending_tasks.count() == 0:
+                logger.warning("All tasks are done but not enough samples collected.")
+                break
 
-                pending_count = self._pending_tasks.count()
-                desired_pending = max(0, scheduled_target - available)
-                if available + pending_count < scheduled_target:
-                    while await self._pending_tasks.schedule_one(
-                        max_pending=desired_pending,
-                        should_abort=ctx.should_abort,
-                        spawn_one=spawn_one,
-                    ):
-                        pass
-                    if ctx.should_abort():
-                        return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
-
-                if ctx.should_abort():
-                    return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
-                if self._pending_tasks.count() == 0:
-                    logger.warning("All tasks are done but not enough samples collected.")
-                    return ProduceBatchStatus.NORMAL
-
-                claimed_done = await self._pending_tasks.wait_and_claim(timeout_s=1)
-                await _put_claimed_tasks(
-                    claimed_done,
-                    ctx,
-                    available_base=available,
-                    progress_displayer=progress_displayer,
-                )
-        finally:
-            progress_displayer.close()
+            claimed_done = await self._pending_tasks.wait_and_claim(timeout_s=1)
+            await _put_claimed_tasks(
+                claimed_done,
+                ctx,
+                available_base=available,
+                progress_displayer=progress_displayer,
+            )
+        progress_displayer.close()
+        return produce_status

@@ -222,8 +222,8 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
                 train_step=3,
             ),
         )
-        self.assertEqual(colocate_ctx.target_count, 1)
-        for disagg_only_name in ("update_event", "should_abort", "available_count", "target_abs"):
+        self.assertEqual(colocate_ctx.batch_target, 1)
+        for disagg_only_name in ("update_event", "should_abort", "available_count", "total_target"):
             self.assertFalse(hasattr(colocate_ctx, disagg_only_name), disagg_only_name)
 
         disagg_strategy = DisaggAsyncProduceStrategyConfig(over_sample_threshold=0.0).build()
@@ -239,7 +239,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             progress=self._build_disagg_progress(task_name, target=2, train_step=3, consumed=1),
             update_event=update_event,
         )
-        self.assertEqual(disagg_ctx.target_abs, 2)
+        self.assertEqual(disagg_ctx.total_target, 2)
         self.assertEqual(await disagg_ctx.available_count(), 1)
         self.assertFalse(disagg_ctx.should_abort())
         update_event.set()
