@@ -23,6 +23,7 @@ from .producer import (
     DisaggProduceProgress,
     DisaggProduceStrategy,
     DisaggProduceStrategyConfig,
+    IsValidSampleFn,
     ProduceBatchStatus,
     ProduceContext,
     ProduceProgress,
@@ -93,6 +94,14 @@ class _TaskRunner:
     sampler: Sampler
     weight: float = 1.0
     order: int = 0
+
+    @property
+    def is_valid_sample_fn(self) -> IsValidSampleFn:
+        return getattr(self.produce_strategy, "is_valid_sample_fn", default_is_valid_sample_fn)
+
+    @property
+    def stale_threshold(self) -> int | None:
+        return getattr(self.produce_strategy, "stale_threshold", None)
 
 
 class _TaskSamplerView:
@@ -195,6 +204,7 @@ def _fill_leftover_counts(result: ProduceBatchResult, status_counts: dict[Status
     result.leftover_filtered = status_counts.get(Status.FILTERED, 0)
 
 
+# TODO: 去掉 _init_manager_fields，将它内联到 AgentLoopManager 和 DisaggAgentLoopManager 的 __init__ 中
 def _init_manager_fields(
     manager, task_runners: list[_TaskRunner], replay_buffer: ReplayBuffer, logger, name: str
 ) -> None:
@@ -278,6 +288,7 @@ def validate_task_batch_sizes(
 
 
 def get_task_batch_sizes_for_step(manager, batch_size: int, train_step: int) -> dict[str, int]:
+    # TODO: 去掉这个函数。具体做法是：1.删掉单task分支。 2. 将validate_task_batch_sizes移到 manager.get_task_batch_sizes中。 3. 外部调用直接使用 manager.get_task_batch_sizes
     if len(manager.task_runners) == 1:
         return {manager.task_runners[0].task_name: batch_size}
 
@@ -298,8 +309,7 @@ async def refresh_for_all_tasks(
     task_stale_thresholds: dict[str, int] = {}
     for task in task_runners:
         # colocate / disagg 都统一刷新 staleness；同步策略没有 stale_threshold 时使用 1。
-        stale_threshold = getattr(task.produce_strategy, "stale_threshold", 1)
-        task_stale_thresholds[task.task_name] = stale_threshold
+        task_stale_thresholds[task.task_name] = task.stale_threshold or 1
 
     expired_counts = await replay_buffer.refresh_staleness(
         task_stale_thresholds=task_stale_thresholds,
@@ -528,8 +538,8 @@ def _build_produce_context(
         train_step=train_step,
         model_step=model_step,
         progress=progress,
-        is_valid_sample_fn=getattr(task_runner.produce_strategy, "is_valid_sample_fn", default_is_valid_sample_fn),
-        stale_threshold=getattr(task_runner.produce_strategy, "stale_threshold", None),
+        is_valid_sample_fn=task_runner.is_valid_sample_fn,
+        stale_threshold=task_runner.stale_threshold,
     )
 
 
@@ -552,8 +562,8 @@ def _build_disagg_produce_context(
         model_step=model_step,
         progress=progress,
         update_event=update_event,
-        is_valid_sample_fn=getattr(task_runner.produce_strategy, "is_valid_sample_fn", default_is_valid_sample_fn),
-        stale_threshold=getattr(task_runner.produce_strategy, "stale_threshold", None),
+        is_valid_sample_fn=task_runner.is_valid_sample_fn,
+        stale_threshold=task_runner.stale_threshold,
     )
 
 

@@ -181,14 +181,17 @@ class DisaggProduceProgress:
     ) -> dict[str, int]:
         """把累计 target 推进到指定 future step，并返回该 step 的 task batch size。"""
 
+        current_task_batch_sizes: dict[str, int] | None = None
         if future_step > self.target_upto_future_step:
             for step in range(self.target_upto_future_step + 1, future_step + 1):
-                task_batch_sizes = allocate_batch_sizes(batch_size, step)
-                for task_name, task_batch_size in task_batch_sizes.items():
+                current_task_batch_sizes = allocate_batch_sizes(batch_size, step)
+                for task_name, task_batch_size in current_task_batch_sizes.items():
                     self.target_samples[task_name] += task_batch_size
             self.target_upto_future_step = future_step
 
-        return allocate_batch_sizes(batch_size, future_step)
+        if current_task_batch_sizes is None:
+            current_task_batch_sizes = allocate_batch_sizes(batch_size, future_step)
+        return current_task_batch_sizes
 
     def begin_consume(self, train_step: int) -> None:
         self.next_consumer_step = train_step
@@ -831,6 +834,22 @@ async def pause_pending_tasks(
     return pause_time
 
 
+async def _put_claimed_tasks(
+    claimed_tasks: set[asyncio.Task],
+    ctx: BaseProduceContext,
+    *,
+    available_base: int | None = None,
+    progress_displayer: _ProgressDisplayer | None = None,
+) -> None:
+    completed_count = 0
+    for task in claimed_tasks:
+        is_completed = await ctx.put_generated_group(task.result())
+        if is_completed:
+            completed_count += 1
+        if is_completed and available_base is not None and progress_displayer is not None:
+            progress_displayer.update(available_base + completed_count)
+
+
 class SyncProduceStrategy(ProduceStrategy):
     async def produce_batch(self, ctx: ProduceContext) -> ProduceBatchStatus:
         pending_tasks = set()
@@ -922,22 +941,6 @@ class AsyncProduceStrategy(ProduceStrategy):
     def pending_task_count(self) -> int:
         return len(self._local_pending_tasks)
 
-    async def _put_claimed(
-        self,
-        claimed_tasks: set[asyncio.Task],
-        ctx: BaseProduceContext,
-        available_base: int | None = None,
-        progress_displayer: _ProgressDisplayer | None = None,
-    ) -> None:
-        completed_count = 0
-        for task in claimed_tasks:
-            items = task.result()
-            is_completed = await ctx.put_generated_group(items)
-            if is_completed:
-                completed_count += 1
-            if is_completed and available_base is not None and progress_displayer is not None:
-                progress_displayer.update(available_base + completed_count)
-
     async def pause_produce(self, ctx: ProduceContext) -> float:
         return await pause_pending_tasks(
             pending_tasks=self._local_pending_tasks,
@@ -1011,7 +1014,7 @@ class AsyncProduceStrategy(ProduceStrategy):
                     set(self._local_pending_tasks), timeout=1, return_when=asyncio.FIRST_COMPLETED
                 )
                 self._local_pending_tasks.difference_update(done_tasks)
-                await self._put_claimed(
+                await _put_claimed_tasks(
                     done_tasks,
                     ctx,
                     available_base=available,
@@ -1062,22 +1065,6 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
     def pending_task_count(self) -> int:
         return self._pending_tasks.count()
 
-    async def _put_claimed(
-        self,
-        claimed_tasks: set[asyncio.Task],
-        ctx: DisaggProduceContext,
-        available_base: int | None = None,
-        progress_displayer: _ProgressDisplayer | None = None,
-    ) -> None:
-        completed_count = 0
-        for task in claimed_tasks:
-            items = task.result()
-            is_completed = await ctx.put_generated_group(items)
-            if is_completed:
-                completed_count += 1
-            if is_completed and available_base is not None and progress_displayer is not None:
-                progress_displayer.update(available_base + completed_count)
-
     async def pause_produce(self, ctx: DisaggProduceContext) -> float:
         return await pause_pending_tasks(
             pending_tasks=self._pending_tasks,
@@ -1101,7 +1088,7 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
 
         # 非共卡 pending 跨后台 produce_batch 调用存在；进入下一轮时先回收已经完成的旧任务。
         claimed_done = await self._pending_tasks.claim_ready()
-        await self._put_claimed(claimed_done, ctx)
+        await _put_claimed_tasks(claimed_done, ctx)
 
         if ctx.should_abort():
             return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
@@ -1173,7 +1160,7 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
                     return ProduceBatchStatus.NORMAL
 
                 claimed_done = await self._pending_tasks.wait_and_claim(timeout_s=1)
-                await self._put_claimed(
+                await _put_claimed_tasks(
                     claimed_done,
                     ctx,
                     available_base=available,
