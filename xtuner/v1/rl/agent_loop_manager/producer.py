@@ -37,6 +37,7 @@ from .sampler import Sampler
 
 logger = get_logger()
 GROUP_GENERATE_TIME_KEY = "group_generate_time_s"
+PERIODIC_ABORT_INTERVAL_S = 5.0
 
 
 class _ProgressDisplayer:
@@ -79,39 +80,16 @@ class _ProgressDisplayer:
 
 @dataclass
 class ProduceProgress:
-    """生产者和消费者共享的 live 进度对象。
+    """共卡单次 produce_batch 的局部进度。
 
-    设计目标：
-    - Manager / 调用方负责初始化并原地更新这个对象，strategy 只接收引用并读取最新进度。
-    - 共卡 manager 只在一次 produce_batch 调用内构造它；非共卡全局 progress 使用
-      DisaggProduceProgress，避免把后台 producer 状态误挂到共卡 manager 上。
-
-    使用注意：
-    - 不要在 strategy 中补 key 或用 dict.get(..., 0) 兜底；缺少 task key 应 fail fast。
-    - 除非语义明确要求冻结本轮 produce_batch 的 target / scheduled_target，
-      否则不要把字段值复制成局部快照后跨 await 使用；需要字段值时直接读 progress.xxx，
-      让并发更新后的 next_consumer_step / consumed_samples 能尽早生效。
-    - 运行中不要整体替换 progress 对象；非共卡 resume 时也应原地更新字段，避免旧引用失效。
-
-    字段含义：
-    - next_consumer_step：producer 写入新样本时应面向的训练 step。get_batch(i) 入口设为 i，
-      成功取出非空 batch 后设为 i + 1。
-    - producer_future_step：producer 当前准备生产的 future step。
-    - consumed_samples：各 task 已被 consumer 从 replay buffer 取走的 group 绝对累计数。
-    - target_samples：各 task 截至 target_upto_future_step 应生产出的 group 绝对累计目标。
-    - target_upto_future_step：target_samples 已覆盖到的最大 future step。
-    - raw_rewards_sum / raw_rewards_count：各 task 自上次 consumer 取 batch 后，producer 实际生成出的
-      completed group reward 统计。filtered group 在过滤前仍按 completed 生成结果计入。
-    - produced_samples / produced_tokens：各 task 自上次 consumer 取 batch 后，producer 实际返回的样本数和
-      response token 数，包含 filtered / aborted / 未被训练消费的 completed 样本。
-    - produce_time_s：自上次 consumer 取 batch 后，producer 实际执行 produce_batch 的累计 wall time。
+    中文不变量：
+    - 只表达本次调用，不进入 checkpoint。
+    - 裁剪非共卡需要的 next_consumer_step / consumed_samples / target_upto_future_step / state_dict。
+    - 不新增 model_step，model_step 仍由 manager 放进 ProduceContext。
     """
 
-    next_consumer_step: int = 1
     producer_future_step: int = 1
-    consumed_samples: dict[str, int] = field(default_factory=dict)
     target_samples: dict[str, int] = field(default_factory=dict)
-    target_upto_future_step: int = 0
     raw_rewards_sum: dict[str, float] = field(default_factory=dict)
     raw_rewards_count: dict[str, int] = field(default_factory=dict)
     produced_samples: dict[str, int] = field(default_factory=dict)
@@ -121,24 +99,73 @@ class ProduceProgress:
     @classmethod
     def build(
         cls,
-        task_names: list[str],
         *,
-        task_batch_sizes: dict[str, int] | None = None,
+        task_names: list[str],
+        target_samples: dict[str, int],
         train_step: int = 1,
     ) -> "ProduceProgress":
-        # task_batch_sizes 为空时表示累计窗口（由 DisaggProduceProgress 使用）；
-        # 非空时表示一次共卡 produce_batch 的局部窗口。
-        target_samples = {task_name: 0 for task_name in task_names}
-        target_upto_future_step = 0
-        if task_batch_sizes is not None:
-            target_samples = dict(task_batch_sizes)
-            target_upto_future_step = train_step
         return cls(
-            next_consumer_step=train_step,
             producer_future_step=train_step,
+            target_samples=dict(target_samples),
+            raw_rewards_sum={task_name: 0.0 for task_name in task_names},
+            raw_rewards_count={task_name: 0 for task_name in task_names},
+            produced_samples={task_name: 0 for task_name in task_names},
+            produced_tokens={task_name: 0 for task_name in task_names},
+        )
+
+    def add_raw_rewards(self, task_name: str, rewards_sum: float, rewards_count: int) -> None:
+        self.raw_rewards_sum[task_name] += rewards_sum
+        self.raw_rewards_count[task_name] += rewards_count
+
+    def add_produced(self, task_name: str, samples: int, tokens: int) -> None:
+        self.produced_samples[task_name] += samples
+        self.produced_tokens[task_name] += tokens
+
+    def add_produce_time(self, elapsed_s: float) -> None:
+        self.produce_time_s += elapsed_s
+
+    def consume_produced(self, task_name: str) -> tuple[int, int]:
+        samples = self.produced_samples[task_name]
+        tokens = self.produced_tokens[task_name]
+        self.produced_samples[task_name] = 0
+        self.produced_tokens[task_name] = 0
+        return samples, tokens
+
+    def consume_produce_time(self) -> float:
+        produce_time_s = self.produce_time_s
+        self.produce_time_s = 0.0
+        return produce_time_s
+
+    def consume_raw_rewards(self, task_name: str) -> tuple[float, int]:
+        rewards_sum = self.raw_rewards_sum[task_name]
+        rewards_count = self.raw_rewards_count[task_name]
+        self.raw_rewards_sum[task_name] = 0.0
+        self.raw_rewards_count[task_name] = 0
+        return rewards_sum, rewards_count
+
+
+@dataclass
+class DisaggProduceProgress:
+    """非共卡 Background Producer / Training Consumer 共享进度。"""
+
+    task_names: list[str] = field(default_factory=list)
+    producer_future_step: int = 1
+    next_consumer_step: int = 1
+    target_upto_future_step: int = 0
+    consumed_samples: dict[str, int] = field(default_factory=dict)
+    target_samples: dict[str, int] = field(default_factory=dict)
+    raw_rewards_sum: dict[str, float] = field(default_factory=dict)
+    raw_rewards_count: dict[str, int] = field(default_factory=dict)
+    produced_samples: dict[str, int] = field(default_factory=dict)
+    produced_tokens: dict[str, int] = field(default_factory=dict)
+    produce_time_s: float = 0.0
+
+    @classmethod
+    def build(cls, task_names: list[str]) -> "DisaggProduceProgress":
+        return cls(
+            task_names=list(task_names),
             consumed_samples={task_name: 0 for task_name in task_names},
-            target_samples=target_samples,
-            target_upto_future_step=target_upto_future_step,
+            target_samples={task_name: 0 for task_name in task_names},
             raw_rewards_sum={task_name: 0.0 for task_name in task_names},
             raw_rewards_count={task_name: 0 for task_name in task_names},
             produced_samples={task_name: 0 for task_name in task_names},
@@ -171,6 +198,12 @@ class ProduceProgress:
         for task_name, count in consumed_counts.items():
             self.consumed_samples[task_name] += count
 
+    def finish_consume(self, train_step: int) -> None:
+        self.next_consumer_step = train_step + 1
+
+    def advance_future_step(self) -> None:
+        self.producer_future_step += 1
+
     def add_raw_rewards(self, task_name: str, rewards_sum: float, rewards_count: int) -> None:
         self.raw_rewards_sum[task_name] += rewards_sum
         self.raw_rewards_count[task_name] += rewards_count
@@ -201,19 +234,13 @@ class ProduceProgress:
         self.raw_rewards_count[task_name] = 0
         return rewards_sum, rewards_count
 
-    def finish_consume(self, train_step: int) -> None:
-        self.next_consumer_step = train_step + 1
-
-    def advance_future_step(self) -> None:
-        self.producer_future_step += 1
-
     def state_dict(self) -> dict[str, Any]:
         return {
-            "next_consumer_step": self.next_consumer_step,
             "producer_future_step": self.producer_future_step,
+            "next_consumer_step": self.next_consumer_step,
+            "target_upto_future_step": self.target_upto_future_step,
             "consumed_samples": dict(self.consumed_samples),
             "target_samples": dict(self.target_samples),
-            "target_upto_future_step": self.target_upto_future_step,
             "raw_rewards_sum": dict(self.raw_rewards_sum),
             "raw_rewards_count": dict(self.raw_rewards_count),
             "produced_samples": dict(self.produced_samples),
@@ -223,8 +250,8 @@ class ProduceProgress:
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         # 原地更新 dict，避免 strategy / context 持有旧引用。
-        self.next_consumer_step = state["next_consumer_step"]
         self.producer_future_step = state["producer_future_step"]
+        self.next_consumer_step = state["next_consumer_step"]
         self.target_upto_future_step = state["target_upto_future_step"]
         self.consumed_samples.clear()
         self.consumed_samples.update(state["consumed_samples"])
@@ -250,15 +277,6 @@ class ProduceProgress:
             {task_name: int(produced_tokens_state.get(task_name, 0)) for task_name in task_names}
         )
         self.produce_time_s = float(state.get("produce_time_s", 0.0))
-
-
-@dataclass
-class DisaggProduceProgress(ProduceProgress):
-    """非共卡 producer / consumer 共享的绝对累计进度。
-
-    这个类型继承已验证的进度算法，只改变所有权边界：只有 DisaggAgentLoopManager 会持有并 checkpoint 它；共卡 AgentLoopManager 的 ProduceProgress 只属于一次本地
-    produce_batch 调用。
-    """
 
 
 class ProduceBatchStatus(Enum):
@@ -295,16 +313,14 @@ class ShouldContinueFn(Protocol):
     def __call__(self, completed_count: int, batch_size: int, **kwargs) -> bool: ...
 
 
-@dataclass
-class ProduceContext:
-    """单 task 生产上下文。
+@dataclass(kw_only=True)
+class BaseProduceContext:
+    """单 task 生产上下文的共享能力。
 
-    这里集中维护 AsyncProduceStrategy 最容易传错的运行时契约：
-    - strategy 只接受 ProduceContext，不再兼容散装参数入口；
-    - target / consumed 都按绝对累计口径读取；
-    - 暂停只读 manager 传入的 update_event；
+    这里保留共卡和非共卡都需要的 sample/generate/put 运行时契约：
     - rollout generate 的 ray/local 差异和 timing 字段写入；
     - 生成结果先按业务有效性过滤，再统一交给 ReplayBuffer 写版本、刷新 staleness、执行过期。
+    非共卡独有的 update_event / 绝对进度访问只放在 DisaggProduceContext。
     """
 
     agent_loop: AgentLoopSpec
@@ -313,29 +329,17 @@ class ProduceContext:
     task_batch_size: int
     task_name: str
     train_step: int
-    update_event: asyncio.Event
     model_step: int
-    progress: ProduceProgress
+    progress: ProduceProgress | DisaggProduceProgress
     is_valid_sample_fn: IsValidSampleFn = default_is_valid_sample_fn
     stale_threshold: int | None = None
 
     @property
     def consumer_step(self) -> int:
-        return self.progress.next_consumer_step
-
-    @property
-    def target_abs(self) -> int:
-        return self.progress.target_samples[self.task_name]
-
-    def should_abort(self) -> bool:
-        return self.update_event.is_set()
+        return self.train_step
 
     async def expired_count(self) -> int:
         return await self.replay_buffer.count(task_name=self.task_name, group_status=Status.EXPIRED)
-
-    async def available_count(self) -> int:
-        completed_count = await self.replay_buffer.count(task_name=self.task_name, group_status=Status.COMPLETED)
-        return self.progress.consumed_samples[self.task_name] + completed_count
 
     async def sample_group(self, *, from_expired_pool: bool) -> list[RolloutState]:
         group_status = [Status.EXPIRED, Status.ABORTED] if from_expired_pool else [Status.ABORTED]
@@ -402,6 +406,44 @@ class ProduceContext:
         return is_completed
 
 
+@dataclass(kw_only=True)
+class ProduceContext(BaseProduceContext):
+    """共卡 strategy context。
+
+    共卡只表达一次 produce_batch 的本地生产窗口，不暴露 update_event / should_abort / 绝对 consumed+completed 口径，避免把非共卡后台状态机语义泄漏进同步生产路径。
+    """
+
+    @property
+    def target_count(self) -> int:
+        return self.progress.target_samples[self.task_name]
+
+    async def completed_count(self) -> int:
+        return await self.replay_buffer.count(task_name=self.task_name, group_status=Status.COMPLETED)
+
+
+@dataclass(kw_only=True)
+class DisaggProduceContext(BaseProduceContext):
+    """非共卡 strategy context。"""
+
+    progress: DisaggProduceProgress
+    update_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @property
+    def consumer_step(self) -> int:
+        return self.progress.next_consumer_step
+
+    @property
+    def target_abs(self) -> int:
+        return self.progress.target_samples[self.task_name]
+
+    def should_abort(self) -> bool:
+        return self.update_event.is_set()
+
+    async def available_count(self) -> int:
+        completed_count = await self.replay_buffer.count(task_name=self.task_name, group_status=Status.COMPLETED)
+        return self.progress.consumed_samples[self.task_name] + completed_count
+
+
 class ProduceStrategyConfig(ABC, BaseModel):
     """Base configuration for rollout production strategies.
 
@@ -446,7 +488,7 @@ class DisaggProduceStrategyConfig(ABC, BaseModel):
         *,
         sync_weights_interval: int = 1,
         rollout_controller: "Optional[RolloutControllerProxy]" = None,
-    ) -> "ProduceStrategy": ...
+    ) -> "DisaggProduceStrategy": ...
 
 
 class SyncProduceStrategyConfig(ProduceStrategyConfig):
@@ -595,6 +637,28 @@ class ProduceStrategy(ABC):
         return 0
 
 
+class DisaggProduceStrategy(ABC):
+    def __init__(
+        self,
+        is_valid_sample_fn: IsValidSampleFn,
+        should_continue_fn: ShouldContinueFn,
+    ):
+        self.is_valid_sample_fn = is_valid_sample_fn
+        self.should_continue_fn = should_continue_fn
+
+    @abstractmethod
+    async def produce_batch(self, ctx: DisaggProduceContext) -> ProduceBatchStatus: ...
+
+    async def pause_produce(self, ctx: DisaggProduceContext) -> float:
+        return 0.0
+
+    def is_model_expired(self, train_step: int, model_step: int) -> bool:
+        return False
+
+    def pending_task_count(self) -> int:
+        return 0
+
+
 class _PendingTasks:
     """AsyncProduceStrategy 的并发 pending task 集合。
 
@@ -659,6 +723,118 @@ class _PendingTasks:
         return len(tasks)
 
 
+class _LocalPendingTasks:
+    """把共卡本次调用的局部 pending set 适配成统一 drain 协议。
+
+    共卡 pending 不跨 produce_batch 调用；这里原地修改传入的 set，让 pending_task_count() 在 pause 过程中仍能反映剩余本地任务数量。
+    """
+
+    def __init__(self, tasks: set[asyncio.Task]) -> None:
+        self._tasks = tasks
+
+    def count(self) -> int:
+        return len(self._tasks)
+
+    async def wait_and_claim(self, *, timeout_s: float) -> set[asyncio.Task]:
+        if not self._tasks:
+            return set()
+        done, _ = await asyncio.wait(set(self._tasks), timeout=timeout_s, return_when=asyncio.FIRST_COMPLETED)
+        self._tasks.difference_update(done)
+        return done
+
+    async def cancel_all(self) -> int:
+        tasks = set(self._tasks)
+        self._tasks.clear()
+        if not tasks:
+            return 0
+        logger.warning(f"Cancelling {len(tasks)} pending rollout tasks.")
+        await cancel_and_drain(list(tasks))
+        return len(tasks)
+
+
+async def request_agent_loop_pause(ctx: BaseProduceContext, *, pending_count: int) -> None:
+    """发送一次 agent loop pause 请求，供共卡和非共卡 pending drain 复用。"""
+
+    pause_request_start = time.perf_counter()
+    if isinstance(ctx.agent_loop, ray.actor.ActorHandle):
+        pause_future = ctx.agent_loop.pause.remote()
+    else:
+        pause_future = ctx.agent_loop.pause()
+    try:
+        await asyncio.wait_for(pause_future, timeout=AGENT_LOOP_PAUSE_REQUEST_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"Agent loop pause timed out: task={ctx.task_name}, timeout_s={AGENT_LOOP_PAUSE_REQUEST_TIMEOUT_S}, "
+            f"elapsed={time.perf_counter() - pause_request_start:.2f}s, pending={pending_count}"
+        )
+    except Exception:
+        logger.exception(
+            f"Agent loop pause failed: task={ctx.task_name}, "
+            f"elapsed={time.perf_counter() - pause_request_start:.2f}s, pending={pending_count}"
+        )
+
+
+async def pause_pending_tasks(
+    *,
+    pending_tasks: set[asyncio.Task] | _PendingTasks,
+    ctx: BaseProduceContext,
+    put_claimed_task: Callable[[asyncio.Task], Awaitable[Any]],
+) -> float:
+    """复用 pending task pause / drain / cancel 协议。
+
+    中文不变量：
+    - 先发 pause，再等待 pending 产出；
+    - pending 没清空时周期性补发 pause，兼容后端 pause/abort 信号延迟；
+    - 超时后 cancel 剩余 pending，避免 checkpoint/save 前仍有任务写 buffer；
+    - 已完成任务必须 claim 后再 put，避免 produce 和 pause 重复入库同一个 done task。
+    """
+
+    pending = _LocalPendingTasks(pending_tasks) if isinstance(pending_tasks, set) else pending_tasks
+    pause_start = time.perf_counter()
+    if pending.count() == 0:
+        return 0.0
+
+    initial_pending_count = pending.count()
+    logger.info(
+        f"Pause signal loop started for task {ctx.task_name}. "
+        f"Waiting for {initial_pending_count} pending tasks to complete. "
+        f"periodic_abort_interval_s={PERIODIC_ABORT_INTERVAL_S}, "
+        f"producer_pause_pending_task_timeout_s={PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S}"
+    )
+
+    pending_pause_tasks = {create_task(request_agent_loop_pause(ctx, pending_count=initial_pending_count))}
+    cleanup_start_time = time.perf_counter()
+    next_periodic_abort_time = cleanup_start_time + PERIODIC_ABORT_INTERVAL_S
+    while True:
+        elapsed_time = time.perf_counter() - cleanup_start_time
+        if elapsed_time > PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S:
+            cancelled_count = await pending.cancel_all()
+            logger.warning(
+                f"Cleanup timeout of {PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S}s reached. "
+                f"Forcefully cancelling {cancelled_count} remaining tasks. task={ctx.task_name}"
+            )
+            break
+
+        if pending.count() == 0:
+            break
+        current_time = time.perf_counter()
+        pending_pause_tasks = {task for task in pending_pause_tasks if not task.done()}
+
+        # 定时发送 pause 信号，避免后端漏掉第一次 pause 后 pending 长时间不结束。
+        if PERIODIC_ABORT_INTERVAL_S > 0 and current_time >= next_periodic_abort_time:
+            pending_pause_tasks.add(create_task(request_agent_loop_pause(ctx, pending_count=pending.count())))
+            next_periodic_abort_time += PERIODIC_ABORT_INTERVAL_S
+
+        claimed_done = await pending.wait_and_claim(timeout_s=1)
+        for task in claimed_done:
+            await put_claimed_task(task)
+
+    await cancel_and_drain(list(pending_pause_tasks))
+    pause_time = time.perf_counter() - pause_start
+    logger.info(f"pause_produce completed for task {ctx.task_name} within {pause_time}s.")
+    return pause_time
+
+
 class SyncProduceStrategy(ProduceStrategy):
     async def produce_batch(self, ctx: ProduceContext) -> ProduceBatchStatus:
         pending_tasks = set()
@@ -676,7 +852,7 @@ class SyncProduceStrategy(ProduceStrategy):
         progress_displayer = _ProgressDisplayer.create(
             strategy_name=self.__class__.__name__,
             task_name=ctx.task_name,
-            total=ctx.target_abs,
+            total=ctx.target_count,
             initial=completed_sample_count,
         )
         try:
@@ -713,7 +889,7 @@ class SyncProduceStrategy(ProduceStrategy):
 
 class AsyncProduceStrategy(ProduceStrategy):
     # Local retry interval for re-sending pause/abort while pending tasks drain.
-    PERIODIC_ABORT_INTERVAL_S = 5.0
+    PERIODIC_ABORT_INTERVAL_S = PERIODIC_ABORT_INTERVAL_S
 
     def __init__(
         self,
@@ -757,7 +933,7 @@ class AsyncProduceStrategy(ProduceStrategy):
     async def _put_claimed(
         self,
         claimed_tasks: set[asyncio.Task],
-        ctx: ProduceContext,
+        ctx: BaseProduceContext,
         available_base: int | None = None,
         progress_displayer: _ProgressDisplayer | None = None,
     ) -> None:
@@ -770,84 +946,14 @@ class AsyncProduceStrategy(ProduceStrategy):
             if is_completed and available_base is not None and progress_displayer is not None:
                 progress_displayer.update(available_base + completed_count)
 
-    async def _pause_agent_loop(self, ctx: ProduceContext) -> None:
-        pause_request_start = time.perf_counter()
-        if isinstance(ctx.agent_loop, ray.actor.ActorHandle):
-            pause_future = ctx.agent_loop.pause.remote()
-        else:
-            pause_future = ctx.agent_loop.pause()
-        try:
-            await asyncio.wait_for(pause_future, timeout=AGENT_LOOP_PAUSE_REQUEST_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"Agent loop pause timed out: task={ctx.task_name}, timeout_s={AGENT_LOOP_PAUSE_REQUEST_TIMEOUT_S}, "
-                f"elapsed={time.perf_counter() - pause_request_start:.2f}s, "
-                f"pending={self.pending_task_count()}"
-            )
-        except Exception:
-            logger.exception(
-                f"Agent loop pause failed: task={ctx.task_name}, "
-                f"elapsed={time.perf_counter() - pause_request_start:.2f}s, "
-                f"pending={self.pending_task_count()}"
-            )
-
     async def pause_produce(self, ctx: ProduceContext) -> float:
-        pause_start = time.perf_counter()
-        if not self._local_pending_tasks:
-            return 0.0
-
-        pending_pause_tasks = {create_task(self._pause_agent_loop(ctx))}
-        initial_pending_count = len(self._local_pending_tasks)
-
-        logger.info(
-            f"Pause signal loop started for task {ctx.task_name}. "
-            f"Waiting for {initial_pending_count} pending tasks to complete. "
-            f"periodic_abort_interval_s={self.PERIODIC_ABORT_INTERVAL_S}, "
-            f"producer_pause_pending_task_timeout_s={PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S}"
+        return await pause_pending_tasks(
+            pending_tasks=self._local_pending_tasks,
+            ctx=ctx,
+            put_claimed_task=lambda task: ctx.put_generated_group(task.result()),
         )
-        cleanup_start_time = time.perf_counter()
-        next_periodic_abort_time = cleanup_start_time + self.PERIODIC_ABORT_INTERVAL_S
-        while True:
-            elapsed_time = time.perf_counter() - cleanup_start_time
-            if elapsed_time > PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S:
-                # 超时强制取消所有pending的任务
-                tasks = set(self._local_pending_tasks)
-                self._local_pending_tasks.clear()
-                cancelled_count = len(tasks)
-                await cancel_and_drain(list(tasks))
-                logger.warning(
-                    f"Cleanup timeout of {PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S}s reached. "
-                    f"Forcefully cancelling {cancelled_count} remaining tasks. "
-                    f"task={ctx.task_name}"
-                )
-                break
-
-            if not self._local_pending_tasks:
-                break
-            current_time = time.perf_counter()
-            pending_pause_tasks = {task for task in pending_pause_tasks if not task.done()}
-
-            # 定时发送 pause 信号
-            if self.PERIODIC_ABORT_INTERVAL_S > 0 and current_time >= next_periodic_abort_time:
-                pending_pause_tasks.add(create_task(self._pause_agent_loop(ctx)))
-                next_periodic_abort_time += self.PERIODIC_ABORT_INTERVAL_S
-
-            done_tasks, _ = await asyncio.wait(
-                set(self._local_pending_tasks), timeout=1, return_when=asyncio.FIRST_COMPLETED
-            )
-            self._local_pending_tasks.difference_update(done_tasks)
-            claimed_done = done_tasks
-            for task in claimed_done:
-                paused_items = task.result()
-                await ctx.put_generated_group(paused_items)
-        await cancel_and_drain(list(pending_pause_tasks))
-        pause_time = time.perf_counter() - pause_start
-        logger.info(f"pause_produce completed for task {ctx.task_name} within {pause_time}s.")
-        return pause_time
 
     async def produce_batch(self, ctx: ProduceContext) -> ProduceBatchStatus:
-        if ctx.task_name not in ctx.progress.consumed_samples:
-            raise KeyError(f"ProduceProgress.consumed_samples missing task_name={ctx.task_name!r}")
         if ctx.task_name not in ctx.progress.target_samples:
             raise KeyError(f"ProduceProgress.target_samples missing task_name={ctx.task_name!r}")
 
@@ -855,11 +961,9 @@ class AsyncProduceStrategy(ProduceStrategy):
         # Manager 会在所有 active task produce_batch 正常返回后统一调用 pause_produce 收尾。
         self._local_pending_tasks = set()
 
-        if ctx.target_abs <= 0:
+        if ctx.target_count <= 0:
             return ProduceBatchStatus.NORMAL
 
-        if ctx.should_abort():
-            return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
         if self.is_model_expired(ctx.train_step, ctx.model_step):
             return ProduceBatchStatus.EXPIRED_BATCH
 
@@ -873,7 +977,7 @@ class AsyncProduceStrategy(ProduceStrategy):
 
         # 本轮 produce_batch 的必要累计目标固定；normal 模式只按当前 task batch 追加固定超发预算。
         # tail-batch 模式只补必要缺口，新增任务固定从 EXPIRED pool 取，不再扩大超发窗口。
-        target_abs = ctx.target_abs
+        target_abs = ctx.target_count
         oversample_budget = 0 if sample_from_expired else math.ceil(self.over_sample_threshold * ctx.task_batch_size)
         scheduled_target = target_abs + oversample_budget
         logger.info(
@@ -890,21 +994,19 @@ class AsyncProduceStrategy(ProduceStrategy):
                 )
             )
 
-        initial_available = await ctx.available_count()
+        initial_available = await ctx.completed_count()
         progress_displayer = _ProgressDisplayer.create(
             strategy_name=self.__class__.__name__,
             task_name=ctx.task_name,
-            total=ctx.target_abs,
+            total=ctx.target_count,
             initial=initial_available,
         )
         try:
             while True:
-                if ctx.should_abort():
-                    return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
                 if self.is_model_expired(ctx.train_step, ctx.model_step):
                     return ProduceBatchStatus.EXPIRED_BATCH
 
-                available = await ctx.available_count()
+                available = await ctx.completed_count()
                 progress_displayer.update(available)
                 if not self.should_continue_fn(available, target_abs):
                     return ProduceBatchStatus.NORMAL
@@ -912,13 +1014,9 @@ class AsyncProduceStrategy(ProduceStrategy):
                 pending_count = len(self._local_pending_tasks)
                 desired_pending = max(0, scheduled_target - available)
                 if available + pending_count < scheduled_target:
-                    while not ctx.should_abort() and len(self._local_pending_tasks) < desired_pending:
+                    while len(self._local_pending_tasks) < desired_pending:
                         self._local_pending_tasks.add(await spawn_one())
-                    if ctx.should_abort():
-                        return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
 
-                if ctx.should_abort():
-                    return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
                 if not self._local_pending_tasks:
                     logger.warning("All tasks are done but not enough samples collected.")
                     return ProduceBatchStatus.NORMAL
@@ -937,11 +1035,14 @@ class AsyncProduceStrategy(ProduceStrategy):
             progress_displayer.close()
 
 
-class DisaggAsyncProduceStrategy(AsyncProduceStrategy):
+class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
     """非共卡后台 producer 使用的 async strategy。
 
-    当前第一步拆分只先固定 public 类型边界；pending 跨调用语义沿用现有 AsyncProduceStrategy 实现。
+    非共卡 pending 跨后台 produce_batch 调用存在，因此这里直接实现 DisaggProduceStrategy， 不继承共卡 AsyncProduceStrategy，避免把本地 pending / 本地
+    progress 语义带进后台 producer。
     """
+
+    PERIODIC_ABORT_INTERVAL_S = PERIODIC_ABORT_INTERVAL_S
 
     def __init__(
         self,
@@ -953,72 +1054,56 @@ class DisaggAsyncProduceStrategy(AsyncProduceStrategy):
         is_valid_sample_fn: IsValidSampleFn,
         should_continue_fn: ShouldContinueFn,
     ):
-        super().__init__(
-            over_sample_threshold=over_sample_threshold,
-            enable_partial_rollout=enable_partial_rollout,
-            tail_batch_trigger_size=tail_batch_trigger_size,
-            max_staleness=max_staleness,
-            sync_weights_interval=sync_weights_interval,
-            is_valid_sample_fn=is_valid_sample_fn,
-            should_continue_fn=should_continue_fn,
-        )
+        super().__init__(is_valid_sample_fn, should_continue_fn)
+
+        if not enable_partial_rollout and max_staleness > 0:
+            logger.warning(
+                "max_staleness > 0, enable_partial_rollout is False, this will affect rollout efficiency because not support tail_batch_max_tries logic now"
+            )
+
+        self.over_sample_threshold = over_sample_threshold
+        self.enable_partial_rollout = enable_partial_rollout
+        self.max_staleness = max_staleness
+        self.sync_weights_interval = sync_weights_interval
+        self.stale_threshold = calculate_stale_threshold(max_staleness, sync_weights_interval)
+        self.tail_batch_trigger_size = tail_batch_trigger_size
         self._pending_tasks = _PendingTasks()
+
+    def is_model_expired(self, train_step: int, model_step: int) -> bool:
+        staleness = calculate_seq_staleness(model_step, train_step)
+        return staleness >= self.stale_threshold
 
     def pending_task_count(self) -> int:
         return self._pending_tasks.count()
 
-    async def pause_produce(self, ctx: ProduceContext) -> float:
-        pause_start = time.perf_counter()
-        if self._pending_tasks.count() == 0:
-            return 0.0
+    async def _put_claimed(
+        self,
+        claimed_tasks: set[asyncio.Task],
+        ctx: DisaggProduceContext,
+        available_base: int | None = None,
+        progress_displayer: _ProgressDisplayer | None = None,
+    ) -> None:
+        completed_count = 0
+        for task in claimed_tasks:
+            items = task.result()
+            is_completed = await ctx.put_generated_group(items)
+            if is_completed:
+                completed_count += 1
+            if is_completed and available_base is not None and progress_displayer is not None:
+                progress_displayer.update(available_base + completed_count)
 
-        pending_pause_tasks = {create_task(self._pause_agent_loop(ctx))}
-        initial_pending_count = self._pending_tasks.count()
-
-        logger.info(
-            f"Pause signal loop started for task {ctx.task_name}. "
-            f"Waiting for {initial_pending_count} pending tasks to complete. "
-            f"periodic_abort_interval_s={self.PERIODIC_ABORT_INTERVAL_S}, "
-            f"producer_pause_pending_task_timeout_s={PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S}"
+    async def pause_produce(self, ctx: DisaggProduceContext) -> float:
+        return await pause_pending_tasks(
+            pending_tasks=self._pending_tasks,
+            ctx=ctx,
+            put_claimed_task=lambda task: ctx.put_generated_group(task.result()),
         )
-        cleanup_start_time = time.perf_counter()
-        next_periodic_abort_time = cleanup_start_time + self.PERIODIC_ABORT_INTERVAL_S
-        while True:
-            elapsed_time = time.perf_counter() - cleanup_start_time
-            if elapsed_time > PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S:
-                # 超时强制取消所有pending的任务
-                cancelled_count = await self._pending_tasks.cancel_all()
-                logger.warning(
-                    f"Cleanup timeout of {PRODUCER_PAUSE_PENDING_TASK_TIMEOUT_S}s reached. "
-                    f"Forcefully cancelling {cancelled_count} remaining tasks. "
-                    f"task={ctx.task_name}"
-                )
-                break
 
-            if self._pending_tasks.count() == 0:
-                break
-            current_time = time.perf_counter()
-            pending_pause_tasks = {task for task in pending_pause_tasks if not task.done()}
-
-            # 定时发送 pause 信号
-            if self.PERIODIC_ABORT_INTERVAL_S > 0 and current_time >= next_periodic_abort_time:
-                pending_pause_tasks.add(create_task(self._pause_agent_loop(ctx)))
-                next_periodic_abort_time += self.PERIODIC_ABORT_INTERVAL_S
-
-            claimed_done = await self._pending_tasks.wait_and_claim(timeout_s=1)
-            for task in claimed_done:
-                paused_items = task.result()
-                await ctx.put_generated_group(paused_items)
-        await cancel_and_drain(list(pending_pause_tasks))
-        pause_time = time.perf_counter() - pause_start
-        logger.info(f"pause_produce completed for task {ctx.task_name} within {pause_time}s.")
-        return pause_time
-
-    async def produce_batch(self, ctx: ProduceContext) -> ProduceBatchStatus:
+    async def produce_batch(self, ctx: DisaggProduceContext) -> ProduceBatchStatus:
         if ctx.task_name not in ctx.progress.consumed_samples:
-            raise KeyError(f"ProduceProgress.consumed_samples missing task_name={ctx.task_name!r}")
+            raise KeyError(f"DisaggProduceProgress.consumed_samples missing task_name={ctx.task_name!r}")
         if ctx.task_name not in ctx.progress.target_samples:
-            raise KeyError(f"ProduceProgress.target_samples missing task_name={ctx.task_name!r}")
+            raise KeyError(f"DisaggProduceProgress.target_samples missing task_name={ctx.task_name!r}")
 
         if ctx.target_abs <= 0:
             return ProduceBatchStatus.NORMAL

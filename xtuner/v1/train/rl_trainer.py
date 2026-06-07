@@ -25,7 +25,9 @@ from xtuner.v1.data_proto.sequence_context import SequenceContext
 from xtuner.v1.patch import patch_default_save_plan
 from xtuner.v1.rl.advantage import BaseAdvantageConfig, GRPOAdvantageConfig
 from xtuner.v1.rl.agent_loop_manager import (
+    AgentLoopManager,
     AgentLoopManagerConfig,
+    DisaggAgentLoopManager,
     ProduceBatchResult,
     ProduceBatchStatus,
 )
@@ -516,6 +518,8 @@ class BaseRLTrainer:
 
     train_controller: TrainingController
     rollout_controller: RolloutControllerProxy
+    agent_loop_manager: AgentLoopManager | DisaggAgentLoopManager
+    eval_agent_loop_manager: AgentLoopManager
     _debug_train_files: dict[int, Path]
 
     def _init_common(self, cfg: BaseRLTrainerConfig, *, meta_path: str, logger_tag: str) -> None:
@@ -676,24 +680,31 @@ class BaseRLTrainer:
 
     def _build_agent_loop_components(self, cfg: BaseRLTrainerConfig, replay_buffer) -> None:
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_path, trust_remote_code=True)
-        self.agent_loop_manager = cfg.agent_loop_manager_cfg.build(
+        agent_loop_manager = cfg.agent_loop_manager_cfg.build(
             rollout_controller=self.rollout_controller,
             tokenizer=self.tokenizer,
             replay_buffer=replay_buffer,
             logger=self.logger,
             sync_weights_interval=cfg.sync_weights_interval,
         )
+        if cfg.agent_loop_manager_cfg.mode == "disaggregated":
+            self.agent_loop_manager = cast(DisaggAgentLoopManager, agent_loop_manager)
+        else:
+            self.agent_loop_manager = cast(AgentLoopManager, agent_loop_manager)
 
         if self._enable_evaluate:
             assert cfg.eval_agent_loop_manager_cfg is not None
             # 评测是一次同步 rollout，不继承训练侧非共卡后台 producer mode。
             eval_agent_loop_manager_cfg = cfg.eval_agent_loop_manager_cfg.model_copy(update={"mode": "colocate"})
-            self.eval_agent_loop_manager = eval_agent_loop_manager_cfg.build(
-                rollout_controller=self.rollout_controller,
-                tokenizer=self.tokenizer,
-                replay_buffer=replay_buffer,
-                logger=self.logger,
-                sync_weights_interval=cfg.sync_weights_interval,
+            self.eval_agent_loop_manager = cast(
+                AgentLoopManager,
+                eval_agent_loop_manager_cfg.build(
+                    rollout_controller=self.rollout_controller,
+                    tokenizer=self.tokenizer,
+                    replay_buffer=replay_buffer,
+                    logger=self.logger,
+                    sync_weights_interval=cfg.sync_weights_interval,
+                ),
             )
 
             total_eval_samples = len(self.eval_agent_loop_manager.data_sampler)
@@ -1321,6 +1332,7 @@ class BaseRLTrainer:
 
 class RLColocateTrainer(BaseRLTrainer):
     _META_PATH = ".xtuner_rl_colocate_trainer"
+    agent_loop_manager: AgentLoopManager
 
     # 共卡 trainer 保留自己的资源编排、resume、主循环和权重同步；通用保存、日志仍在 BaseRLTrainer。
     def __init__(self, cfg: RLColocateTrainerConfig):
@@ -1520,6 +1532,7 @@ class RLColocateTrainer(BaseRLTrainer):
 
 class RLDisaggregatedTrainer(BaseRLTrainer):
     _META_PATH = ".xtuner_rl_disaggregated_trainer"
+    agent_loop_manager: DisaggAgentLoopManager
 
     def __init__(self, cfg: RLDisaggregatedTrainerConfig):
         self._init_common(cfg, meta_path=self._META_PATH, logger_tag="RLDisaggTrainer")

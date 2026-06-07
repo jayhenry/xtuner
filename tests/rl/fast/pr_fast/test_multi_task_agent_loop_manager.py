@@ -13,16 +13,23 @@
 import asyncio
 import unittest
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from xtuner.v1.data_proto.rl_data import Status
 from xtuner.v1.rl.agent_loop_manager.agent_loop_manager import (
     AgentLoopManager,
     AgentLoopManagerConfig,
+    DisaggAgentLoopManager,
     TaskSpecConfig,
     _TaskRunner,
 )
-from xtuner.v1.rl.agent_loop_manager.producer import GROUP_GENERATE_TIME_KEY, ProduceBatchStatus
+from xtuner.v1.rl.agent_loop_manager.producer import (
+    GROUP_GENERATE_TIME_KEY,
+    AsyncProduceStrategyConfig,
+    DisaggAsyncProduceStrategyConfig,
+    ProduceBatchStatus,
+    SyncProduceStrategyConfig,
+)
 
 
 class _FakeSampler:
@@ -46,8 +53,6 @@ class _FakeProduceStrategy:
         self.called_batch_sizes: list[int] = []
         self.called_train_steps: list[int] = []
         self.called_model_steps: list[int] = []
-        self.called_update_events: list[object | None] = []
-        self.called_update_event_states: list[bool | None] = []
         self.called_progresses: list[object] = []
         self.cleanup_model_steps: list[int] = []
         self.cleanup_progresses: list[object | None] = []
@@ -57,10 +62,14 @@ class _FakeProduceStrategy:
         self.called_batch_sizes.append(ctx.task_batch_size)
         self.called_train_steps.append(ctx.train_step)
         self.called_model_steps.append(ctx.model_step)
-        self.called_update_events.append(ctx.update_event)
-        self.called_update_event_states.append(None if ctx.update_event is None else ctx.update_event.is_set())
+        self.assert_colocate_context(ctx)
         self.called_progresses.append(ctx.progress)
         return self.status
+
+    def assert_colocate_context(self, ctx) -> None:
+        for disagg_only_name in ("update_event", "available_count", "target_abs"):
+            if hasattr(ctx, disagg_only_name):
+                raise AssertionError(f"colocate ProduceContext should not expose {disagg_only_name}")
 
     async def pause_produce(self, ctx) -> float:
         self.cleanup_call_count += 1
@@ -79,8 +88,6 @@ class _FakeStatusProduceStrategy:
         self.cleanup_call_count = 0
         self.called_train_steps: list[int] = []
         self.called_model_steps: list[int] = []
-        self.called_update_events: list[object | None] = []
-        self.called_update_event_states: list[bool | None] = []
         self.called_progresses: list[object] = []
         self.cleanup_model_steps: list[int] = []
         self.cleanup_progresses: list[object | None] = []
@@ -88,8 +95,9 @@ class _FakeStatusProduceStrategy:
     async def produce_batch(self, ctx) -> ProduceBatchStatus:
         self.called_train_steps.append(ctx.train_step)
         self.called_model_steps.append(ctx.model_step)
-        self.called_update_events.append(ctx.update_event)
-        self.called_update_event_states.append(None if ctx.update_event is None else ctx.update_event.is_set())
+        for disagg_only_name in ("update_event", "available_count", "target_abs"):
+            if hasattr(ctx, disagg_only_name):
+                raise AssertionError(f"colocate ProduceContext should not expose {disagg_only_name}")
         self.called_progresses.append(ctx.progress)
         return self.status
 
@@ -184,6 +192,72 @@ def _fake_agent_loop():
 
 
 class TestMultiTaskAgentLoopManager(unittest.IsolatedAsyncioTestCase):
+    def _build_task_config_with_strategy(self, strategy_config):
+        agent_loop_config = MagicMock()
+        agent_loop_config.build.return_value = _fake_agent_loop()
+        sampler_config = MagicMock()
+        sampler_config.build.return_value = _FakeSampler()
+        return TaskSpecConfig.model_construct(
+            task_name="task_a",
+            agent_loop_config=agent_loop_config,
+            produce_strategy_config=strategy_config,
+            sampler_config=sampler_config,
+            weight=1.0,
+        )
+
+    def test_manager_types_expose_separate_public_surfaces(self):
+        # 共卡 manager 只暴露同步 produce_batch；非共卡后台 producer/consumer 控制面只属于 DisaggAgentLoopManager。
+        task_runner = _TaskRunner(
+            task_name="task_a",
+            agent_loop=_fake_agent_loop(),
+            produce_strategy=_FakeProduceStrategy(),
+            sampler=_FakeSampler(),
+            weight=1.0,
+            order=0,
+        )
+
+        colocate_manager = AgentLoopManager(task_runners=[task_runner], replay_buffer=_FakeReplayBuffer({}, {}))
+        disagg_manager = DisaggAgentLoopManager(task_runners=[task_runner], replay_buffer=_FakeReplayBuffer({}, {}))
+
+        self.assertTrue(callable(getattr(colocate_manager, "produce_batch")))
+        for api_name in ("produce_loop", "get_batch", "pause_produce", "continue_produce", "shutdown"):
+            self.assertFalse(hasattr(colocate_manager, api_name), api_name)
+            self.assertTrue(callable(getattr(disagg_manager, api_name)), api_name)
+        self.assertFalse(hasattr(disagg_manager, "produce_batch"))
+
+    def test_manager_config_mode_builds_matching_manager_and_rejects_wrong_strategy_configs(self):
+        # mode 只选择 manager 类型；strategy config 类型本身表达共卡/非共卡执行环境。
+        rollout_controller = MagicMock()
+        rollout_controller.set_enable_partial_rollout.remote = MagicMock(return_value=None)
+        tokenizer = MagicMock()
+        replay_buffer = _FakeReplayBuffer({}, {})
+
+        colocate_manager = AgentLoopManagerConfig(
+            tasks=self._build_task_config_with_strategy(SyncProduceStrategyConfig()),
+            mode="colocate",
+        ).build(rollout_controller=rollout_controller, tokenizer=tokenizer, replay_buffer=replay_buffer)
+        self.assertIsInstance(colocate_manager, AgentLoopManager)
+
+        with patch("xtuner.v1.rl.agent_loop_manager.producer.ray.get", side_effect=lambda ref, *_, **__: ref):
+            disagg_manager = AgentLoopManagerConfig(
+                tasks=self._build_task_config_with_strategy(DisaggAsyncProduceStrategyConfig()),
+                mode="disaggregated",
+            ).build(rollout_controller=rollout_controller, tokenizer=tokenizer, replay_buffer=replay_buffer)
+        self.assertIsInstance(disagg_manager, DisaggAgentLoopManager)
+        self.assertNotIsInstance(disagg_manager, AgentLoopManager)
+
+        with self.assertRaisesRegex(ValueError, "expects DisaggProduceStrategyConfig"):
+            AgentLoopManagerConfig(
+                tasks=self._build_task_config_with_strategy(AsyncProduceStrategyConfig()),
+                mode="disaggregated",
+            ).build(rollout_controller=rollout_controller, tokenizer=tokenizer, replay_buffer=replay_buffer)
+
+        with self.assertRaisesRegex(ValueError, "expects ProduceStrategyConfig"):
+            AgentLoopManagerConfig(
+                tasks=self._build_task_config_with_strategy(DisaggAsyncProduceStrategyConfig()),
+                mode="colocate",
+            ).build(rollout_controller=rollout_controller, tokenizer=tokenizer, replay_buffer=replay_buffer)
+
     def test_manager_config_accepts_single_task_spec(self):
         # 单 task 配置可以直接传入，兼容最小 AgentLoopManager 配置。
         task = TaskSpecConfig.model_construct(
@@ -305,6 +379,45 @@ class TestMultiTaskAgentLoopManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(strategy_a.called_batch_sizes, [])
         self.assertEqual(strategy_b.called_batch_sizes, [2])
         self.assertEqual(result.rollout_states, [["b-0"], ["b-1"]])
+
+    async def test_disagg_get_batch_aggregates_multi_task_results_without_colocate_surface(self):
+        # 非共卡 get_batch 使用后台 progress 消费 replay buffer，不依赖共卡 produce_batch 继承面。
+        replay_buffer = _FakeReplayBuffer(
+            rollout_states_by_task={
+                "task_a": [["a-0"], ["a-1"]],
+                "task_b": [["b-0"]],
+            },
+            leftover_counts={
+                ("task_a", Status.COMPLETED): 2,
+                ("task_b", Status.COMPLETED): 1,
+            },
+        )
+        manager = DisaggAgentLoopManager(
+            task_runners=[
+                _TaskRunner(
+                    task_name="task_a",
+                    agent_loop=_fake_agent_loop(),
+                    produce_strategy=_FakeProduceStrategy(),
+                    sampler=_FakeSampler(),
+                    weight=2.0,
+                    order=0,
+                ),
+                _TaskRunner(
+                    task_name="task_b",
+                    agent_loop=_fake_agent_loop(),
+                    produce_strategy=_FakeProduceStrategy(),
+                    sampler=_FakeSampler(),
+                    weight=1.0,
+                    order=1,
+                ),
+            ],
+            replay_buffer=replay_buffer,
+        )
+
+        result = await manager.get_batch(batch_size=3, train_step=2)
+
+        self.assertEqual(result.rollout_states, [["a-0"], ["a-1"], ["b-0"]])
+        self.assertEqual(result.task_batch_sizes, {"task_a": 2, "task_b": 1})
 
     async def test_status_returning_strategy_uses_cleanup_and_reconstructs_group_timing_stats(self):
         # 共卡 produce_batch 会把 producer 收尾耗时和 rollout group 生成耗时汇总到结果中。

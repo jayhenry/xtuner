@@ -263,7 +263,7 @@ class TestAgentLoopManagerCheckpoint(unittest.IsolatedAsyncioTestCase):
 
         try:
             sample1_index = await self._consume_async_index(manager, train_step=1)
-            await manager.pause_produce(use_global_progress=True)
+            await manager.pause_produce()
 
             with tempfile.TemporaryDirectory() as tmp_dir:
                 checkpoint_path = Path(tmp_dir) / "ckpt"

@@ -24,6 +24,9 @@ from unittest.mock import AsyncMock, MagicMock
 from xtuner.v1.data_proto.rl_data import RolloutState, Status
 from xtuner.v1.rl.agent_loop_manager import (
     AsyncProduceStrategyConfig,
+    DisaggAsyncProduceStrategyConfig,
+    DisaggProduceContext,
+    DisaggProduceProgress,
     ProduceBatchStatus,
     ProduceContext,
     ProduceProgress,
@@ -86,14 +89,14 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         producer_future_step: int | None = None,
         target_upto_future_step: int | None = None,
     ) -> ProduceProgress:
-        progress = ProduceProgress.build([task_name])
-        progress.next_consumer_step = train_step
-        progress.producer_future_step = producer_future_step if producer_future_step is not None else train_step
-        progress.consumed_samples[task_name] = consumed
-        progress.target_samples[task_name] = target
-        progress.target_upto_future_step = (
-            target_upto_future_step if target_upto_future_step is not None else train_step
+        if consumed != 0 or target_upto_future_step is not None:
+            raise ValueError("Use _build_disagg_progress for absolute consumed/target progress.")
+        progress = ProduceProgress.build(
+            task_names=[task_name],
+            target_samples={task_name: target},
+            train_step=train_step,
         )
+        progress.producer_future_step = producer_future_step if producer_future_step is not None else train_step
         return progress
 
     def _build_agent_loop(self, sleep_by_id: dict[int, float] | None = None):
@@ -130,14 +133,60 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         train_step: int = 0,
         model_step: int = 0,
         progress: ProduceProgress | None = None,
-        update_event: asyncio.Event | None = None,
     ) -> ProduceContext:
         # 测试只走新的 ProduceContext 入口，不再覆盖旧散装参数兼容逻辑。
         if progress is None:
             progress = self._build_progress(task_name, target=batch_size, train_step=train_step)
+        return ProduceContext(
+            agent_loop=agent_loop,
+            sampler=sampler,
+            replay_buffer=self.replay_buffer,
+            task_batch_size=batch_size,
+            task_name=task_name,
+            train_step=train_step,
+            model_step=model_step,
+            progress=progress,
+            is_valid_sample_fn=strategy.is_valid_sample_fn,
+            stale_threshold=getattr(strategy, "stale_threshold", None),
+        )
+
+    def _build_disagg_progress(
+        self,
+        task_name: str,
+        target: int,
+        train_step: int = 0,
+        consumed: int = 0,
+        producer_future_step: int | None = None,
+        target_upto_future_step: int | None = None,
+    ) -> DisaggProduceProgress:
+        progress = DisaggProduceProgress.build([task_name])
+        progress.next_consumer_step = train_step
+        progress.producer_future_step = producer_future_step if producer_future_step is not None else train_step
+        progress.consumed_samples[task_name] = consumed
+        progress.target_samples[task_name] = target
+        progress.target_upto_future_step = (
+            target_upto_future_step if target_upto_future_step is not None else train_step
+        )
+        return progress
+
+    def _build_disagg_context(
+        self,
+        strategy,
+        task_name: str,
+        agent_loop,
+        sampler,
+        *,
+        batch_size: int,
+        train_step: int = 0,
+        model_step: int = 0,
+        progress: DisaggProduceProgress | None = None,
+        update_event: asyncio.Event | None = None,
+    ) -> DisaggProduceContext:
+        if progress is None:
+            progress = self._build_disagg_progress(task_name, target=batch_size, train_step=train_step)
         if update_event is None:
             update_event = asyncio.Event()
-        return ProduceContext(
+        return DisaggProduceContext(
             agent_loop=agent_loop,
             sampler=sampler,
             replay_buffer=self.replay_buffer,
@@ -150,6 +199,50 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             is_valid_sample_fn=strategy.is_valid_sample_fn,
             stale_threshold=getattr(strategy, "stale_threshold", None),
         )
+
+    async def test_contexts_keep_colocate_and_disagg_control_surface_separate(self):
+        # 共卡 context 只表达一次本地生产窗口；update_event / abort / 绝对累计进度只属于非共卡 context。
+        task_name = "test_context_surface"
+        sampler = self._build_sampler()
+        agent_loop = self._build_agent_loop()
+
+        colocate_strategy = AsyncProduceStrategyConfig(over_sample_threshold=0.0).build()
+        colocate_ctx = self._build_context(
+            colocate_strategy,
+            task_name,
+            agent_loop,
+            sampler,
+            batch_size=1,
+            train_step=3,
+            model_step=2,
+            progress=ProduceProgress.build(
+                task_names=[task_name],
+                target_samples={task_name: 1},
+                train_step=3,
+            ),
+        )
+        self.assertEqual(colocate_ctx.target_count, 1)
+        for disagg_only_name in ("update_event", "should_abort", "available_count", "target_abs"):
+            self.assertFalse(hasattr(colocate_ctx, disagg_only_name), disagg_only_name)
+
+        disagg_strategy = DisaggAsyncProduceStrategyConfig(over_sample_threshold=0.0).build()
+        update_event = asyncio.Event()
+        disagg_ctx = self._build_disagg_context(
+            disagg_strategy,
+            task_name,
+            agent_loop,
+            sampler,
+            batch_size=1,
+            train_step=3,
+            model_step=2,
+            progress=self._build_disagg_progress(task_name, target=2, train_step=3, consumed=1),
+            update_event=update_event,
+        )
+        self.assertEqual(disagg_ctx.target_abs, 2)
+        self.assertEqual(await disagg_ctx.available_count(), 1)
+        self.assertFalse(disagg_ctx.should_abort())
+        update_event.set()
+        self.assertTrue(disagg_ctx.should_abort())
 
     async def test_sampler_with_replay_buffer(self):
         # 验证 sampler 优先复用 replay buffer 中可重试的 rollout group，耗尽后回退 dataloader。
@@ -390,8 +483,8 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         mock_agent_loop.generate_group = mock_gen
         sampler = self._build_sampler()
         # 该用例验证版本记录顺序，放宽 stale 策略避免在生产入口提前返回。
-        strategy = AsyncProduceStrategyConfig(over_sample_threshold=0.0, max_staleness=3).build()
-        progress = self._build_progress(
+        strategy = DisaggAsyncProduceStrategyConfig(over_sample_threshold=0.0, max_staleness=3).build()
+        progress = self._build_disagg_progress(
             task_name,
             target=2,
             train_step=1,
@@ -400,7 +493,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             target_upto_future_step=2,
         )
 
-        ctx = self._build_context(
+        ctx = self._build_disagg_context(
             strategy,
             task_name,
             mock_agent_loop,
@@ -419,6 +512,8 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
     async def test_async_produce_strategy_uses_fixed_batch_oversample_budget(self):
         # 验证超发预算按当前 task batch size 固定计算，而不是按剩余缺口缩小。
         task_name = "test_fixed_oversample"
+        for sample_id in range(9):
+            await self.replay_buffer.put([make_rollout_state(sample_id, status=Status.COMPLETED)], task_name)
         sampler = MagicMock()
         sample_ids = iter(range(100, 200))
 
@@ -429,7 +524,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         sampler.sample = AsyncMock(side_effect=sample)
         mock_agent_loop = self._build_agent_loop()
         strategy = AsyncProduceStrategyConfig(over_sample_threshold=1.0).build()
-        progress = self._build_progress(task_name, target=10, consumed=9)
+        progress = self._build_progress(task_name, target=10)
 
         ctx = self._build_context(
             strategy,
@@ -446,7 +541,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         # 当前只缺 1 个样本，但 over-sample 预算固定为 over * batch_size = 4，
         # 因此本轮最多调度到 target + 4，对应初始发射 5 个任务。
         self.assertEqual(sampler.sample.await_count, 5)
-        self.assertEqual(await self.replay_buffer.count(task_name, Status.COMPLETED), 5)
+        self.assertEqual(await self.replay_buffer.count(task_name, Status.COMPLETED), 14)
 
     async def test_async_produce_strategy_tail_batch_is_static_and_no_oversample(self):
         # 验证 tail-batch 模式固定从 expired/aborted pool 补必要缺口，并禁用额外超发。
@@ -494,32 +589,9 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         sampler = MagicMock()
         sampler.sample = AsyncMock(side_effect=AssertionError("sampler.sample should not be called"))
 
-        missing_consumed = ProduceProgress(
-            next_consumer_step=1,
-            producer_future_step=1,
-            consumed_samples={},
-            target_samples={task_name: 1},
-            target_upto_future_step=1,
-        )
-        with self.assertRaisesRegex(KeyError, "consumed_samples"):
-            ctx = self._build_context(
-                strategy,
-                task_name,
-                mock_agent_loop,
-                sampler,
-                batch_size=1,
-                train_step=1,
-                model_step=0,
-                progress=missing_consumed,
-            )
-            await strategy.produce_batch(ctx)
-
         missing_target = ProduceProgress(
-            next_consumer_step=1,
             producer_future_step=1,
-            consumed_samples={task_name: 0},
             target_samples={},
-            target_upto_future_step=1,
         )
         with self.assertRaisesRegex(KeyError, "target_samples"):
             ctx = self._build_context(
@@ -533,6 +605,28 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
                 progress=missing_target,
             )
             await strategy.produce_batch(ctx)
+
+        disagg_strategy = DisaggAsyncProduceStrategyConfig(over_sample_threshold=0.0).build()
+        missing_consumed = DisaggProduceProgress(
+            task_names=[task_name],
+            producer_future_step=1,
+            next_consumer_step=1,
+            consumed_samples={},
+            target_samples={task_name: 1},
+            target_upto_future_step=1,
+        )
+        with self.assertRaisesRegex(KeyError, "consumed_samples"):
+            ctx = self._build_disagg_context(
+                disagg_strategy,
+                task_name,
+                mock_agent_loop,
+                sampler,
+                batch_size=1,
+                train_step=1,
+                model_step=0,
+                progress=missing_consumed,
+            )
+            await disagg_strategy.produce_batch(ctx)
 
     async def test_async_produce_strategy_records_sample_version_before_staleness_refresh(self):
         # 验证新生成 token 会先记录 Rollout Model Step，再按 consumer step 刷新 staleness。
@@ -718,14 +812,14 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
     async def test_async_produce_strategy_returns_update_abort_without_sampling(self):
         # 验证 update_event 已设置时策略立即返回 UPDATE_WEIGHT_AND_ABORT，不再采样新 rollout。
         task_name = "test_update_abort"
-        strategy = AsyncProduceStrategyConfig(over_sample_threshold=1.0).build()
+        strategy = DisaggAsyncProduceStrategyConfig(over_sample_threshold=1.0).build()
         mock_agent_loop = self._build_agent_loop()
         sampler = MagicMock()
         sampler.sample = AsyncMock(side_effect=AssertionError("sampler.sample should not be called"))
         update_event = asyncio.Event()
         update_event.set()
 
-        ctx = self._build_context(
+        ctx = self._build_disagg_context(
             strategy,
             task_name,
             mock_agent_loop,
@@ -734,7 +828,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             train_step=1,
             model_step=1,
             update_event=update_event,
-            progress=self._build_progress(task_name, target=1, train_step=1),
+            progress=self._build_disagg_progress(task_name, target=1, train_step=1),
         )
         status = await strategy.produce_batch(ctx)
 
@@ -744,11 +838,11 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
     async def test_async_produce_strategy_returns_update_abort_after_schedule_pause(self):
         # 验证调度临界区中途触发 pause 后，策略停止继续调度并返回 UPDATE_WEIGHT_AND_ABORT。
         task_name = "test_update_abort_after_schedule"
-        strategy = AsyncProduceStrategyConfig(over_sample_threshold=0.0).build()
+        strategy = DisaggAsyncProduceStrategyConfig(over_sample_threshold=0.0).build()
         mock_agent_loop = self._build_agent_loop({0: 0.05})
         sampler = MagicMock()
         update_event = asyncio.Event()
-        progress = self._build_progress(task_name, target=1)
+        progress = self._build_disagg_progress(task_name, target=1)
 
         async def sample(task_name, group_status=None):
             # 模拟 manager 在调度临界区中途触发 pause；当前样本会进入 pending，后续应停止继续调度。
@@ -757,7 +851,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
 
         sampler.sample = AsyncMock(side_effect=sample)
 
-        ctx = self._build_context(
+        ctx = self._build_disagg_context(
             strategy,
             task_name,
             mock_agent_loop,
