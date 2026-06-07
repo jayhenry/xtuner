@@ -84,11 +84,10 @@ class ProduceProgress:
 
     中文不变量：
     - 只表达本次调用，不进入 checkpoint。
-    - 裁剪非共卡需要的 next_consumer_step / consumed_samples / target_upto_future_step / state_dict。
+    - 裁剪非共卡需要的 producer_future_step / next_consumer_step / consumed_samples / target_upto_future_step / state_dict。
     - 不新增 model_step，model_step 仍由 manager 放进 ProduceContext。
     """
 
-    producer_future_step: int = 1
     target_samples: dict[str, int] = field(default_factory=dict)
     raw_rewards_sum: dict[str, float] = field(default_factory=dict)
     raw_rewards_count: dict[str, int] = field(default_factory=dict)
@@ -102,10 +101,8 @@ class ProduceProgress:
         *,
         task_names: list[str],
         target_samples: dict[str, int],
-        train_step: int = 1,
     ) -> "ProduceProgress":
         return cls(
-            producer_future_step=train_step,
             target_samples=dict(target_samples),
             raw_rewards_sum={task_name: 0.0 for task_name in task_names},
             raw_rewards_count={task_name: 0 for task_name in task_names},

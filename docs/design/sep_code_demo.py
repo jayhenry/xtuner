@@ -183,11 +183,10 @@ class ProduceProgress:
     中文不变量：
     - 只表达本次调用，不进入 checkpoint。
     - pending task 由具体 strategy 在本次调用内持有。
-    - 字段名沿用当前 ProduceProgress；只裁剪非共卡需要的 next_consumer_step / consumed_samples / target_upto_future_step / state_dict。
+    - 裁剪非共卡需要的 producer_future_step / next_consumer_step / consumed_samples / target_upto_future_step / state_dict。
     - 不新增 model_step，model_step 仍由 manager 放进 ProduceContext。
     """
 
-    producer_future_step: int
     target_samples: dict[str, int]
     raw_rewards_sum: dict[str, float] = field(default_factory=dict)
     raw_rewards_count: dict[str, int] = field(default_factory=dict)
@@ -201,10 +200,8 @@ class ProduceProgress:
         *,
         task_names: list[str],
         target_samples: dict[str, int],
-        train_step: int,
     ) -> "ProduceProgress":
         return cls(
-            producer_future_step=train_step,
             target_samples=dict(target_samples),
             raw_rewards_sum={name: 0.0 for name in task_names},
             raw_rewards_count={name: 0 for name in task_names},
@@ -1130,7 +1127,6 @@ class AgentLoopManager:
         progress = ProduceProgress.build(
             task_names=self.task_names,
             target_samples=task_sizes,
-            train_step=train_step,
         )
         active_contexts = [
             (
@@ -1141,7 +1137,7 @@ class AgentLoopManager:
                     sampler=task.sampler,
                     replay_buffer=self.replay_buffer,
                     task_batch_size=task_sizes[task.task_name],
-                    train_step=progress.producer_future_step,
+                    train_step=train_step,
                     model_step=model_step,
                     progress=progress,
                     is_valid_sample_fn=getattr(task.produce_strategy, "is_valid_sample_fn", default_is_valid_sample_fn),

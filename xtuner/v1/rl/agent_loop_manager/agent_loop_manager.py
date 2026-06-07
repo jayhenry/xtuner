@@ -689,7 +689,6 @@ class AgentLoopManager:
         local_progress = ProduceProgress.build(
             task_names=self.task_names,
             target_samples=current_sizes,
-            train_step=train_step,
         )
         # 共卡 produce_batch 也是消费入口；生产前先刷新 buffer 中已有 completed / aborted。
         await refresh_for_all_tasks(

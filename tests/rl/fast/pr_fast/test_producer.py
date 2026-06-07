@@ -85,20 +85,15 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         self,
         task_name: str,
         target: int,
-        train_step: int = 0,
         consumed: int = 0,
-        producer_future_step: int | None = None,
         target_upto_future_step: int | None = None,
     ) -> ProduceProgress:
         if consumed != 0 or target_upto_future_step is not None:
             raise ValueError("Use _build_disagg_progress for absolute consumed/target progress.")
-        progress = ProduceProgress.build(
+        return ProduceProgress.build(
             task_names=[task_name],
             target_samples={task_name: target},
-            train_step=train_step,
         )
-        progress.producer_future_step = producer_future_step if producer_future_step is not None else train_step
-        return progress
 
     def _build_agent_loop(self, sleep_by_id: dict[int, float] | None = None):
         mock_agent_loop = MagicMock()
@@ -137,7 +132,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
     ) -> ProduceContext:
         # 测试只走新的 ProduceContext 入口，不再覆盖旧散装参数兼容逻辑。
         if progress is None:
-            progress = self._build_progress(task_name, target=batch_size, train_step=train_step)
+            progress = self._build_progress(task_name, target=batch_size)
         return ProduceContext(
             agent_loop=agent_loop,
             sampler=sampler,
@@ -219,7 +214,6 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             progress=ProduceProgress.build(
                 task_names=[task_name],
                 target_samples={task_name: 1},
-                train_step=3,
             ),
         )
         self.assertEqual(colocate_ctx.batch_target, 1)
@@ -344,7 +338,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             batch_size=2,
             train_step=4,
             model_step=3,
-            progress=self._build_progress(task_name, target=2, train_step=4),
+            progress=self._build_progress(task_name, target=2),
         )
         await strategy.produce_batch(ctx)
 
@@ -386,7 +380,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             batch_size=2,
             train_step=4,
             model_step=3,
-            progress=self._build_progress(task_name, target=2, train_step=4),
+            progress=self._build_progress(task_name, target=2),
         )
 
         await strategy.produce_batch(ctx)
@@ -448,7 +442,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         mock_agent_loop = self._build_agent_loop()
         sampler = self._build_sampler()
         strategy = AsyncProduceStrategyConfig(over_sample_threshold=0.0).build()
-        progress = self._build_progress(task_name, target=1, train_step=1)
+        progress = self._build_progress(task_name, target=1)
         ctx = self._build_context(
             strategy,
             task_name,
@@ -580,10 +574,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         sampler = MagicMock()
         sampler.sample = AsyncMock(side_effect=AssertionError("sampler.sample should not be called"))
 
-        missing_target = ProduceProgress(
-            producer_future_step=1,
-            target_samples={},
-        )
+        missing_target = ProduceProgress(target_samples={})
         with self.assertRaisesRegex(KeyError, "target_samples"):
             ctx = self._build_context(
                 strategy,
@@ -644,7 +635,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             batch_size=1,
             train_step=5,
             model_step=3,
-            progress=self._build_progress(task_name, target=1, train_step=5),
+            progress=self._build_progress(task_name, target=1),
         )
         await strategy.produce_batch(ctx)
         completed = await self.replay_buffer.get(1, task_name, Status.COMPLETED)
@@ -684,7 +675,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             batch_size=1,
             train_step=5,
             model_step=3,
-            progress=self._build_progress(task_name, target=1, train_step=5),
+            progress=self._build_progress(task_name, target=1),
         )
         await strategy.produce_batch(ctx)
 

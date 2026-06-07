@@ -75,12 +75,11 @@ class TestProduceProgress(unittest.TestCase):
         local_progress = ProduceProgress.build(
             task_names=["task_a", "task_b"],
             target_samples={"task_a": 1, "task_b": 3},
-            train_step=7,
         )
 
-        self.assertEqual(local_progress.producer_future_step, 7)
         self.assertEqual(local_progress.target_samples, {"task_a": 1, "task_b": 3})
         self.assertEqual(disagg_progress.target_samples, {"task_a": 3, "task_b": 5})
+        self.assertFalse(hasattr(local_progress, "producer_future_step"))
         self.assertFalse(hasattr(local_progress, "next_consumer_step"))
         self.assertFalse(hasattr(local_progress, "consumed_samples"))
         self.assertFalse(hasattr(local_progress, "target_upto_future_step"))
