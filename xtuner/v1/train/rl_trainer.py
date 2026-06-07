@@ -1593,6 +1593,35 @@ class RLDisaggregatedTrainer(BaseRLTrainer):
         # 对外保留同步 fit 接口，内部用 async loop 组织 producer/consumer。
         return asyncio_run(self._fit())
 
+    async def _get_batch_or_raise_producer_failure(
+        self,
+        producer_task: asyncio.Task,
+        *,
+        batch_size: int,
+        train_step: int,
+    ) -> ProduceBatchResult:
+        # 前台 consumer 等 batch 时必须同时观察后台 producer。
+        # producer 异常是终止性训练失败，不能等到 shutdown 才暴露，更不能先训练一个已经失去生产保障的 batch。
+        get_batch_task = create_task(
+            self.agent_loop_manager.get_batch(batch_size, train_step=train_step),
+            done_callbacks=[],
+        )
+        done, _ = await asyncio.wait(
+            {get_batch_task, producer_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if producer_task in done:
+            if not get_batch_task.done():
+                get_batch_task.cancel()
+                await asyncio.gather(get_batch_task, return_exceptions=True)
+            if producer_task.cancelled():
+                raise asyncio.CancelledError
+            if producer_task.exception() is not None:
+                producer_task.result()
+            raise RuntimeError("Disaggregated background producer exited before training finished.")
+
+        return get_batch_task.result()
+
     async def _fit(self):
         self.logger.info("Start RL disaggregated training")
         if self._cur_step >= self._total_train_steps:
@@ -1610,7 +1639,8 @@ class RLDisaggregatedTrainer(BaseRLTrainer):
         producer_task = create_task(
             self.agent_loop_manager.produce_loop(
                 batch_size=self.train_batch_size,
-            )
+            ),
+            done_callbacks=[],
         )
         try:
             # train_step 表示“下一步待完成训练”；空 expired 不算完成，所以必须用 while 支持重试同一步。
@@ -1622,8 +1652,10 @@ class RLDisaggregatedTrainer(BaseRLTrainer):
                 eval_log_info = {}
                 with timer("step", step_timer_dict):
                     with timer("get_batch", step_timer_dict):
-                        produce_result = await self.agent_loop_manager.get_batch(
-                            self.train_batch_size, train_step=train_step
+                        produce_result = await self._get_batch_or_raise_producer_failure(
+                            producer_task,
+                            batch_size=self.train_batch_size,
+                            train_step=train_step,
                         )
                     if XTUNER_DETERMINISTIC:
                         produce_result.rollout_states = sort_rollout_state_for_deterministic(
@@ -1669,7 +1701,7 @@ class RLDisaggregatedTrainer(BaseRLTrainer):
                     if need_sync:
                         # 同步前先暂停后台 producer，避免 save/sync 时还有 pending rollout 继续写 buffer。
                         with timer("pause_produce", step_timer_dict):
-                            await self.agent_loop_manager.pause_produce(use_global_progress=True)
+                            await self.agent_loop_manager.pause_produce()
 
                         await self._sync_weights_and_save(sync_model_step, step_timer_dict)
 

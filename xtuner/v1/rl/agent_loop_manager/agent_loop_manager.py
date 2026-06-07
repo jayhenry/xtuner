@@ -19,6 +19,7 @@ from xtuner.v1.utils import get_logger
 
 from .producer import (
     GROUP_GENERATE_TIME_KEY,
+    DisaggProduceProgress,
     DisaggProduceStrategyConfig,
     ProduceBatchStatus,
     ProduceContext,
@@ -389,29 +390,6 @@ class AgentLoopManager:
 
         self.task_names = [task.task_name for task in self.task_runners]
 
-        # 非共卡并发控制信号：consumer 在同步权重前置位，producer / strategy 应直接观察
-        # event 状态并尽快停止继续发新 rollout；不要用额外布尔快照替代这个 event。
-        self._update_event = asyncio.Event()
-
-        self._finish_event = asyncio.Event()
-
-        # 非共卡 producer 读取的 model_step：rollout 侧当前使用的是哪个 train_step 同步后的模型。
-        # 权重更新前必须先 pause 并清空 pending task，因此一个 pending 生命周期内只对应一个 model_step。
-        self._model_step = 0
-
-        # 非共卡 producer / consumer 共享的控制状态。produce_loop / get_batch 应直接读取
-        # self._status，不要跨 await 缓存局部快照，避免错过同步、过期或结束状态变化。
-        self._status = AgentLoopManagerStatus.NORMAL
-
-        # pause_produce 写入、下一次 get batch 读取并清零的耗时指标。
-        # 只用于消费侧日志/metrics；读写不构成生产正确性依赖。
-        self._pause_time_s = 0.0
-
-        # 非共卡 producer / consumer 共享的绝对累计进度。对象引用必须保持稳定；
-        # consumer 原地更新字段，producer / strategy 需要字段值时直接读取 progress.xxx，
-        # 不要把字段值复制成跨 await 使用的局部快照。
-        self._produce_progress = ProduceProgress.build(self.task_names)
-
     def get_task_batch_sizes(self, global_batch_size: int, train_step: int) -> dict[str, int]:
         """Return the per-task batch sizes for the current train step.
 
@@ -570,9 +548,11 @@ class AgentLoopManager:
         self,
         task_batch_sizes: dict[str, int],
         progress: ProduceProgress,
+        *,
+        model_step: int,
+        update_event: asyncio.Event,
     ) -> ProduceBatchStatus:
         current_future_step = progress.producer_future_step
-        model_step = self._model_step
         expired_tasks = [
             task.task_name
             for task in self.task_runners
@@ -599,7 +579,7 @@ class AgentLoopManager:
                             task_batch_sizes[task.task_name],
                             current_future_step,
                             model_step,
-                            self._update_event,
+                            update_event,
                             progress,
                         )
                     )
@@ -610,39 +590,16 @@ class AgentLoopManager:
             progress.add_produce_time(time.perf_counter() - produce_start)
         return _aggregate_status(statuses)
 
-    async def pause_produce(
+    async def _pause_produce_for_progress(
         self,
         *,
-        use_global_progress: bool,
-        progress: ProduceProgress | None = None,
+        progress: ProduceProgress,
+        update_event: asyncio.Event,
+        model_step: int,
     ) -> float:
-        # 这是 producer 的“显式刹车”接口。
-        #
-        # 设计动机：
-        # - 旧 colocate 语义里，一次 produce_batch() 结束后就自然收尾；
-        # - 非共卡后，producer 可能在后台持续运行，何时停下来必须交给 trainer 明确控制。
-        #
-        # 因此调用方必须显式说明是否使用全局 progress：
-        # - use_global_progress=True：非共卡后台生产循环在权重同步点前暂停；
-        # - use_global_progress=False：共卡同步 produce_batch 的本次调用收尾，使用本地 progress。
-        # 返回值 `pause_time_s` 不是业务语义，而是日志/诊断信息，
-        # 供训练侧在下一次消费 batch 时上报。
-        # use_global_progress=False 模式会在下一次 produce_batch 入口通过 continue_produce 恢复；
-        # use_global_progress=True 模式则由 trainer 在权重同步和评测完成后显式恢复。
-        if use_global_progress:
-            if progress is not None:
-                raise ValueError("progress must not be provided when use_global_progress=True.")
-            pause_progress = self._produce_progress
-        else:
-            if progress is None:
-                raise ValueError("progress must be provided when use_global_progress=False.")
-            pause_progress = progress
-
-        # 合法参数确认后，统一拉起 manager 级暂停信号，阻止仍在运行的 produce_batch 继续调度新 rollout。
-        self._update_event.set()
-        self._status = AgentLoopManagerStatus.UPDATE_WEIGHT_AND_ABORT
-
-        # 必须先让 producer / strategy 看到暂停状态，再暂停 rollout controller，避免暂停过程中继续调度新请求。
+        # 共卡和非共卡都复用同一段“先置位更新信号，再暂停 rollout controller，再 drain strategy pending”的协议；
+        # 是否把这个 event 作为 manager 全局状态，由调用方所在 manager 决定。
+        update_event.set()
         rollout_ctl = await get_agent_loop_rollout_ctl(self.task_runners[0].agent_loop)
         await rollout_ctl.pause_generation.remote()  # type: ignore[attr-defined]
 
@@ -652,15 +609,14 @@ class AgentLoopManager:
                 task,
                 self.replay_buffer,
                 0,
-                pause_progress.producer_future_step,
-                self._model_step,
-                self._update_event,
-                pause_progress,
+                progress.producer_future_step,
+                model_step,
+                update_event,
+                progress,
             )
             pause_time_s += await task.produce_strategy.pause_produce(
                 ctx,
             )
-        self._pause_time_s = pause_time_s
         return pause_time_s
 
     def _log_buffer_counts(
@@ -737,10 +693,8 @@ class AgentLoopManager:
         batch_size: int,
         task_batch_sizes: dict[str, int],
         consume_progress: ProduceProgress,
+        pause_time_s: float = 0.0,
     ) -> ProduceBatchResult:
-        pause_time_s = self._pause_time_s
-        self._pause_time_s = 0.0
-
         self._validate_task_batch_sizes(task_batch_sizes, batch_size)
         batch_by_task, consumed_counts = await self.replay_buffer.take_batch(task_batch_sizes)
         consume_progress.mark_consumed(consumed_counts)
@@ -754,30 +708,10 @@ class AgentLoopManager:
             pause_time_s=pause_time_s,
         )
 
-    async def continue_produce(self, model_step: int) -> None:
-        #
-        # 它和 pause_produce(use_global_progress=True) 是一对：
-        # - pause_produce(...) 负责让 producer 停下来；
-        # - continue_produce(...) 负责在同步/评测完成后解除暂停。
-        #
-        # 这里同步更新 `_model_step`，表示 rollout 侧接下来生成样本时，
-        # 应把“当前正在使用的是哪一版权重”记录成这个版本号。
-        self._model_step = model_step
+    async def _continue_generation(self) -> None:
+        # rollout controller 的恢复动作是共享协议；共卡只恢复本次同步生产，非共卡由子类负责更新全局状态。
         rollout_ctl = await get_agent_loop_rollout_ctl(self.task_runners[0].agent_loop)
         await rollout_ctl.continue_generation.remote()  # type: ignore[attr-defined]
-        # rollout controller 真正恢复后，再把 manager 暴露成 NORMAL，produce_loop 才能继续生产。
-        self._status = AgentLoopManagerStatus.NORMAL
-        self._update_event.clear()
-
-    def shutdown(self) -> None:
-        # 公开收口后台 producer 的退出信号，避免 trainer 直接写 manager 私有状态。
-        self._status = AgentLoopManagerStatus.FINISH
-        self._update_event.set()
-        self._finish_event.set()
-
-    async def _wait_for_status_exit(self, blocked_status: AgentLoopManagerStatus) -> None:
-        while not self._finish_event.is_set() and self._status == blocked_status:
-            await asyncio.sleep(self._STATUS_POLL_INTERVAL_S)
 
     async def produce_batch(
         self,
@@ -790,7 +724,7 @@ class AgentLoopManager:
         #
         # 它虽然名字没变，但内部已经改成三段式：
         # 1. `_produce_batch_to_buffer()` 只负责生产，把结果写入 replay buffer
-        # 2. `pause_produce()` 显式收尾 pending rollout
+        # 2. 本地 pause/drain 显式收尾 pending rollout
         # 3. `_get_batch_from_buffer()` 再把训练 batch 取出来
         #
         # 这也是为什么这里要求返回非空 batch：
@@ -806,12 +740,10 @@ class AgentLoopManager:
         active_tasks = [task for task in self.task_runners if current_sizes[task.task_name] > 0]
         assert active_tasks, "No active tasks found"
 
-        # 共卡路径不复用非共卡的 paused producer 状态机。
-        # 即使 manager 是从 resume() 恢复出来、当前仍处在 UPDATE_WEIGHT_AND_ABORT，
-        # produce_batch() 也应视作一次独立的同步生产过程，从干净状态开始。
-        #
         # 共卡路径下，produce_batch() 对应 rollout worker 当前持有的权重版本。
-        await self.continue_produce(model_step=model_step)
+        # 这里只恢复 rollout controller，不维护非共卡 status/update_event/model_step。
+        await self._continue_generation()
+        local_update_event = asyncio.Event()
         local_progress = ProduceProgress.build(
             self.task_names,
             task_batch_sizes=current_sizes,
@@ -823,15 +755,19 @@ class AgentLoopManager:
         status = await self._produce_batch_to_buffer(
             task_batch_sizes=current_sizes,
             progress=local_progress,
+            model_step=model_step,
+            update_event=local_update_event,
         )
-        await self.pause_produce(
-            use_global_progress=False,
+        pause_time_s = await self._pause_produce_for_progress(
             progress=local_progress,
+            update_event=local_update_event,
+            model_step=model_step,
         )
         result = await self._get_batch_from_buffer(
             batch_size=batch_size,
             task_batch_sizes=current_sizes,
             consume_progress=local_progress,
+            pause_time_s=pause_time_s,
         )
         result.status = status
         assert result.rollout_states, (
@@ -845,18 +781,136 @@ class AgentLoopManager:
         )
         return result
 
+    def _task_checkpoint_path(self, checkpoint_path: Path | str, task_name: str) -> Path:
+        checkpoint_path = Path(checkpoint_path)
+        return checkpoint_path / self._TASK_CHECKPOINT_DIR / task_name
+
+    def _manager_state_path(self, checkpoint_path: Path | str) -> Path:
+        checkpoint_path = Path(checkpoint_path)
+        return checkpoint_path / self._MANAGER_STATE_PATH
+
+    def _get_pending_task_counts(self) -> dict[str, int]:
+        pending_task_counts: dict[str, int] = {}
+        for task in self.task_runners:
+            pending_count = task.produce_strategy.pending_task_count()
+            if pending_count > 0:
+                pending_task_counts[task.task_name] = pending_count
+        return pending_task_counts
+
+    async def save(self, checkpoint_path: Path | str, model_step: int) -> None:
+        """Save all task sampler states and the shared replay buffer."""
+        checkpoint_path = Path(checkpoint_path)
+        checkpoint_path.mkdir(parents=True, exist_ok=True)
+        pending_task_counts = self._get_pending_task_counts()
+        if pending_task_counts:
+            raise RuntimeError(
+                "Cannot save AgentLoopManager while pending rollout tasks still exist: "
+                f"{pending_task_counts}. Finish the current produce_batch before saving."
+            )
+        for task in self.task_runners:
+            task_checkpoint_path = self._task_checkpoint_path(checkpoint_path, task.task_name)
+            task_checkpoint_path.mkdir(parents=True, exist_ok=True)
+            task.sampler.save(task_checkpoint_path)
+        # manager 层保持 async 语义；同步入口只允许在 trainer 边界用 asyncio_run 包起来。
+        await self.replay_buffer.save(checkpoint_path)
+        manager_state_path = self._manager_state_path(checkpoint_path)
+        with manager_state_path.open("w") as f:
+            # 共卡 checkpoint 只需要恢复 sampler/replay buffer 和已完成的 model_step；
+            # 非共卡 status/event/progress 由 DisaggAgentLoopManager 独占保存。
+            json.dump({"model_step": model_step}, f)
+
+    async def resume(self, checkpoint_path: Path | str) -> int:
+        """Resume all task sampler states and the shared replay buffer."""
+        checkpoint_path = Path(checkpoint_path)
+        for task in self.task_runners:
+            task.sampler.resume(self._task_checkpoint_path(checkpoint_path, task.task_name))
+        # replay buffer 恢复是 async I/O，不能在已有 event loop 中再次嵌套 asyncio_run。
+        await self.replay_buffer.resume(checkpoint_path)
+
+        manager_state_path = self._manager_state_path(checkpoint_path)
+        with manager_state_path.open("r") as f:
+            manager_state = json.load(f)
+        return manager_state["model_step"]
+
+
+class DisaggAgentLoopManager(AgentLoopManager):
+    """非共卡 producer / consumer manager。
+
+    独占后台 producer / 前台 consumer 的状态机，避免共卡 produce_batch 继续携带非共卡 event/status/progress。
+    """
+
+    def __init__(
+        self,
+        task_runners: list[_TaskRunner],
+        replay_buffer: ReplayBuffer,
+        logger=None,
+    ):
+        super().__init__(task_runners=task_runners, replay_buffer=replay_buffer, logger=logger)
+
+        # 非共卡并发控制信号：consumer 在同步权重前置位，producer / strategy 应直接观察
+        # event 状态并尽快停止继续发新 rollout；不要用额外布尔快照替代这个 event。
+        self._update_event = asyncio.Event()
+        self._finish_event = asyncio.Event()
+
+        # 非共卡 producer 读取的 model_step：rollout 侧当前使用的是哪个 train_step 同步后的模型。
+        # 权重更新前必须先 pause 并清空 pending task，因此一个 pending 生命周期内只对应一个 model_step。
+        self._model_step = 0
+
+        # 非共卡 producer / consumer 共享的控制状态。produce_loop / get_batch 应直接读取
+        # self._status，不要跨 await 缓存局部快照，避免错过同步、过期或结束状态变化。
+        self._status = AgentLoopManagerStatus.NORMAL
+
+        # pause_produce 写入、下一次 get_batch 读取并清零的耗时指标。
+        # 只用于消费侧日志/metrics；读写不构成生产正确性依赖。
+        self._pause_time_s = 0.0
+
+        # 非共卡 producer / consumer 共享的绝对累计进度。对象引用必须保持稳定；
+        # consumer 原地更新字段，producer / strategy 需要字段值时直接读取 progress.xxx。
+        self._produce_progress = DisaggProduceProgress.build(self.task_names)
+
+    def _consume_pause_time(self) -> float:
+        pause_time_s = self._pause_time_s
+        self._pause_time_s = 0.0
+        return pause_time_s
+
+    async def pause_produce(self) -> float:
+        # 非共卡 producer 的显式刹车接口；共卡没有 public pause，所以不再需要 use_global_progress 分支。
+        self._status = AgentLoopManagerStatus.UPDATE_WEIGHT_AND_ABORT
+        pause_time_s = await self._pause_produce_for_progress(
+            progress=self._produce_progress,
+            update_event=self._update_event,
+            model_step=self._model_step,
+        )
+        self._pause_time_s = pause_time_s
+        return pause_time_s
+
+    async def continue_produce(self, model_step: int) -> None:
+        #
+        # 它和 pause_produce() 是一对：
+        # - pause_produce() 负责让后台 producer 停下来；
+        # - continue_produce(...) 负责在同步/评测完成后解除暂停。
+        #
+        # 这里同步更新 `_model_step`，表示 rollout 侧接下来生成样本时，
+        # 应把“当前正在使用的是哪一版权重”记录成这个版本号。
+        self._model_step = model_step
+        await self._continue_generation()
+        # rollout controller 真正恢复后，再把 manager 暴露成 NORMAL，produce_loop 才能继续生产。
+        self._status = AgentLoopManagerStatus.NORMAL
+        self._update_event.clear()
+
+    def shutdown(self) -> None:
+        # 公开收口后台 producer 的退出信号，避免 trainer 直接写 manager 私有状态。
+        self._status = AgentLoopManagerStatus.FINISH
+        self._update_event.set()
+        self._finish_event.set()
+
+    async def _wait_for_status_exit(self, blocked_status: AgentLoopManagerStatus) -> None:
+        while not self._finish_event.is_set() and self._status == blocked_status:
+            await asyncio.sleep(self._STATUS_POLL_INTERVAL_S)
+
     async def produce_loop(self, batch_size: int) -> None:
-        # `produce_loop()` 是非共卡新增的后台生产循环。
-        # batch_size 表示每个 future train_step 的目标生产规模；producer 需要它来推进累计目标，
-        # 所以这个参数保留在后台生产入口，而不是从 get_batch() 的消费请求里推断。
-        #
-        # 和 colocate 最大的区别是：
-        # - 它不直接把 batch 返回给 trainer
-        # - 它只是持续把样本“喂”进 replay buffer
-        # - trainer 前台通过 `get_batch()` 异步消费
-        #
-        # 因此这里的核心职责不是“凑出一批训练数据”，而是根据 manager 的全局状态机
-        # 决定什么时候继续生产、什么时候暂停等待、什么时候彻底退出。
+        # `produce_loop()` 是非共卡后台生产循环：它持续把样本写入 replay buffer，
+        # 前台 trainer 再通过 `get_batch()` 异步消费。
         while not self._finish_event.is_set():
             if self._status == AgentLoopManagerStatus.FINISH:
                 break
@@ -873,12 +927,12 @@ class AgentLoopManager:
             produce_status = await self._produce_batch_to_buffer(
                 task_batch_sizes=task_batch_sizes,
                 progress=self._produce_progress,
+                model_step=self._model_step,
+                update_event=self._update_event,
             )
 
             if produce_status == ProduceBatchStatus.EXPIRED_BATCH:
-                # 注意：
-                # - EXPIRED_BATCH 是 producer 在生产过程中自己检测出来的“立即停下”信号
-                # - UPDATE_WEIGHT_AND_ABORT 则是 trainer 在同步前通过 pause_produce() 主动设置的
+                # EXPIRED_BATCH 是 producer 自己检测出来的“立即停下”信号。
                 self._status = AgentLoopManagerStatus.EXPIRED_BATCH
             elif produce_status == ProduceBatchStatus.NORMAL:
                 # 只有正常完成一轮生产时，producer 自己维护的 train_step 才前进一步。
@@ -888,16 +942,8 @@ class AgentLoopManager:
             await asyncio.sleep(0)
 
     async def get_batch(self, batch_size: int, train_step: int) -> ProduceBatchResult:
-        # `get_batch()` 是非共卡路径给 trainer 的消费接口。
-        #
-        # 设计上它和 `produce_batch()` 明确分工：
-        # - `produce_batch()`：colocate，一次调用内完成“生产+收尾+取数”
-        # - `get_batch()`：disagg，等待 replay buffer 准备好当前训练步所需 batch 后再取数
-        #
-        # 因而这里允许返回空 batch 的唯一合法场景是：
-        # - manager 已进入 EXPIRED_BATCH
-        # - 当前训练侧已有比 rollout 侧更新的 Model Step，可以直接同步过去
-        # 如果没有更新的模型版本，则要么消费当前已准备好的 batch，要么 fail fast 暴露不变量破坏。
+        # `get_batch()` 是非共卡路径给 trainer 的消费接口；允许空 batch 的唯一合法场景是：
+        # manager 已进入 EXPIRED_BATCH，且训练侧已经有比 rollout 侧更新的 Model Step。
         progress = self._produce_progress
         progress.begin_consume(train_step)
         await self._refresh_for_all_tasks(train_step, [Status.COMPLETED, Status.ABORTED])
@@ -906,10 +952,8 @@ class AgentLoopManager:
 
         while not self._finish_event.is_set():
             if self._status == AgentLoopManagerStatus.EXPIRED_BATCH:
-                # 只有训练侧已经有更新的 Model Step，空 expired 才能跳过训练并直接同步。
                 if current_model_step > self._model_step:
-                    pause_time_s = self._pause_time_s
-                    self._pause_time_s = 0.0
+                    pause_time_s = self._consume_pause_time()
                     result = ProduceBatchResult(
                         rollout_states=[],
                         status=ProduceBatchStatus.EXPIRED_BATCH,
@@ -937,6 +981,7 @@ class AgentLoopManager:
                     batch_size=batch_size,
                     task_batch_sizes=task_batch_sizes,
                     consume_progress=progress,
+                    pause_time_s=self._consume_pause_time(),
                 )
                 if self._status == AgentLoopManagerStatus.EXPIRED_BATCH:
                     # expired 但带数据表示 trainer 仍需完成本 step，再用新 Model Step 恢复 producer。
@@ -949,24 +994,9 @@ class AgentLoopManager:
 
         return ProduceBatchResult(rollout_states=[])
 
-    def _task_checkpoint_path(self, checkpoint_path: Path | str, task_name: str) -> Path:
-        checkpoint_path = Path(checkpoint_path)
-        return checkpoint_path / self._TASK_CHECKPOINT_DIR / task_name
-
-    def _manager_state_path(self, checkpoint_path: Path | str) -> Path:
-        checkpoint_path = Path(checkpoint_path)
-        return checkpoint_path / self._MANAGER_STATE_PATH
-
-    def _get_pending_task_counts(self) -> dict[str, int]:
-        pending_task_counts: dict[str, int] = {}
-        for task in self.task_runners:
-            pending_count = task.produce_strategy.pending_task_count()
-            if pending_count > 0:
-                pending_task_counts[task.task_name] = pending_count
-        return pending_task_counts
-
     async def save(self, checkpoint_path: Path | str, model_step: int) -> None:
-        """Save all task sampler states and the shared replay buffer."""
+        """Save all task sampler states, replay buffer, and disaggregated
+        progress."""
         checkpoint_path = Path(checkpoint_path)
         checkpoint_path.mkdir(parents=True, exist_ok=True)
         pending_task_counts = self._get_pending_task_counts()
@@ -975,13 +1005,11 @@ class AgentLoopManager:
                 "Cannot save AgentLoopManager while pending rollout tasks still exist: "
                 f"{pending_task_counts}. Call pause_produce() first."
             )
-        # 保存前显式记录当前 checkpoint 对应的模型步数，resume 时直接恢复这一份状态。
         self._model_step = model_step
         for task in self.task_runners:
             task_checkpoint_path = self._task_checkpoint_path(checkpoint_path, task.task_name)
             task_checkpoint_path.mkdir(parents=True, exist_ok=True)
             task.sampler.save(task_checkpoint_path)
-        # manager 层保持 async 语义；同步入口只允许在 trainer 边界用 asyncio_run 包起来。
         await self.replay_buffer.save(checkpoint_path)
         manager_state_path = self._manager_state_path(checkpoint_path)
         progress_state = self._produce_progress.state_dict()
@@ -996,11 +1024,11 @@ class AgentLoopManager:
             )
 
     async def resume(self, checkpoint_path: Path | str) -> int:
-        """Resume all task sampler states and the shared replay buffer."""
+        """Resume all task sampler states, replay buffer, and disaggregated
+        progress."""
         checkpoint_path = Path(checkpoint_path)
         for task in self.task_runners:
             task.sampler.resume(self._task_checkpoint_path(checkpoint_path, task.task_name))
-        # replay buffer 恢复是 async I/O，不能在已有 event loop 中再次嵌套 asyncio_run。
         await self.replay_buffer.resume(checkpoint_path)
 
         manager_state_path = self._manager_state_path(checkpoint_path)
@@ -1016,10 +1044,3 @@ class AgentLoopManager:
         self._pause_time_s = 0.0
         self._model_step = saved_model_step
         return saved_model_step
-
-
-class DisaggAgentLoopManager(AgentLoopManager):
-    """非共卡 producer / consumer manager。
-
-    第一阶段先建立 mode-aware public 类型边界，复用现有后台 producer 状态机，避免在拆分入口时改变训练语义。
-    """

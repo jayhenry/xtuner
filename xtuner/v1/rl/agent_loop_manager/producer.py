@@ -83,16 +83,15 @@ class ProduceProgress:
 
     设计目标：
     - Manager / 调用方负责初始化并原地更新这个对象，strategy 只接收引用并读取最新进度。
-    - target / consumed 使用全局绝对累计口径，避免 consumer 取走 buffer 中的 completed 后，
-      producer 把已消费样本误判成缺口并重复补发。
-    - 同一套语义同时服务非共卡全局 progress 和共卡 produce_batch 的局部 progress。
+    - 共卡 manager 只在一次 produce_batch 调用内构造它；非共卡全局 progress 使用
+      DisaggProduceProgress，避免把后台 producer 状态误挂到共卡 manager 上。
 
     使用注意：
     - 不要在 strategy 中补 key 或用 dict.get(..., 0) 兜底；缺少 task key 应 fail fast。
     - 除非语义明确要求冻结本轮 produce_batch 的 target / scheduled_target，
       否则不要把字段值复制成局部快照后跨 await 使用；需要字段值时直接读 progress.xxx，
       让并发更新后的 next_consumer_step / consumed_samples 能尽早生效。
-    - 运行中不要整体替换 ProduceProgress 对象；resume 时也应原地更新字段，避免旧引用失效。
+    - 运行中不要整体替换 progress 对象；非共卡 resume 时也应原地更新字段，避免旧引用失效。
 
     字段含义：
     - next_consumer_step：producer 写入新样本时应面向的训练 step。get_batch(i) 入口设为 i，
@@ -127,7 +126,8 @@ class ProduceProgress:
         task_batch_sizes: dict[str, int] | None = None,
         train_step: int = 1,
     ) -> "ProduceProgress":
-        # task_batch_sizes 为空时表示非共卡全局累计窗口；非空时表示一次共卡 produce_batch 的局部窗口。
+        # task_batch_sizes 为空时表示累计窗口（由 DisaggProduceProgress 使用）；
+        # 非空时表示一次共卡 produce_batch 的局部窗口。
         target_samples = {task_name: 0 for task_name in task_names}
         target_upto_future_step = 0
         if task_batch_sizes is not None:
@@ -250,6 +250,15 @@ class ProduceProgress:
             {task_name: int(produced_tokens_state.get(task_name, 0)) for task_name in task_names}
         )
         self.produce_time_s = float(state.get("produce_time_s", 0.0))
+
+
+@dataclass
+class DisaggProduceProgress(ProduceProgress):
+    """非共卡 producer / consumer 共享的绝对累计进度。
+
+    这个类型继承已验证的进度算法，只改变所有权边界：只有 DisaggAgentLoopManager 会持有并 checkpoint 它；共卡 AgentLoopManager 的 ProduceProgress 只属于一次本地
+    produce_batch 调用。
+    """
 
 
 class ProduceBatchStatus(Enum):
