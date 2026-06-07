@@ -1035,6 +1035,7 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
         if ctx.total_target <= 0:
             return ProduceBatchStatus.NORMAL
 
+        # TODO: place this check just before while loop
         if ctx.should_abort():
             return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
         if self.is_model_expired(ctx.train_step, ctx.model_step):
@@ -1044,6 +1045,7 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
         claimed_done = await self._pending_tasks.claim_ready()
         await _put_claimed_tasks(claimed_done, ctx)
 
+        # TODO: remove this check
         if ctx.should_abort():
             return ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
         if self.is_model_expired(ctx.train_step, ctx.model_step):
@@ -1109,6 +1111,7 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
                     produce_status = ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
                     break
 
+            # TODO: remove this check, because will check it when exit if statement, it's redundant
             if ctx.should_abort():
                 produce_status = ProduceBatchStatus.UPDATE_WEIGHT_AND_ABORT
                 break
