@@ -80,13 +80,7 @@ class _ProgressDisplayer:
 
 @dataclass
 class ProduceProgress:
-    """共卡单次 produce_batch 的局部进度。
-
-    中文不变量：
-    - 只表达本次调用，不进入 checkpoint。
-    - 裁剪非共卡需要的 producer_future_step / next_consumer_step / consumed_samples / target_upto_future_step / state_dict。
-    - 不新增 model_step，model_step 仍由 manager 放进 ProduceContext。
-    """
+    """共卡单次 produce_batch 的局部指标，不进入 checkpoint。"""
 
     target_samples: dict[str, int] = field(default_factory=dict)
     raw_rewards_sum: dict[str, float] = field(default_factory=dict)
@@ -143,7 +137,7 @@ class ProduceProgress:
 
 @dataclass
 class DisaggProduceProgress:
-    """非共卡 Background Producer / Training Consumer 共享进度。"""
+    """非共卡 producer / consumer 共享的绝对进度。"""
 
     task_names: list[str] = field(default_factory=list)
     producer_future_step: int = 1
@@ -194,7 +188,7 @@ class DisaggProduceProgress:
         self.next_consumer_step = train_step
 
     def mark_consumed(self, consumed_counts: dict[str, int]) -> None:
-        # consumer 真实取出多少就累计多少，target 不回退，避免 producer 把已消费样本当成缺口。
+        # target 不回退；producer 用 consumed + completed 判断真实缺口。
         for task_name, count in consumed_counts.items():
             self.consumed_samples[task_name] += count
 
@@ -249,7 +243,7 @@ class DisaggProduceProgress:
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        # 原地更新 dict，避免 strategy / context 持有旧引用。
+        # 原地更新，避免 strategy / context 持有旧引用。
         self.producer_future_step = state["producer_future_step"]
         self.next_consumer_step = state["next_consumer_step"]
         self.target_upto_future_step = state["target_upto_future_step"]
@@ -315,13 +309,7 @@ class ShouldContinueFn(Protocol):
 
 @dataclass(kw_only=True)
 class BaseProduceContext:
-    """单 task 生产上下文的共享能力。
-
-    这里保留共卡和非共卡都需要的 sample/generate/put 运行时契约：
-    - rollout generate 的 ray/local 差异和 timing 字段写入；
-    - 生成结果先按业务有效性过滤，再统一交给 ReplayBuffer 写版本、刷新 staleness、执行过期。
-    非共卡独有的 update_event / 绝对进度访问只放在 DisaggProduceContext。
-    """
+    """共卡/非共卡共享的 sample、generate、put 能力。"""
 
     agent_loop: AgentLoopSpec
     sampler: Sampler
@@ -351,7 +339,7 @@ class BaseProduceContext:
         *,
         enable_partial_rollout: bool = False,
     ) -> list[RolloutState]:
-        # strategy 只表达“要生成”，不关心 agent_loop 是 ray actor 还是本地对象。
+        # strategy 不关心 agent_loop 是 ray actor 还是本地对象。
         start = time.perf_counter()
         if isinstance(self.agent_loop, ray.actor.ActorHandle):
             result = await self.agent_loop.generate_group.remote(
@@ -373,7 +361,7 @@ class BaseProduceContext:
         return result
 
     async def put_generated_group(self, group: list[RolloutState]) -> bool:
-        # 只有完整生成的 group 才需要业务有效性过滤；ABORTED / EXPIRED 保留原状态供重试或统计。
+        # 只有 COMPLETED group 需要业务过滤；ABORTED / EXPIRED 保留原状态。
         is_completed = get_group_status(group) == Status.COMPLETED
         produced_tokens = sum(len(item.response_ids) for item in group if item.response_ids is not None)
         if is_completed:
@@ -401,17 +389,14 @@ class BaseProduceContext:
             stale_threshold=self.stale_threshold,
         )
         self.progress.add_produced(self.task_name, samples=len(group), tokens=produced_tokens)
-        # replay_buffer.put 可能把 stale group 转为 EXPIRED，返回前重新判断是否仍可训练。
+        # replay_buffer.put 可能因 staleness 把 group 转为 EXPIRED。
         is_completed = get_group_status(group) == Status.COMPLETED
         return is_completed
 
 
 @dataclass(kw_only=True)
 class ProduceContext(BaseProduceContext):
-    """共卡 strategy context。
-
-    共卡只表达一次 produce_batch 的本地生产窗口，不暴露 update_event / should_abort / 绝对 consumed+completed 口径，避免把非共卡后台状态机语义泄漏进同步生产路径。
-    """
+    """共卡本地生产窗口；不暴露非共卡状态机字段。"""
 
     @property
     def batch_target(self) -> int:
@@ -423,7 +408,7 @@ class ProduceContext(BaseProduceContext):
 
 @dataclass(kw_only=True)
 class DisaggProduceContext(BaseProduceContext):
-    """非共卡 strategy context。"""
+    """非共卡后台生产上下文。"""
 
     progress: DisaggProduceProgress
     update_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -473,10 +458,7 @@ class ProduceStrategyConfig(ABC, BaseModel):
 
 
 class DisaggProduceStrategyConfig(ABC, BaseModel):
-    """非共卡后台 producer strategy 配置。
-
-    共卡和非共卡使用不同 Config 类型表达执行环境，避免在 strategy build 里用 mode 分支切换语义。
-    """
+    """非共卡后台 producer strategy 配置。"""
 
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
     is_valid_sample_fn: IsValidSampleFn = default_is_valid_sample_fn
@@ -586,7 +568,7 @@ class AsyncProduceStrategyConfig(ProduceStrategyConfig):
 
 
 class DisaggAsyncProduceStrategyConfig(DisaggProduceStrategyConfig):
-    """非共卡异步 rollout production 配置。"""
+    """非共卡异步生产配置。"""
 
     over_sample_threshold: float = 0.0
     enable_partial_rollout: bool = False
@@ -669,7 +651,6 @@ class _PendingTasks:
         self._lock = asyncio.Lock()
 
     def count(self) -> int:
-        # 只暴露已经纳入 pending 集合的 task 数量。
         return len(self._tasks)
 
     async def claim_ready(self) -> set[asyncio.Task]:
@@ -700,7 +681,6 @@ class _PendingTasks:
         async with self._lock:
             if should_abort() or len(self._tasks) >= max_pending:
                 return False
-            # 保持“检查 abort / pending 数 / 新增 task”这一组操作原子化。
             self._tasks.add(await spawn_one())
             return True
 
@@ -749,7 +729,7 @@ class _LocalPendingTasks:
 
 
 async def request_agent_loop_pause(ctx: BaseProduceContext, *, pending_count: int) -> None:
-    """发送一次 agent loop pause 请求，供共卡和非共卡 pending drain 复用。"""
+    """发送一次 agent loop pause 请求。"""
 
     pause_request_start = time.perf_counter()
     if isinstance(ctx.agent_loop, ray.actor.ActorHandle):
@@ -776,14 +756,7 @@ async def pause_pending_tasks(
     ctx: BaseProduceContext,
     put_claimed_task: Callable[[asyncio.Task], Awaitable[Any]],
 ) -> float:
-    """复用 pending task pause / drain / cancel 协议。
-
-    中文不变量：
-    - 先发 pause，再等待 pending 产出；
-    - pending 没清空时周期性补发 pause，兼容后端 pause/abort 信号延迟；
-    - 超时后 cancel 剩余 pending，避免 checkpoint/save 前仍有任务写 buffer；
-    - 已完成任务必须 claim 后再 put，避免 produce 和 pause 重复入库同一个 done task。
-    """
+    """Pause/drain pending；超时后 cancel 剩余任务。"""
 
     pending = _LocalPendingTasks(pending_tasks) if isinstance(pending_tasks, set) else pending_tasks
     pause_start = time.perf_counter()
@@ -872,8 +845,7 @@ class SyncProduceStrategy(ProduceStrategy):
             done_tasks, pending_tasks = await asyncio.wait(
                 pending_tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED
             )
-            # 如果要过滤，在这个地方处理，然后加入到 replay buffer
-            # 如果被过滤的数据就放到 put_to_filtered pool 中
+            # put_generated_group 负责过滤和入库。
             for task in done_tasks:
                 items = task.result()
 
@@ -894,7 +866,6 @@ class SyncProduceStrategy(ProduceStrategy):
 
 
 class AsyncProduceStrategy(ProduceStrategy):
-    # Local retry interval for re-sending pause/abort while pending tasks drain.
     PERIODIC_ABORT_INTERVAL_S = PERIODIC_ABORT_INTERVAL_S
 
     def __init__(
@@ -943,8 +914,7 @@ class AsyncProduceStrategy(ProduceStrategy):
         if ctx.task_name not in ctx.progress.target_samples:
             raise KeyError(f"ProduceProgress.target_samples missing task_name={ctx.task_name!r}")
 
-        # 共卡 async 的 pending 生命周期只属于本次 produce_batch 调用。
-        # Manager 会在所有 active task produce_batch 正常返回后统一调用 pause_produce 收尾。
+        # 共卡 async 的 pending 只属于本次 produce_batch。
         self._local_pending_tasks = set()
 
         if ctx.batch_target <= 0:
@@ -958,8 +928,7 @@ class AsyncProduceStrategy(ProduceStrategy):
                 f"(threshold: {self.tail_batch_trigger_size}). Enabling tail batch mode."
             )
 
-        # 本轮 produce_batch 的必要累计目标固定；normal 模式只按当前 task batch 追加固定超发预算。
-        # tail-batch 模式只补必要缺口，新增任务固定从 EXPIRED pool 取，不再扩大超发窗口。
+        # normal 使用固定超发预算；tail-batch 只补必要缺口。
         batch_target = ctx.batch_target
         oversample_budget = 0 if sample_from_expired else math.ceil(self.over_sample_threshold * ctx.task_batch_size)
         scheduled_target = batch_target + oversample_budget
@@ -1014,11 +983,7 @@ class AsyncProduceStrategy(ProduceStrategy):
 
 
 class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
-    """非共卡后台 producer 使用的 async strategy。
-
-    非共卡 pending 跨后台 produce_batch 调用存在，因此这里直接实现 DisaggProduceStrategy， 不继承共卡 AsyncProduceStrategy，避免把本地 pending / 本地
-    progress 语义带进后台 producer。
-    """
+    """非共卡 async strategy；pending 跨后台生产轮次存在。"""
 
     PERIODIC_ABORT_INTERVAL_S = PERIODIC_ABORT_INTERVAL_S
 
@@ -1075,7 +1040,7 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
         if self.is_model_expired(ctx.train_step, ctx.model_step):
             return ProduceBatchStatus.EXPIRED_BATCH
 
-        # 非共卡 pending 跨后台 produce_batch 调用存在；进入下一轮时先回收已经完成的旧任务。
+        # 进入下一轮前先回收已完成的旧 pending。
         claimed_done = await self._pending_tasks.claim_ready()
         await _put_claimed_tasks(claimed_done, ctx)
 
@@ -1092,8 +1057,7 @@ class DisaggAsyncProduceStrategy(DisaggProduceStrategy):
                 f"(threshold: {self.tail_batch_trigger_size}). Enabling tail batch mode."
             )
 
-        # 本轮 produce_batch 的必要累计目标固定；normal 模式只按当前 task batch 追加固定超发预算。
-        # tail-batch 模式只补必要缺口，新增任务固定从 EXPIRED pool 取，不再扩大超发窗口。
+        # normal 使用固定超发预算；tail-batch 只补必要缺口。
         total_target = ctx.total_target
         oversample_budget = 0 if sample_from_expired else math.ceil(self.over_sample_threshold * ctx.task_batch_size)
         scheduled_target = total_target + oversample_budget
