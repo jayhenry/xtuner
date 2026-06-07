@@ -77,9 +77,6 @@ class _FakeProduceStrategy:
         self.cleanup_progresses.append(ctx.progress)
         return self.cleanup_pause_time_s
 
-    def is_model_expired(self, train_step: int, model_step: int) -> bool:
-        return False
-
 
 class _FakeStatusProduceStrategy:
     def __init__(self, status: ProduceBatchStatus, pause_time_s: float):
@@ -107,9 +104,6 @@ class _FakeStatusProduceStrategy:
         self.cleanup_progresses.append(ctx.progress)
         return self.pause_time_s
 
-    def is_model_expired(self, train_step: int, model_step: int) -> bool:
-        return False
-
 
 class _FailingProduceStrategy:
     async def produce_batch(self, ctx) -> ProduceBatchStatus:
@@ -117,9 +111,6 @@ class _FailingProduceStrategy:
 
     async def pause_produce(self, ctx) -> float:
         raise RuntimeError("cleanup failure")
-
-    def is_model_expired(self, train_step: int, model_step: int) -> bool:
-        return False
 
 
 class _FakeRolloutState:

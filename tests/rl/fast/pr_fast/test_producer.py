@@ -13,7 +13,8 @@ Bad Tests:
 本文件主要覆盖的 public 行为:
 - sampler 优先复用可重试 Rollout Group，耗尽后回退 dataloader。
 - ProduceContext 统一处理生成结果落库、过滤、raw reward 和模型版本记录。
-- SyncProduceStrategy / AsyncProduceStrategy 返回 NORMAL、UPDATE_WEIGHT_AND_ABORT、EXPIRED_BATCH 的行为。
+- SyncProduceStrategy / AsyncProduceStrategy 返回 NORMAL 的共卡生产行为。
+- DisaggAsyncProduceStrategy 返回 UPDATE_WEIGHT_AND_ABORT、EXPIRED_BATCH 的后台生产状态。
 - AsyncProduceStrategy 的 oversample、tail-batch、partial rollout、pause drain 和 staleness 结果。
 """
 
@@ -869,16 +870,16 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         await strategy.pause_produce(ctx)
         self.assertEqual(strategy.pending_task_count(), 0)
 
-    async def test_async_produce_strategy_returns_expired_batch_before_processing_leftovers(self):
-        # 验证 Rollout Model Step 过期时策略先返回 EXPIRED_BATCH，不消费已有 completed leftovers。
+    async def test_disagg_async_produce_strategy_returns_expired_batch_before_processing_leftovers(self):
+        # 验证非共卡 Rollout Model Step 过期时策略先返回 EXPIRED_BATCH，不消费已有 completed leftovers。
         task_name = "test_expired_batch"
-        strategy = AsyncProduceStrategyConfig(max_staleness=0).build()
+        strategy = DisaggAsyncProduceStrategyConfig(max_staleness=0).build()
         mock_agent_loop = self._build_agent_loop()
         sampler = MagicMock()
         sampler.sample = AsyncMock(side_effect=AssertionError("sampler.sample should not be called"))
         await self.replay_buffer.put([make_rollout_state(999, status=Status.COMPLETED)], task_name)
 
-        ctx = self._build_context(
+        ctx = self._build_disagg_context(
             strategy,
             task_name,
             mock_agent_loop,
@@ -886,7 +887,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             batch_size=1,
             train_step=3,
             model_step=1,
-            progress=self._build_progress(task_name, target=1, train_step=3),
+            progress=self._build_disagg_progress(task_name, target=1, train_step=3),
         )
         status = await strategy.produce_batch(ctx)
 

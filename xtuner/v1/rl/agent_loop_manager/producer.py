@@ -629,10 +629,6 @@ class ProduceStrategy(ABC):
     async def pause_produce(self, ctx: ProduceContext) -> float:
         return 0.0
 
-    def is_model_expired(self, train_step: int, model_step: int) -> bool:
-        # 默认同步策略没有跨权重版本的后台样本，只有异步策略需要判定模型过期。
-        return False
-
     def pending_task_count(self) -> int:
         return 0
 
@@ -923,10 +919,6 @@ class AsyncProduceStrategy(ProduceStrategy):
         self.tail_batch_trigger_size = tail_batch_trigger_size
         self._local_pending_tasks: set[asyncio.Task] = set()
 
-    def is_model_expired(self, train_step: int, model_step: int) -> bool:
-        staleness = calculate_seq_staleness(model_step, train_step)
-        return staleness >= self.stale_threshold
-
     def pending_task_count(self) -> int:
         return len(self._local_pending_tasks)
 
@@ -964,9 +956,6 @@ class AsyncProduceStrategy(ProduceStrategy):
         if ctx.target_count <= 0:
             return ProduceBatchStatus.NORMAL
 
-        if self.is_model_expired(ctx.train_step, ctx.model_step):
-            return ProduceBatchStatus.EXPIRED_BATCH
-
         expired_count = await ctx.expired_count()
         sample_from_expired = self.tail_batch_trigger_size > 0 and expired_count >= self.tail_batch_trigger_size
         if sample_from_expired:
@@ -1003,9 +992,6 @@ class AsyncProduceStrategy(ProduceStrategy):
         )
         try:
             while True:
-                if self.is_model_expired(ctx.train_step, ctx.model_step):
-                    return ProduceBatchStatus.EXPIRED_BATCH
-
                 available = await ctx.completed_count()
                 progress_displayer.update(available)
                 if not self.should_continue_fn(available, target_abs):

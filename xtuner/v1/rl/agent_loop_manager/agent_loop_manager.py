@@ -729,28 +729,6 @@ class AgentLoopManager:
         """
         return allocate_task_batch_sizes(self.task_runners, global_batch_size, train_step)
 
-    def _validate_task_batch_sizes(self, task_batch_sizes: dict[str, int], global_batch_size: int) -> None:
-        validate_task_batch_sizes(self.task_runners, task_batch_sizes, global_batch_size)
-
-    async def _refresh_for_all_tasks(self, train_step: int, statuses: list[Status]) -> None:
-        await refresh_for_all_tasks(
-            task_runners=self.task_runners,
-            replay_buffer=self.replay_buffer,
-            logger=self.logger,
-            manager_name=self.name,
-            train_step=train_step,
-            statuses=statuses,
-        )
-
-    def _get_task_batch_sizes_for_step(self, batch_size: int, train_step: int) -> dict[str, int]:
-        return get_task_batch_sizes_for_step(self, batch_size, train_step)
-
-    @staticmethod
-    def _aggregate_task_results(
-        ordered_tasks: list[_TaskRunner], task_results: dict[str, ProduceBatchResult]
-    ) -> ProduceBatchResult:
-        return aggregate_task_results(ordered_tasks, task_results)
-
     async def _produce_batch_to_buffer(
         self,
         task_batch_sizes: dict[str, int],
@@ -759,18 +737,6 @@ class AgentLoopManager:
         model_step: int,
     ) -> ProduceBatchStatus:
         current_future_step = progress.producer_future_step
-        expired_tasks = [
-            task.task_name
-            for task in self.task_runners
-            if task.produce_strategy.is_model_expired(current_future_step, model_step)
-        ]
-        if expired_tasks:
-            self.logger.info(
-                f"[AgentLoopManager][{self.name}] EXPIRED_BATCH: "
-                f"future_step={current_future_step}, tasks={expired_tasks}"
-            )
-            return ProduceBatchStatus.EXPIRED_BATCH
-
         active_tasks = [task for task in self.task_runners if progress.target_samples[task.task_name] > 0]
         assert active_tasks, "No active tasks found"
 
@@ -822,62 +788,6 @@ class AgentLoopManager:
             )
         return pause_time_s
 
-    def _log_buffer_counts(
-        self,
-        task_batch_sizes: dict[str, int],
-        batch_by_task: dict[str, list[list[RolloutState]]],
-        leftover_counts: dict[str, dict[Status, int]],
-    ) -> None:
-        log_buffer_counts(
-            self.logger,
-            manager_name=self.name,
-            task_runners=self.task_runners,
-            task_batch_sizes=task_batch_sizes,
-            batch_by_task=batch_by_task,
-            leftover_counts=leftover_counts,
-        )
-
-    def _build_result_from_batch(
-        self,
-        task_batch_sizes: dict[str, int],
-        batch_by_task: dict[str, list[list[RolloutState]]],
-        leftover_counts: dict[str, dict[Status, int]],
-        *,
-        progress: ProduceProgress | DisaggProduceProgress,
-        pause_time_s: float,
-    ) -> ProduceBatchResult:
-        return build_produce_batch_result(
-            task_runners=self.task_runners,
-            task_batch_sizes=task_batch_sizes,
-            batch_by_task=batch_by_task,
-            leftover_counts=leftover_counts,
-            progress=progress,
-            pause_time_s=pause_time_s,
-        )
-
-    async def _get_batch_from_buffer(
-        self,
-        *,
-        batch_size: int,
-        task_batch_sizes: dict[str, int],
-        consume_progress: ProduceProgress | DisaggProduceProgress,
-        pause_time_s: float = 0.0,
-    ) -> ProduceBatchResult:
-        return await take_train_batch(
-            task_runners=self.task_runners,
-            replay_buffer=self.replay_buffer,
-            logger=self.logger,
-            manager_name=self.name,
-            batch_size=batch_size,
-            task_batch_sizes=task_batch_sizes,
-            progress=consume_progress,
-            pause_time_s=pause_time_s,
-        )
-
-    async def _continue_generation(self) -> None:
-        # rollout controller 的恢复动作是共享协议；共卡只恢复本次同步生产，非共卡由子类负责更新全局状态。
-        await continue_generation(self.task_runners)
-
     async def produce_batch(
         self,
         batch_size: int,
@@ -890,7 +800,7 @@ class AgentLoopManager:
         # 它虽然名字没变，但内部已经改成三段式：
         # 1. `_produce_batch_to_buffer()` 只负责生产，把结果写入 replay buffer
         # 2. 本地 pause/drain 显式收尾 pending rollout
-        # 3. `_get_batch_from_buffer()` 再把训练 batch 取出来
+        # 3. 从 replay buffer 再把训练 batch 取出来
         #
         # 这也是为什么这里要求返回非空 batch：
         # - colocate 语义下，调用它就是为了拿一批可训练 completed groups
@@ -901,13 +811,13 @@ class AgentLoopManager:
         self.logger.info(
             f"[AgentLoopManager][{self.name}] Start produce_batch: train_step={train_step} model_step={model_step} batch_size={batch_size}"
         )
-        current_sizes = self._get_task_batch_sizes_for_step(batch_size, train_step)
+        current_sizes = get_task_batch_sizes_for_step(self, batch_size, train_step)
         active_tasks = [task for task in self.task_runners if current_sizes[task.task_name] > 0]
         assert active_tasks, "No active tasks found"
 
         # 共卡路径下，produce_batch() 对应 rollout worker 当前持有的权重版本。
-        # 这里只恢复 rollout controller，不维护非共卡 status/update_event/model_step。
-        await self._continue_generation()
+        # 这里只恢复 rollout controller，不维护非共卡 status/update_event/model_step，也不做 model expired 状态流转。
+        await continue_generation(self.task_runners)
         local_progress = ProduceProgress.build(
             task_names=self.task_names,
             target_samples=current_sizes,
@@ -915,7 +825,14 @@ class AgentLoopManager:
         )
         status = ProduceBatchStatus.NORMAL
         # 共卡 produce_batch 也是消费入口；生产前先刷新 buffer 中已有 completed / aborted。
-        await self._refresh_for_all_tasks(train_step, [Status.COMPLETED, Status.ABORTED])
+        await refresh_for_all_tasks(
+            task_runners=self.task_runners,
+            replay_buffer=self.replay_buffer,
+            logger=self.logger,
+            manager_name=self.name,
+            train_step=train_step,
+            statuses=[Status.COMPLETED, Status.ABORTED],
+        )
         status = await self._produce_batch_to_buffer(
             task_batch_sizes=current_sizes,
             progress=local_progress,
@@ -925,10 +842,14 @@ class AgentLoopManager:
             progress=local_progress,
             model_step=model_step,
         )
-        result = await self._get_batch_from_buffer(
+        result = await take_train_batch(
+            task_runners=self.task_runners,
+            replay_buffer=self.replay_buffer,
+            logger=self.logger,
+            manager_name=self.name,
             batch_size=batch_size,
             task_batch_sizes=current_sizes,
-            consume_progress=local_progress,
+            progress=local_progress,
             pause_time_s=pause_time_s,
         )
         result.status = status
@@ -943,33 +864,24 @@ class AgentLoopManager:
         )
         return result
 
-    def _task_checkpoint_path(self, checkpoint_path: Path | str, task_name: str) -> Path:
-        return task_checkpoint_path(checkpoint_path, task_name)
-
-    def _manager_state_path(self, checkpoint_path: Path | str) -> Path:
-        return manager_state_path(checkpoint_path)
-
-    def _get_pending_task_counts(self) -> dict[str, int]:
-        return get_pending_task_counts(self.task_runners)
-
     async def save(self, checkpoint_path: Path | str, model_step: int) -> None:
         """Save all task sampler states and the shared replay buffer."""
         checkpoint_path = Path(checkpoint_path)
         checkpoint_path.mkdir(parents=True, exist_ok=True)
-        pending_task_counts = self._get_pending_task_counts()
+        pending_task_counts = get_pending_task_counts(self.task_runners)
         if pending_task_counts:
             raise RuntimeError(
                 "Cannot save AgentLoopManager while pending rollout tasks still exist: "
                 f"{pending_task_counts}. Finish the current produce_batch before saving."
             )
         for task in self.task_runners:
-            task_checkpoint_path = self._task_checkpoint_path(checkpoint_path, task.task_name)
-            task_checkpoint_path.mkdir(parents=True, exist_ok=True)
-            task.sampler.save(task_checkpoint_path)
+            checkpoint_dir = task_checkpoint_path(checkpoint_path, task.task_name)
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            task.sampler.save(checkpoint_dir)
         # manager 层保持 async 语义；同步入口只允许在 trainer 边界用 asyncio_run 包起来。
         await self.replay_buffer.save(checkpoint_path)
-        manager_state_path = self._manager_state_path(checkpoint_path)
-        with manager_state_path.open("w") as f:
+        state_path = manager_state_path(checkpoint_path)
+        with state_path.open("w") as f:
             # 共卡 checkpoint 只需要恢复 sampler/replay buffer 和已完成的 model_step；
             # 非共卡 status/event/progress 由 DisaggAgentLoopManager 独占保存。
             json.dump({"model_step": model_step}, f)
@@ -978,12 +890,12 @@ class AgentLoopManager:
         """Resume all task sampler states and the shared replay buffer."""
         checkpoint_path = Path(checkpoint_path)
         for task in self.task_runners:
-            task.sampler.resume(self._task_checkpoint_path(checkpoint_path, task.task_name))
+            task.sampler.resume(task_checkpoint_path(checkpoint_path, task.task_name))
         # replay buffer 恢复是 async I/O，不能在已有 event loop 中再次嵌套 asyncio_run。
         await self.replay_buffer.resume(checkpoint_path)
 
-        manager_state_path = self._manager_state_path(checkpoint_path)
-        with manager_state_path.open("r") as f:
+        state_path = manager_state_path(checkpoint_path)
+        with state_path.open("r") as f:
             manager_state = json.load(f)
         return manager_state["model_step"]
 
@@ -1036,53 +948,6 @@ class DisaggAgentLoopManager:
     def get_task_batch_sizes(self, global_batch_size: int, train_step: int) -> dict[str, int]:
         return allocate_task_batch_sizes(self.task_runners, global_batch_size, train_step)
 
-    def _validate_task_batch_sizes(self, task_batch_sizes: dict[str, int], global_batch_size: int) -> None:
-        validate_task_batch_sizes(self.task_runners, task_batch_sizes, global_batch_size)
-
-    async def _refresh_for_all_tasks(self, train_step: int, statuses: list[Status]) -> None:
-        await refresh_for_all_tasks(
-            task_runners=self.task_runners,
-            replay_buffer=self.replay_buffer,
-            logger=self.logger,
-            manager_name=self.name,
-            train_step=train_step,
-            statuses=statuses,
-        )
-
-    def _get_task_batch_sizes_for_step(self, batch_size: int, train_step: int) -> dict[str, int]:
-        return get_task_batch_sizes_for_step(self, batch_size, train_step)
-
-    async def _get_batch_from_buffer(
-        self,
-        *,
-        batch_size: int,
-        task_batch_sizes: dict[str, int],
-        consume_progress: ProduceProgress | DisaggProduceProgress,
-        pause_time_s: float = 0.0,
-    ) -> ProduceBatchResult:
-        return await take_train_batch(
-            task_runners=self.task_runners,
-            replay_buffer=self.replay_buffer,
-            logger=self.logger,
-            manager_name=self.name,
-            batch_size=batch_size,
-            task_batch_sizes=task_batch_sizes,
-            progress=consume_progress,
-            pause_time_s=pause_time_s,
-        )
-
-    async def _continue_generation(self) -> None:
-        await continue_generation(self.task_runners)
-
-    def _task_checkpoint_path(self, checkpoint_path: Path | str, task_name: str) -> Path:
-        return task_checkpoint_path(checkpoint_path, task_name)
-
-    def _manager_state_path(self, checkpoint_path: Path | str) -> Path:
-        return manager_state_path(checkpoint_path)
-
-    def _get_pending_task_counts(self) -> dict[str, int]:
-        return get_pending_task_counts(self.task_runners)
-
     def _consume_pause_time(self) -> float:
         pause_time_s = self._pause_time_s
         self._pause_time_s = 0.0
@@ -1096,11 +961,11 @@ class DisaggAgentLoopManager:
         model_step: int,
     ) -> ProduceBatchStatus:
         current_future_step = progress.producer_future_step
-        expired_tasks = [
-            task.task_name
-            for task in self.task_runners
-            if task.produce_strategy.is_model_expired(current_future_step, model_step)
-        ]
+        expired_tasks = []
+        for task in self.task_runners:
+            produce_strategy = cast(DisaggProduceStrategy, task.produce_strategy)
+            if produce_strategy.is_model_expired(current_future_step, model_step):
+                expired_tasks.append(task.task_name)
         if expired_tasks:
             self.logger.info(
                 f"[DisaggAgentLoopManager][{self.name}] EXPIRED_BATCH: "
@@ -1166,7 +1031,7 @@ class DisaggAgentLoopManager:
         # 这里同步更新 `_model_step`，表示 rollout 侧接下来生成样本时，
         # 应把“当前正在使用的是哪一版权重”记录成这个版本号。
         self._model_step = model_step
-        await self._continue_generation()
+        await continue_generation(self.task_runners)
         # rollout controller 真正恢复后，再把 manager 暴露成 NORMAL，produce_loop 才能继续生产。
         self._status = AgentLoopManagerStatus.NORMAL
         self._update_event.clear()
@@ -1195,7 +1060,11 @@ class DisaggAgentLoopManager:
             task_batch_sizes = self._produce_progress.ensure_target_upto(
                 batch_size=batch_size,
                 future_step=self._produce_progress.producer_future_step,
-                allocate_batch_sizes=self._get_task_batch_sizes_for_step,
+                allocate_batch_sizes=lambda current_batch_size, future_step: get_task_batch_sizes_for_step(
+                    self,
+                    current_batch_size,
+                    future_step,
+                ),
             )
             produce_status = await self._produce_batch_to_buffer(
                 task_batch_sizes=task_batch_sizes,
@@ -1218,8 +1087,15 @@ class DisaggAgentLoopManager:
         # manager 已进入 EXPIRED_BATCH，且训练侧已经有比 rollout 侧更新的 Model Step。
         progress = self._produce_progress
         progress.begin_consume(train_step)
-        await self._refresh_for_all_tasks(train_step, [Status.COMPLETED, Status.ABORTED])
-        task_batch_sizes = self._get_task_batch_sizes_for_step(batch_size, train_step)
+        await refresh_for_all_tasks(
+            task_runners=self.task_runners,
+            replay_buffer=self.replay_buffer,
+            logger=self.logger,
+            manager_name=self.name,
+            train_step=train_step,
+            statuses=[Status.COMPLETED, Status.ABORTED],
+        )
+        task_batch_sizes = get_task_batch_sizes_for_step(self, batch_size, train_step)
         current_model_step = train_step - 1
 
         while not self._finish_event.is_set():
@@ -1249,10 +1125,14 @@ class DisaggAgentLoopManager:
                         f"leftover_status_counts={leftover_counts}"
                     )
             if await self.replay_buffer.is_ready(task_batch_sizes):
-                result = await self._get_batch_from_buffer(
+                result = await take_train_batch(
+                    task_runners=self.task_runners,
+                    replay_buffer=self.replay_buffer,
+                    logger=self.logger,
+                    manager_name=self.name,
                     batch_size=batch_size,
                     task_batch_sizes=task_batch_sizes,
-                    consume_progress=progress,
+                    progress=progress,
                     pause_time_s=self._consume_pause_time(),
                 )
                 if self._status == AgentLoopManagerStatus.EXPIRED_BATCH:
@@ -1260,7 +1140,14 @@ class DisaggAgentLoopManager:
                     result.status = ProduceBatchStatus.EXPIRED_BATCH
                 if result.rollout_states:
                     progress.finish_consume(train_step)
-                    await self._refresh_for_all_tasks(train_step + 1, [Status.COMPLETED, Status.ABORTED])
+                    await refresh_for_all_tasks(
+                        task_runners=self.task_runners,
+                        replay_buffer=self.replay_buffer,
+                        logger=self.logger,
+                        manager_name=self.name,
+                        train_step=train_step + 1,
+                        statuses=[Status.COMPLETED, Status.ABORTED],
+                    )
                     return result
             await asyncio.sleep(self._STATUS_POLL_INTERVAL_S)
 
@@ -1271,7 +1158,7 @@ class DisaggAgentLoopManager:
         progress."""
         checkpoint_path = Path(checkpoint_path)
         checkpoint_path.mkdir(parents=True, exist_ok=True)
-        pending_task_counts = self._get_pending_task_counts()
+        pending_task_counts = get_pending_task_counts(self.task_runners)
         if pending_task_counts:
             raise RuntimeError(
                 "Cannot save AgentLoopManager while pending rollout tasks still exist: "
@@ -1279,13 +1166,13 @@ class DisaggAgentLoopManager:
             )
         self._model_step = model_step
         for task in self.task_runners:
-            task_checkpoint_path = self._task_checkpoint_path(checkpoint_path, task.task_name)
-            task_checkpoint_path.mkdir(parents=True, exist_ok=True)
-            task.sampler.save(task_checkpoint_path)
+            checkpoint_dir = task_checkpoint_path(checkpoint_path, task.task_name)
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            task.sampler.save(checkpoint_dir)
         await self.replay_buffer.save(checkpoint_path)
-        manager_state_path = self._manager_state_path(checkpoint_path)
+        state_path = manager_state_path(checkpoint_path)
         progress_state = self._produce_progress.state_dict()
-        with manager_state_path.open("w") as f:
+        with state_path.open("w") as f:
             json.dump(
                 {
                     "status": self._status.name,
@@ -1300,11 +1187,11 @@ class DisaggAgentLoopManager:
         progress."""
         checkpoint_path = Path(checkpoint_path)
         for task in self.task_runners:
-            task.sampler.resume(self._task_checkpoint_path(checkpoint_path, task.task_name))
+            task.sampler.resume(task_checkpoint_path(checkpoint_path, task.task_name))
         await self.replay_buffer.resume(checkpoint_path)
 
-        manager_state_path = self._manager_state_path(checkpoint_path)
-        with manager_state_path.open("r") as f:
+        state_path = manager_state_path(checkpoint_path)
+        with state_path.open("r") as f:
             manager_state = json.load(f)
         saved_model_step = manager_state["model_step"]
         self._produce_progress.load_state_dict(manager_state)
