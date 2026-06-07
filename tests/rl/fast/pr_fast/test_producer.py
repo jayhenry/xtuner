@@ -13,7 +13,7 @@ Bad Tests:
 本文件主要覆盖的 public 行为:
 - sampler 优先复用可重试 Rollout Group，耗尽后回退 dataloader。
 - ProduceContext 统一处理生成结果落库、过滤、raw reward 和模型版本记录。
-- SyncProduceStrategy / AsyncProduceStrategy 返回 NORMAL 的共卡生产行为。
+- SyncProduceStrategy / AsyncProduceStrategy 通过共卡入口完成生产，不返回状态控制信号。
 - DisaggAsyncProduceStrategy 返回 UPDATE_WEIGHT_AND_ABORT、EXPIRED_BATCH 的后台生产状态。
 - AsyncProduceStrategy 的 oversample、tail-batch、partial rollout、pause drain 和 staleness 结果。
 """
@@ -346,8 +346,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             model_step=3,
             progress=self._build_progress(task_name, target=2, train_step=4),
         )
-        status = await strategy.produce_batch(ctx)
-        self.assertEqual(status, ProduceBatchStatus.NORMAL)
+        await strategy.produce_batch(ctx)
 
         # 验证：ReplayBuffer 中应该有 2 条 COMPLETED 数据
         final_data = await self.replay_buffer.get(10, task_name, Status.COMPLETED)
@@ -390,9 +389,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             progress=self._build_progress(task_name, target=2, train_step=4),
         )
 
-        status = await strategy.produce_batch(ctx)
-
-        self.assertEqual(status, ProduceBatchStatus.NORMAL)
+        await strategy.produce_batch(ctx)
         completed = await self.replay_buffer.get(10, task_name, Status.COMPLETED)
         self.assertEqual(len(completed), 2)
         self.assertEqual(sorted(group[0].message_uid for group in completed), [2, 3])
@@ -438,8 +435,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             model_step=0,
             progress=self._build_progress(task_name, target=2),
         )
-        status = await strategy.produce_batch(ctx)
-        self.assertEqual(status, ProduceBatchStatus.NORMAL)
+        await strategy.produce_batch(ctx)
 
         # 验证：ReplayBuffer 中应该有 4 条 COMPLETED 数据。
         final_data = await self.replay_buffer.get(10, task_name, Status.COMPLETED)
@@ -463,9 +459,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             progress=progress,
         )
 
-        status = await strategy.produce_batch(ctx)
-
-        self.assertEqual(status, ProduceBatchStatus.NORMAL)
+        await strategy.produce_batch(ctx)
         self.assertEqual(await self.replay_buffer.count(task_name, Status.COMPLETED), 1)
 
     async def test_async_produce_strategy_uses_live_consumed_progress(self):
@@ -536,9 +530,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             model_step=0,
             progress=progress,
         )
-        status = await strategy.produce_batch(ctx)
-
-        self.assertEqual(status, ProduceBatchStatus.NORMAL)
+        await strategy.produce_batch(ctx)
         # 当前只缺 1 个样本，但 over-sample 预算固定为 over * batch_size = 4，
         # 因此本轮最多调度到 target + 4，对应初始发射 5 个任务。
         self.assertEqual(sampler.sample.await_count, 5)
@@ -574,9 +566,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             model_step=0,
             progress=self._build_progress(task_name, target=2),
         )
-        status = await strategy.produce_batch(ctx)
-
-        self.assertEqual(status, ProduceBatchStatus.NORMAL)
+        await strategy.produce_batch(ctx)
         # tail-batch 模式在本轮优先走 EXPIRED pool，并且不使用 over-sample 额外发射。
         self.assertEqual(sampled_statuses, [[Status.EXPIRED, Status.ABORTED], [Status.EXPIRED, Status.ABORTED]])
         completed = await self.replay_buffer.get(10, task_name, Status.COMPLETED)
@@ -656,9 +646,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             model_step=3,
             progress=self._build_progress(task_name, target=1, train_step=5),
         )
-        status = await strategy.produce_batch(ctx)
-
-        self.assertEqual(status, ProduceBatchStatus.NORMAL)
+        await strategy.produce_batch(ctx)
         completed = await self.replay_buffer.get(1, task_name, Status.COMPLETED)
         self.assertEqual(completed[0][0].response_model_steps, [3, 3])
         self.assertEqual(completed[0][0].seq_staleness, 1)
@@ -698,9 +686,8 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             model_step=3,
             progress=self._build_progress(task_name, target=1, train_step=5),
         )
-        status = await strategy.produce_batch(ctx)
+        await strategy.produce_batch(ctx)
 
-        self.assertEqual(status, ProduceBatchStatus.NORMAL)
         completed = await self.replay_buffer.get(1, task_name, Status.COMPLETED)
         self.assertEqual(completed[0][0].response_model_steps, [1, 3, 3])
         self.assertEqual(completed[0][0].seq_staleness, 3)
@@ -723,8 +710,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             model_step=0,
             progress=progress,
         )
-        status = await strategy.produce_batch(ctx)
-        self.assertEqual(status, ProduceBatchStatus.NORMAL)
+        await strategy.produce_batch(ctx)
         self.assertGreater(strategy.pending_task_count(), 0)
 
         await asyncio.sleep(0.08)
@@ -738,8 +724,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             model_step=0,
             progress=progress,
         )
-        status = await strategy.produce_batch(ctx)
-        self.assertEqual(status, ProduceBatchStatus.NORMAL)
+        await strategy.produce_batch(ctx)
         self.assertEqual(strategy.pending_task_count(), 0)
 
         final_data = await self.replay_buffer.get(10, task_name, Status.COMPLETED)

@@ -204,27 +204,6 @@ def _fill_leftover_counts(result: ProduceBatchResult, status_counts: dict[Status
     result.leftover_filtered = status_counts.get(Status.FILTERED, 0)
 
 
-# TODO: 去掉 _init_manager_fields，将它内联到 AgentLoopManager 和 DisaggAgentLoopManager 的 __init__ 中
-def _init_manager_fields(
-    manager, task_runners: list[_TaskRunner], replay_buffer: ReplayBuffer, logger, name: str
-) -> None:
-    if not task_runners:
-        raise ValueError(f"{name} requires at least one task runner.")
-    if sum(task.weight for task in task_runners) <= 0:
-        raise ValueError(f"At least one task weight must be positive for {name}.")
-
-    manager.task_runners = task_runners
-    manager.replay_buffer = replay_buffer
-    manager.data_sampler = (
-        task_runners[0].sampler
-        if len(task_runners) == 1
-        else _TaskSamplerView([task.sampler for task in task_runners])
-    )
-    manager.name = task_runners[0].task_name if len(task_runners) == 1 else "multi_task"
-    manager.logger = get_logger() if logger is None else logger
-    manager.task_names = [task.task_name for task in task_runners]
-
-
 def allocate_task_batch_sizes(
     task_runners: list[_TaskRunner],
     global_batch_size: int,
@@ -285,16 +264,6 @@ def validate_task_batch_sizes(
             "Task batch sizes must sum to the requested global batch size, "
             f"got total={total_batch_size}, expected={global_batch_size}"
         )
-
-
-def get_task_batch_sizes_for_step(manager, batch_size: int, train_step: int) -> dict[str, int]:
-    # TODO: 去掉这个函数。具体做法是：1.删掉单task分支。 2. 将validate_task_batch_sizes移到 manager.get_task_batch_sizes中。 3. 外部调用直接使用 manager.get_task_batch_sizes
-    if len(manager.task_runners) == 1:
-        return {manager.task_runners[0].task_name: batch_size}
-
-    task_batch_sizes = manager.get_task_batch_sizes(batch_size, train_step)
-    validate_task_batch_sizes(manager.task_runners, task_batch_sizes, batch_size)
-    return task_batch_sizes
 
 
 async def refresh_for_all_tasks(
@@ -470,12 +439,10 @@ async def take_train_batch(
     replay_buffer: ReplayBuffer,
     logger,
     manager_name: str,
-    batch_size: int,
     task_batch_sizes: dict[str, int],
     progress: ProduceProgress | DisaggProduceProgress,
     pause_time_s: float = 0.0,
 ) -> ProduceBatchResult:
-    validate_task_batch_sizes(task_runners, task_batch_sizes, batch_size)
     batch_by_task, consumed_counts = await replay_buffer.take_batch(task_batch_sizes)
     if isinstance(progress, DisaggProduceProgress):
         progress.mark_consumed(consumed_counts)
@@ -519,52 +486,6 @@ def get_pending_task_counts(task_runners: list[_TaskRunner]) -> dict[str, int]:
         if pending_count > 0:
             pending_task_counts[task.task_name] = pending_count
     return pending_task_counts
-
-
-def _build_produce_context(
-    task_runner: _TaskRunner,
-    replay_buffer: ReplayBuffer,
-    batch_size: int,
-    train_step: int,
-    model_step: int,
-    progress: ProduceProgress,
-) -> ProduceContext:
-    return ProduceContext(
-        agent_loop=task_runner.agent_loop,
-        sampler=task_runner.sampler,
-        replay_buffer=replay_buffer,
-        task_batch_size=batch_size,
-        task_name=task_runner.task_name,
-        train_step=train_step,
-        model_step=model_step,
-        progress=progress,
-        is_valid_sample_fn=task_runner.is_valid_sample_fn,
-        stale_threshold=task_runner.stale_threshold,
-    )
-
-
-def _build_disagg_produce_context(
-    task_runner: _TaskRunner,
-    replay_buffer: ReplayBuffer,
-    batch_size: int,
-    train_step: int,
-    model_step: int,
-    update_event: asyncio.Event,
-    progress: DisaggProduceProgress,
-) -> DisaggProduceContext:
-    return DisaggProduceContext(
-        agent_loop=task_runner.agent_loop,
-        sampler=task_runner.sampler,
-        replay_buffer=replay_buffer,
-        task_batch_size=batch_size,
-        task_name=task_runner.task_name,
-        train_step=train_step,
-        model_step=model_step,
-        progress=progress,
-        update_event=update_event,
-        is_valid_sample_fn=task_runner.is_valid_sample_fn,
-        stale_threshold=task_runner.stale_threshold,
-    )
 
 
 class TaskSpecConfig(BaseModel):
@@ -729,7 +650,21 @@ class AgentLoopManager:
         replay_buffer: ReplayBuffer,
         logger=None,
     ):
-        _init_manager_fields(self, task_runners, replay_buffer, logger, "AgentLoopManager")
+        if not task_runners:
+            raise ValueError("AgentLoopManager requires at least one task runner.")
+        if sum(task.weight for task in task_runners) <= 0:
+            raise ValueError("At least one task weight must be positive for AgentLoopManager.")
+
+        self.task_runners = task_runners
+        self.replay_buffer = replay_buffer
+        self.data_sampler = (
+            task_runners[0].sampler
+            if len(task_runners) == 1
+            else _TaskSamplerView([task.sampler for task in task_runners])
+        )
+        self.name = task_runners[0].task_name if len(task_runners) == 1 else "multi_task"
+        self.logger = get_logger() if logger is None else logger
+        self.task_names = [task.task_name for task in task_runners]
 
     def get_task_batch_sizes(self, global_batch_size: int, train_step: int) -> dict[str, int]:
         """Return the per-task batch sizes for the current train step.
@@ -737,66 +672,9 @@ class AgentLoopManager:
         Subclasses may override this method to implement custom dynamic batch allocation policies. Returning 0 for a
         task effectively disables that task for the current produce_batch call.
         """
-        return allocate_task_batch_sizes(self.task_runners, global_batch_size, train_step)
-
-    async def _produce_batch_to_buffer(
-        self,
-        task_batch_sizes: dict[str, int],
-        progress: ProduceProgress,
-        *,
-        model_step: int,
-    ) -> ProduceBatchStatus:
-        current_future_step = progress.producer_future_step
-        active_tasks = [task for task in self.task_runners if progress.target_samples[task.task_name] > 0]
-        assert active_tasks, "No active tasks found"
-
-        produce_start = time.perf_counter()
-        try:
-            produce_futures = []
-            for task in active_tasks:
-                produce_strategy = cast(ProduceStrategy, task.produce_strategy)
-                produce_futures.append(
-                    produce_strategy.produce_batch(
-                        _build_produce_context(
-                            task,
-                            self.replay_buffer,
-                            task_batch_sizes[task.task_name],
-                            current_future_step,
-                            model_step,
-                            progress,
-                        )
-                    )
-                )
-            statuses = await asyncio.gather(*produce_futures)
-        finally:
-            progress.add_produce_time(time.perf_counter() - produce_start)
-        return _aggregate_status(statuses)
-
-    async def _pause_produce_for_progress(
-        self,
-        *,
-        progress: ProduceProgress,
-        model_step: int,
-    ) -> float:
-        # 共卡 pause 只负责让本次 produce_batch 的本地 pending 收尾，不维护非共卡 update_event。
-        rollout_ctl = await get_agent_loop_rollout_ctl(self.task_runners[0].agent_loop)
-        await rollout_ctl.pause_generation.remote()  # type: ignore[attr-defined]
-
-        pause_time_s = 0.0
-        for task in self.task_runners:
-            produce_strategy = cast(ProduceStrategy, task.produce_strategy)
-            ctx = _build_produce_context(
-                task,
-                self.replay_buffer,
-                0,
-                progress.producer_future_step,
-                model_step,
-                progress,
-            )
-            pause_time_s += await produce_strategy.pause_produce(
-                ctx,
-            )
-        return pause_time_s
+        task_batch_sizes = allocate_task_batch_sizes(self.task_runners, global_batch_size, train_step)
+        validate_task_batch_sizes(self.task_runners, task_batch_sizes, global_batch_size)
+        return task_batch_sizes
 
     async def produce_batch(
         self,
@@ -807,10 +685,8 @@ class AgentLoopManager:
     ) -> ProduceBatchResult:
         # `produce_batch()` 是保留给 colocate 路径的同步入口。
         #
-        # 它虽然名字没变，但内部已经改成三段式：
-        # 1. `_produce_batch_to_buffer()` 只负责生产，把结果写入 replay buffer
-        # 2. 本地 pause/drain 显式收尾 pending rollout
-        # 3. 从 replay buffer 再把训练 batch 取出来
+        # 它虽然名字没变，但内部已经改成三段式：先生产入 replay buffer，
+        # 再本地 pause/drain 收尾 pending rollout，最后取出训练 batch。
         #
         # 这也是为什么这里要求返回非空 batch：
         # - colocate 语义下，调用它就是为了拿一批可训练 completed groups
@@ -821,7 +697,7 @@ class AgentLoopManager:
         self.logger.info(
             f"[AgentLoopManager][{self.name}] Start produce_batch: train_step={train_step} model_step={model_step} batch_size={batch_size}"
         )
-        current_sizes = get_task_batch_sizes_for_step(self, batch_size, train_step)
+        current_sizes = self.get_task_batch_sizes(batch_size, train_step)
         active_tasks = [task for task in self.task_runners if current_sizes[task.task_name] > 0]
         assert active_tasks, "No active tasks found"
 
@@ -833,7 +709,6 @@ class AgentLoopManager:
             target_samples=current_sizes,
             train_step=train_step,
         )
-        status = ProduceBatchStatus.NORMAL
         # 共卡 produce_batch 也是消费入口；生产前先刷新 buffer 中已有 completed / aborted。
         await refresh_for_all_tasks(
             task_runners=self.task_runners,
@@ -843,26 +718,61 @@ class AgentLoopManager:
             train_step=train_step,
             statuses=[Status.COMPLETED, Status.ABORTED],
         )
-        status = await self._produce_batch_to_buffer(
-            task_batch_sizes=current_sizes,
-            progress=local_progress,
-            model_step=model_step,
-        )
-        pause_time_s = await self._pause_produce_for_progress(
-            progress=local_progress,
-            model_step=model_step,
-        )
+        produce_start = time.perf_counter()
+        try:
+            produce_futures = []
+            for task in active_tasks:
+                produce_strategy = cast(ProduceStrategy, task.produce_strategy)
+                produce_futures.append(
+                    produce_strategy.produce_batch(
+                        ProduceContext(
+                            agent_loop=task.agent_loop,
+                            sampler=task.sampler,
+                            replay_buffer=self.replay_buffer,
+                            task_batch_size=current_sizes[task.task_name],
+                            task_name=task.task_name,
+                            train_step=train_step,
+                            model_step=model_step,
+                            progress=local_progress,
+                            is_valid_sample_fn=task.is_valid_sample_fn,
+                            stale_threshold=task.stale_threshold,
+                        )
+                    )
+                )
+            await asyncio.gather(*produce_futures)
+        finally:
+            local_progress.add_produce_time(time.perf_counter() - produce_start)
+
+        # 共卡 pause 只负责让本次 produce_batch 的本地 pending 收尾，不维护非共卡 update_event。
+        rollout_ctl = await get_agent_loop_rollout_ctl(self.task_runners[0].agent_loop)
+        await rollout_ctl.pause_generation.remote()  # type: ignore[attr-defined]
+
+        pause_time_s = 0.0
+        for task in active_tasks:
+            produce_strategy = cast(ProduceStrategy, task.produce_strategy)
+            pause_time_s += await produce_strategy.pause_produce(
+                ProduceContext(
+                    agent_loop=task.agent_loop,
+                    sampler=task.sampler,
+                    replay_buffer=self.replay_buffer,
+                    task_batch_size=0,
+                    task_name=task.task_name,
+                    train_step=train_step,
+                    model_step=model_step,
+                    progress=local_progress,
+                    is_valid_sample_fn=task.is_valid_sample_fn,
+                    stale_threshold=task.stale_threshold,
+                )
+            )
         result = await take_train_batch(
             task_runners=self.task_runners,
             replay_buffer=self.replay_buffer,
             logger=self.logger,
             manager_name=self.name,
-            batch_size=batch_size,
             task_batch_sizes=current_sizes,
             progress=local_progress,
             pause_time_s=pause_time_s,
         )
-        result.status = status
         assert result.rollout_states, (
             "AgentLoopManager.produce_batch() must return non-empty rollout_states for colocated training. "
             "Use get_batch() for disaggregated empty/expired reads."
@@ -932,7 +842,21 @@ class DisaggAgentLoopManager:
         replay_buffer: ReplayBuffer,
         logger=None,
     ):
-        _init_manager_fields(self, task_runners, replay_buffer, logger, "DisaggAgentLoopManager")
+        if not task_runners:
+            raise ValueError("DisaggAgentLoopManager requires at least one task runner.")
+        if sum(task.weight for task in task_runners) <= 0:
+            raise ValueError("At least one task weight must be positive for DisaggAgentLoopManager.")
+
+        self.task_runners = task_runners
+        self.replay_buffer = replay_buffer
+        self.data_sampler = (
+            task_runners[0].sampler
+            if len(task_runners) == 1
+            else _TaskSamplerView([task.sampler for task in task_runners])
+        )
+        self.name = task_runners[0].task_name if len(task_runners) == 1 else "multi_task"
+        self.logger = get_logger() if logger is None else logger
+        self.task_names = [task.task_name for task in task_runners]
 
         # 非共卡并发控制信号：consumer 在同步权重前置位，producer / strategy 应直接观察
         # event 状态并尽快停止继续发新 rollout；不要用额外布尔快照替代这个 event。
@@ -956,58 +880,14 @@ class DisaggAgentLoopManager:
         self._produce_progress = DisaggProduceProgress.build(self.task_names)
 
     def get_task_batch_sizes(self, global_batch_size: int, train_step: int) -> dict[str, int]:
-        return allocate_task_batch_sizes(self.task_runners, global_batch_size, train_step)
+        task_batch_sizes = allocate_task_batch_sizes(self.task_runners, global_batch_size, train_step)
+        validate_task_batch_sizes(self.task_runners, task_batch_sizes, global_batch_size)
+        return task_batch_sizes
 
     def _consume_pause_time(self) -> float:
         pause_time_s = self._pause_time_s
         self._pause_time_s = 0.0
         return pause_time_s
-
-    async def _produce_batch_to_buffer(
-        self,
-        task_batch_sizes: dict[str, int],
-        progress: DisaggProduceProgress,
-        *,
-        model_step: int,
-    ) -> ProduceBatchStatus:
-        current_future_step = progress.producer_future_step
-        expired_tasks = []
-        for task in self.task_runners:
-            produce_strategy = cast(DisaggProduceStrategy, task.produce_strategy)
-            if produce_strategy.is_model_expired(current_future_step, model_step):
-                expired_tasks.append(task.task_name)
-        if expired_tasks:
-            self.logger.info(
-                f"[DisaggAgentLoopManager][{self.name}] EXPIRED_BATCH: "
-                f"future_step={current_future_step}, tasks={expired_tasks}"
-            )
-            return ProduceBatchStatus.EXPIRED_BATCH
-
-        active_tasks = [task for task in self.task_runners if progress.target_samples[task.task_name] > 0]
-        assert active_tasks, "No active tasks found"
-
-        produce_start = time.perf_counter()
-        try:
-            produce_futures = []
-            for task in active_tasks:
-                produce_strategy = cast(DisaggProduceStrategy, task.produce_strategy)
-                produce_futures.append(
-                    produce_strategy.produce_batch(
-                        _build_disagg_produce_context(
-                            task,
-                            self.replay_buffer,
-                            task_batch_sizes[task.task_name],
-                            current_future_step,
-                            model_step,
-                            self._update_event,
-                            progress,
-                        )
-                    )
-                )
-            statuses = await asyncio.gather(*produce_futures)
-        finally:
-            progress.add_produce_time(time.perf_counter() - produce_start)
-        return _aggregate_status(statuses)
 
     async def pause_produce(self) -> float:
         # 非共卡 producer 的显式刹车接口；共卡没有 public pause，也不再有混合模式分支。
@@ -1019,14 +899,18 @@ class DisaggAgentLoopManager:
         pause_time_s = 0.0
         for task in self.task_runners:
             produce_strategy = cast(DisaggProduceStrategy, task.produce_strategy)
-            ctx = _build_disagg_produce_context(
-                task,
-                self.replay_buffer,
-                0,
-                self._produce_progress.producer_future_step,
-                self._model_step,
-                self._update_event,
-                self._produce_progress,
+            ctx = DisaggProduceContext(
+                agent_loop=task.agent_loop,
+                sampler=task.sampler,
+                replay_buffer=self.replay_buffer,
+                task_batch_size=0,
+                task_name=task.task_name,
+                train_step=self._produce_progress.producer_future_step,
+                model_step=self._model_step,
+                progress=self._produce_progress,
+                update_event=self._update_event,
+                is_valid_sample_fn=task.is_valid_sample_fn,
+                stale_threshold=task.stale_threshold,
             )
             pause_time_s += await produce_strategy.pause_produce(ctx)
         self._pause_time_s = pause_time_s
@@ -1070,17 +954,51 @@ class DisaggAgentLoopManager:
             task_batch_sizes = self._produce_progress.ensure_target_upto(
                 batch_size=batch_size,
                 future_step=self._produce_progress.producer_future_step,
-                allocate_batch_sizes=lambda current_batch_size, future_step: get_task_batch_sizes_for_step(
-                    self,
-                    current_batch_size,
-                    future_step,
-                ),
+                allocate_batch_sizes=self.get_task_batch_sizes,
             )
-            produce_status = await self._produce_batch_to_buffer(
-                task_batch_sizes=task_batch_sizes,
-                progress=self._produce_progress,
-                model_step=self._model_step,
-            )
+            producer_train_step = self._produce_progress.producer_future_step
+            expired_tasks = []
+            for task in self.task_runners:
+                produce_strategy = cast(DisaggProduceStrategy, task.produce_strategy)
+                if produce_strategy.is_model_expired(producer_train_step, self._model_step):
+                    expired_tasks.append(task.task_name)
+            if expired_tasks:
+                self.logger.info(
+                    f"[DisaggAgentLoopManager][{self.name}] EXPIRED_BATCH: "
+                    f"future_step={producer_train_step}, tasks={expired_tasks}"
+                )
+                produce_status = ProduceBatchStatus.EXPIRED_BATCH
+            else:
+                active_tasks = [
+                    task for task in self.task_runners if self._produce_progress.target_samples[task.task_name] > 0
+                ]
+                assert active_tasks, "No active tasks found"
+
+                produce_start = time.perf_counter()
+                try:
+                    produce_futures = []
+                    for task in active_tasks:
+                        produce_strategy = cast(DisaggProduceStrategy, task.produce_strategy)
+                        produce_futures.append(
+                            produce_strategy.produce_batch(
+                                DisaggProduceContext(
+                                    agent_loop=task.agent_loop,
+                                    sampler=task.sampler,
+                                    replay_buffer=self.replay_buffer,
+                                    task_batch_size=task_batch_sizes[task.task_name],
+                                    task_name=task.task_name,
+                                    train_step=producer_train_step,
+                                    model_step=self._model_step,
+                                    progress=self._produce_progress,
+                                    update_event=self._update_event,
+                                    is_valid_sample_fn=task.is_valid_sample_fn,
+                                    stale_threshold=task.stale_threshold,
+                                )
+                            )
+                        )
+                    produce_status = _aggregate_status(await asyncio.gather(*produce_futures))
+                finally:
+                    self._produce_progress.add_produce_time(time.perf_counter() - produce_start)
 
             if produce_status == ProduceBatchStatus.EXPIRED_BATCH:
                 # EXPIRED_BATCH 是 producer 自己检测出来的“立即停下”信号。
@@ -1105,7 +1023,7 @@ class DisaggAgentLoopManager:
             train_step=train_step,
             statuses=[Status.COMPLETED, Status.ABORTED],
         )
-        task_batch_sizes = get_task_batch_sizes_for_step(self, batch_size, train_step)
+        task_batch_sizes = self.get_task_batch_sizes(batch_size, train_step)
         current_model_step = train_step - 1
 
         while not self._finish_event.is_set():
@@ -1140,7 +1058,6 @@ class DisaggAgentLoopManager:
                     replay_buffer=self.replay_buffer,
                     logger=self.logger,
                     manager_name=self.name,
-                    batch_size=batch_size,
                     task_batch_sizes=task_batch_sizes,
                     progress=progress,
                     pause_time_s=self._consume_pause_time(),

@@ -627,7 +627,7 @@ class ProduceStrategy(ABC):
         self.should_continue_fn = should_continue_fn
 
     @abstractmethod
-    async def produce_batch(self, ctx: ProduceContext) -> ProduceBatchStatus: ...
+    async def produce_batch(self, ctx: ProduceContext) -> None: ...
 
     async def pause_produce(self, ctx: ProduceContext) -> float:
         return 0.0
@@ -851,11 +851,9 @@ async def _put_claimed_tasks(
 
 
 class SyncProduceStrategy(ProduceStrategy):
-    async def produce_batch(self, ctx: ProduceContext) -> ProduceBatchStatus:
+    async def produce_batch(self, ctx: ProduceContext) -> None:
         pending_tasks = set()
         completed_sample_count = await ctx.replay_buffer.count(task_name=ctx.task_name, group_status=Status.COMPLETED)
-        # TODO: 是否支持 SyncProduceStrategy 在非共卡时使用？如果支持，下面这行注释掉？
-        # assert completed_sample_count == 0, "SyncProduceStrategy assumes no completed samples at the start."
 
         for _ in range(ctx.task_batch_size):
             rollout_state = await ctx.sampler.sample(task_name=ctx.task_name)
@@ -898,8 +896,6 @@ class SyncProduceStrategy(ProduceStrategy):
                     pending_tasks.add(task)
         finally:
             progress_displayer.close()
-
-        return ProduceBatchStatus.NORMAL
 
 
 class AsyncProduceStrategy(ProduceStrategy):
@@ -948,7 +944,7 @@ class AsyncProduceStrategy(ProduceStrategy):
             put_claimed_task=lambda task: ctx.put_generated_group(task.result()),
         )
 
-    async def produce_batch(self, ctx: ProduceContext) -> ProduceBatchStatus:
+    async def produce_batch(self, ctx: ProduceContext) -> None:
         if ctx.task_name not in ctx.progress.target_samples:
             raise KeyError(f"ProduceProgress.target_samples missing task_name={ctx.task_name!r}")
 
@@ -957,7 +953,7 @@ class AsyncProduceStrategy(ProduceStrategy):
         self._local_pending_tasks = set()
 
         if ctx.target_count <= 0:
-            return ProduceBatchStatus.NORMAL
+            return
 
         expired_count = await ctx.expired_count()
         sample_from_expired = self.tail_batch_trigger_size > 0 and expired_count >= self.tail_batch_trigger_size
@@ -969,11 +965,11 @@ class AsyncProduceStrategy(ProduceStrategy):
 
         # 本轮 produce_batch 的必要累计目标固定；normal 模式只按当前 task batch 追加固定超发预算。
         # tail-batch 模式只补必要缺口，新增任务固定从 EXPIRED pool 取，不再扩大超发窗口。
-        target_abs = ctx.target_count
+        target_count = ctx.target_count
         oversample_budget = 0 if sample_from_expired else math.ceil(self.over_sample_threshold * ctx.task_batch_size)
-        scheduled_target = target_abs + oversample_budget
+        scheduled_target = target_count + oversample_budget
         logger.info(
-            f"Starting produce_batch for task {ctx.task_name} with target_abs={target_abs}, "
+            f"Starting produce_batch for task {ctx.task_name} with target_count={target_count}, "
             f"oversample_budget={oversample_budget}, scheduled_target={scheduled_target}."
         )
 
@@ -997,8 +993,8 @@ class AsyncProduceStrategy(ProduceStrategy):
             while True:
                 available = await ctx.completed_count()
                 progress_displayer.update(available)
-                if not self.should_continue_fn(available, target_abs):
-                    return ProduceBatchStatus.NORMAL
+                if not self.should_continue_fn(available, target_count):
+                    return
 
                 pending_count = len(self._local_pending_tasks)
                 desired_pending = max(0, scheduled_target - available)
@@ -1008,7 +1004,7 @@ class AsyncProduceStrategy(ProduceStrategy):
 
                 if not self._local_pending_tasks:
                     logger.warning("All tasks are done but not enough samples collected.")
-                    return ProduceBatchStatus.NORMAL
+                    return
 
                 done_tasks, _ = await asyncio.wait(
                     set(self._local_pending_tasks), timeout=1, return_when=asyncio.FIRST_COMPLETED
