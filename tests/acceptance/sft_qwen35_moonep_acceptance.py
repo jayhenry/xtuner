@@ -13,6 +13,7 @@ from xtuner.v1.datasets import FTDPTokenizeFnConfig
 from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfig
 from xtuner.v1.loss.ce_loss import CELossConfig
 from xtuner.v1.model import Qwen3_5_VLMoE35BA3Config
+from xtuner.v1.model.moe.qwen3_5_text import MOE_EP_COMPILE_CFG
 from xtuner.v1.module.mtp import MTPConfig
 from xtuner.v1.train import TrainerConfig
 
@@ -48,6 +49,12 @@ text_cfg.router_async_offload = False
 # pt212_cu132. Flex attention keeps both dispatcher runs on the same real-model
 # workload instead of depending on that broken optional binary.
 text_cfg.attention.attn_impl = "flex_attention"
+# FlexAttention intentionally compiles behind a graph break so its BlockMask
+# tensors become fixed-layout inputs to the kernel graph. Keep all default
+# Qwen3.5 compile targets, but let MHA form that one required boundary.
+text_cfg.compile_cfg = MOE_EP_COMPILE_CFG | {
+    "xtuner.v1.module.attention.mha.MultiHeadAttention.forward": {"fullgraph": False}
+}
 text_cfg.mtp_config = MTPConfig(num_layers=1) if mtp_enabled else None
 
 dataset_cfg = [

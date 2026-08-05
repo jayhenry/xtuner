@@ -56,6 +56,10 @@ def test_qwen35_acceptance_config_locks_the_formal_workload(monkeypatch, tmp_pat
     assert model.text_config.moonep_staging_reference is False
     assert model.text_config.router_async_offload is False
     assert model.text_config.router_compute_dtype == "float32"
+    assert (
+        model.text_config.compile_cfg["xtuner.v1.module.attention.mha.MultiHeadAttention.forward"]["fullgraph"]
+        is False
+    )
     assert (model.text_config.mtp_config is not None) is mtp
     if mtp:
         assert model.text_config.mtp_config.num_layers == 1
