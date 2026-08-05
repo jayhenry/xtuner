@@ -18,6 +18,7 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 from typing_extensions import TypedDict, override
 
+from xtuner.v1.ops.moe.cuda.route_weight import route_weight_rows_backward
 from xtuner.v1.utils import log_rank0
 
 from .base import GenericDispatcher
@@ -263,26 +264,38 @@ class _MoonEPInvocation:
         topk_weights: torch.Tensor,
         async_op: bool,
     ) -> MoonEPDispatchResult:
-        buffer = self._runtime._buffer_for(hidden_states.shape[0])
-        hidden_nvsh, weights_nvs, cu_seqlens, plan, done = buffer.dispatch(
+        hidden_nvsh, weights_nvs, cu_seqlens = _DispatchAutograd.apply(
             hidden_states,
-            route_weights_sk=topk_weights,
-            topk_experts_sk=topk_ids,
-            tokens_per_expert=tokens_per_expert,
-            async_finish=True,
-            zero_copy=False,
+            topk_ids,
+            tokens_per_expert,
+            topk_weights,
+            self,
+            async_op,
         )
-        assert weights_nvs is not None and cu_seqlens is not None
-        self._plan = plan
-        self._dispatch_done = done
-        if not async_op:
-            done.wait()
         return MoonEPDispatchResult(
             hidden_states=hidden_nvsh,
             topk_weights=weights_nvs,
             cu_seqlens=cu_seqlens,
             _moonep_invocation=self,
         )
+
+    def _stage_home_weights(self) -> ProjectionPair:
+        """Copy current FSDP BF16 views into this layer's VMM generation."""
+        workspace = self._runtime._workspace
+        assert workspace is not None
+        landings = workspace.landing(self._owner._generation)
+        sources: list[torch.Tensor] = []
+        for linear, landing in zip(
+            (self._owner._experts.fused_w1w3, self._owner._experts.fused_w2),
+            landings,
+        ):
+            source = linear.weight.to_local() if isinstance(linear.weight, DTensor) else linear.weight
+            if source.dtype is not torch.bfloat16 or source.numel() != landing.numel():
+                raise RuntimeError(f"{self._owner.layer_fqn} staging expected an unsharded BF16 expert weight")
+            with torch.no_grad():
+                landing.copy_(source.view_as(landing))
+            sources.append(source)
+        return sources[0], sources[1]
 
     def prepare_experts(
         self,
@@ -296,20 +309,10 @@ class _MoonEPInvocation:
         buffer = runtime._buffer
         assert workspace is not None and buffer is not None and self._plan is not None
 
-        # Staging happens only after the enclosing FSDP layer has exposed its
-        # current BF16 unsharded Parameter views. The subsequent MoonEP
-        # prefetch records a caller-stream event, so these D2D copies are
-        # ordered before remote weights are read without a host wait.
-        landings = workspace.landing(self._owner._generation)
-        with torch.no_grad():
-            for linear, landing in zip(
-                (self._owner._experts.fused_w1w3, self._owner._experts.fused_w2),
-                landings,
-            ):
-                source = linear.weight.to_local() if isinstance(linear.weight, DTensor) else linear.weight
-                if source.dtype is not torch.bfloat16 or source.numel() != landing.numel():
-                    raise RuntimeError(f"{self._owner.layer_fqn} staging expected an unsharded BF16 expert weight")
-                landing.copy_(source.view_as(landing))
+        # FSDP has exposed differentiable BF16 unsharded views at this point.
+        # Staging copies their values but keeps the source tensors as the
+        # native FSDP gradient edge.
+        home_weights = self._stage_home_weights()
 
         local_weights, grad_outputs, weights_ready = workspace.materialize(
             buffer=buffer,
@@ -325,27 +328,21 @@ class _MoonEPInvocation:
         self._dispatch_done.wait()
         local_counts = workspace.local_token_counts(dispatched["cu_seqlens"])
         weights_ready.wait()
+        differentiable_weights = _ExpertWeightAutograd.apply(
+            home_weights[0],
+            home_weights[1],
+            local_weights[0],
+            local_weights[1],
+            self,
+        )
         return MoonEPPostDispatchResult(
             hidden_states=dispatched["hidden_states"],
             tokens_per_expert=local_counts,
-            expert_tensors=(local_weights, grad_outputs),
+            expert_tensors=(differentiable_weights, grad_outputs),
         )
 
     def combine(self, expert_output: torch.Tensor, route_weights: torch.Tensor, *, async_op: bool) -> torch.Tensor:
-        assert self._runtime._buffer is not None and self._plan is not None
-        output, gathered_weights, done = self._runtime._buffer.combine(
-            plan=self._plan,
-            hidden_nvsh=expert_output,
-            hidden_scales_nvs=route_weights,
-            route_weights_nvs=None,
-            async_finish=True,
-            zero_copy=False,
-        )
-        assert gathered_weights is None
-        self._combine_done = done
-        if not async_op:
-            done.wait()
-        return output
+        return _CombineAutograd.apply(expert_output, route_weights, self, async_op)
 
     def wait_combined(self) -> None:
         assert self._combine_done is not None
@@ -357,6 +354,183 @@ class _MoonEPInvocation:
         self._plan = None
         self._dispatch_done = None
         self._combine_done = None
+
+    def _dispatch_backward(
+        self,
+        grad_hidden_nvsh: torch.Tensor,
+        grad_route_weights_nvs: torch.Tensor,
+    ) -> ProjectionPair:
+        """Use forward's plan to combine source hidden/router gradients."""
+        assert self._plan is not None and self._runtime._buffer is not None
+        grad_hidden, grad_route_weights, done = self._runtime._buffer.combine(
+            plan=self._plan,
+            hidden_nvsh=grad_hidden_nvsh.contiguous(),
+            route_weights_nvs=grad_route_weights_nvs.contiguous(),
+            async_finish=True,
+            zero_copy=False,
+        )
+        assert grad_route_weights is not None
+        done.wait()
+        return grad_hidden, grad_route_weights
+
+    def _combine_backward(self, grad_output: torch.Tensor) -> tuple[torch.Tensor, Any]:
+        """Dispatch output gradients and overlap duplicated-weight replay."""
+        runtime = self._runtime
+        workspace = runtime._workspace
+        assert self._plan is not None and runtime._buffer is not None and workspace is not None
+        grad_weighted, no_weights, no_cu, reused_plan, dispatch_done = runtime._buffer.dispatch(
+            grad_output.contiguous(),
+            plan=self._plan,
+            async_finish=True,
+            zero_copy=False,
+        )
+        assert no_weights is None and no_cu is None and reused_plan is self._plan
+
+        # Later routed layers can reuse the same generation. FSDP's layer
+        # pre-backward AllGather has restored this layer's BF16 source view;
+        # stage it again before replaying duplicated weights.
+        self._stage_home_weights()
+        _, _, replay_done = workspace.materialize(
+            buffer=runtime._buffer,
+            plan=self._plan,
+            generation=self._owner._generation,
+            grad_slot=self._grad_slot,
+        )
+        dispatch_done.wait()
+        return grad_weighted, replay_done
+
+    def _complete_weight_gradients(self, local_grads: ProjectionPair) -> ProjectionPair:
+        """Return duplicated BF16 partials before FSDP ReduceScatter."""
+        runtime = self._runtime
+        assert self._plan is not None and runtime._buffer is not None and runtime._workspace is not None
+        home_grads, done = runtime._workspace.complete_gradients(
+            buffer=runtime._buffer,
+            plan=self._plan,
+            local_grads=local_grads,
+            grad_slot=self._grad_slot,
+        )
+        done.wait()
+        return home_grads
+
+
+class _DispatchAutograd(torch.autograd.Function):
+    """Concrete MoonEP dispatch forward paired with combine backward."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        source_hidden: torch.Tensor,
+        topk_ids: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        source_route_weights: torch.Tensor,
+        invocation: _MoonEPInvocation,
+        async_op: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ctx.invocation = invocation
+        buffer = invocation._runtime._buffer_for(source_hidden.shape[0])
+        hidden_nvsh, route_weights_nvs, cu_seqlens, plan, done = buffer.dispatch(
+            source_hidden,
+            route_weights_sk=source_route_weights,
+            topk_experts_sk=topk_ids,
+            tokens_per_expert=tokens_per_expert,
+            async_finish=True,
+            zero_copy=False,
+        )
+        assert route_weights_nvs is not None and cu_seqlens is not None
+        invocation._plan = plan
+        invocation._dispatch_done = done
+        if not async_op:
+            done.wait()
+        ctx.mark_non_differentiable(cu_seqlens)
+        return hidden_nvsh, route_weights_nvs, cu_seqlens
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_hidden_nvsh: torch.Tensor,
+        grad_route_weights_nvs: torch.Tensor,
+        grad_cu_seqlens: None,
+    ) -> tuple[torch.Tensor, None, None, torch.Tensor, None, None]:
+        del grad_cu_seqlens
+        grad_hidden, grad_route_weights = ctx.invocation._dispatch_backward(
+            grad_hidden_nvsh,
+            grad_route_weights_nvs,
+        )
+        return grad_hidden, None, None, grad_route_weights, None, None
+
+
+class _CombineAutograd(torch.autograd.Function):
+    """Fused route-scaled combine forward paired with plan-reuse dispatch."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        expert_output: torch.Tensor,
+        route_weights: torch.Tensor,
+        invocation: _MoonEPInvocation,
+        async_op: bool,
+    ) -> torch.Tensor:
+        ctx.invocation = invocation
+        ctx.save_for_backward(expert_output, route_weights)
+        assert invocation._plan is not None and invocation._runtime._buffer is not None
+        output, gathered_weights, done = invocation._runtime._buffer.combine(
+            plan=invocation._plan,
+            hidden_nvsh=expert_output,
+            hidden_scales_nvs=route_weights,
+            route_weights_nvs=None,
+            async_finish=True,
+            zero_copy=False,
+        )
+        assert gathered_weights is None
+        invocation._combine_done = done
+        if not async_op:
+            done.wait()
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None]:
+        grad_weighted, replay_done = ctx.invocation._combine_backward(grad_output)
+        expert_output, route_weights = ctx.saved_tensors
+        grad_expert, grad_route_weights = route_weight_rows_backward(
+            grad_weighted,
+            expert_output,
+            route_weights,
+        )
+        # The next autograd node immediately reads duplicated weights.
+        replay_done.wait()
+        return grad_expert, grad_route_weights, None, None
+
+
+class _ExpertWeightAutograd(torch.autograd.Function):
+    """Complete two local-[2B] weight gradients as one FSDP transaction."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        home_w1w3: torch.Tensor,
+        home_w2: torch.Tensor,
+        local_w1w3: torch.Tensor,
+        local_w2: torch.Tensor,
+        invocation: _MoonEPInvocation,
+    ) -> ProjectionPair:
+        ctx.invocation = invocation
+        ctx.home_shapes = home_w1w3.shape, home_w2.shape
+        return local_w1w3.view_as(local_w1w3), local_w2.view_as(local_w2)
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_local_w1w3: torch.Tensor,
+        grad_local_w2: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, None, None, None]:
+        home_w1w3_grad, home_w2_grad = ctx.invocation._complete_weight_gradients((grad_local_w1w3, grad_local_w2))
+        return (
+            home_w1w3_grad.reshape(ctx.home_shapes[0]),
+            home_w2_grad.reshape(ctx.home_shapes[1]),
+            None,
+            None,
+            None,
+        )
 
 
 class MoonEPDispatcher(

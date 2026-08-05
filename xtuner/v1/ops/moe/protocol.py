@@ -9,6 +9,8 @@ class GroupGemmProtocol(Protocol):
         x: torch.Tensor,
         weights: torch.Tensor,
         split_sizes: torch.Tensor,
+        *,
+        grad_weight_out: torch.Tensor | None = None,
     ) -> torch.Tensor: ...
 
 

@@ -2,11 +2,14 @@ import unittest
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 from xtuner._testing import DeterministicDDPTestCase
 from xtuner.v1.config import AdamWConfig, FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.engine.train_engine import TrainEngine
+from xtuner.v1.loss import CELossConfig
+from xtuner.v1.model.base import ModelItem
 from xtuner.v1.model.moe.glm52 import Glm52MoEConfig
 from xtuner.v1.model.moe.moe import MoEConfig
 from xtuner.v1.model.moe.qwen3 import Qwen3MoEConfig
@@ -14,7 +17,13 @@ from xtuner.v1.module.attention import DSAMLAConfig, MHAConfig
 from xtuner.v1.module.router import GreedyRouterConfig, NoAuxRouterConfig
 
 
-def _tiny_config(family: str, dispatcher: str, *, compile: bool) -> MoEConfig:
+def _tiny_config(
+    family: str,
+    dispatcher: str,
+    *,
+    compile: bool,
+    router_compute_dtype: str = "float32",
+) -> MoEConfig:
     common = dict(
         vocab_size=256,
         max_position_embeddings=64,
@@ -34,6 +43,7 @@ def _tiny_config(family: str, dispatcher: str, *, compile: bool) -> MoEConfig:
         moe_intermediate_size=1024,
         ep_size=4,
         dispatcher=dispatcher,
+        router_compute_dtype=router_compute_dtype,
         moonep_staging_reference=dispatcher == "moonep",
         balancing_loss_cfg=None,
         compile_cfg=(
@@ -94,6 +104,19 @@ def _tiny_config(family: str, dispatcher: str, *, compile: bool) -> MoEConfig:
 
 @unittest.skipUnless(torch.cuda.device_count() >= 8, "requires 8 CUDA devices")
 class TestMoonEPStagingForward(DeterministicDDPTestCase):
+    @staticmethod
+    def _training_item() -> ModelItem:
+        input_ids = torch.arange(2, 18, device="cuda").view(1, -1)
+        labels = (input_ids + 1) % 256
+        loss_cfg = CELossConfig()
+        loss_ctx = loss_cfg.build(data={"shifted_labels": labels})
+        assert loss_ctx is not None
+        loss_ctx = loss_cfg.loss_ctx_cls.build_batches([loss_ctx])[0]
+        return ModelItem(
+            seq_ctx=SequenceContext.from_input_ids((input_ids,), device="cuda"),
+            loss_ctx={"lm": loss_ctx},
+        )
+
     def _forward(self, family: str, dispatcher: str) -> torch.Tensor:
         torch.manual_seed(20260805)
         engine = TrainEngine(
@@ -145,11 +168,131 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
         moonep = self._forward(family, "moonep")
         torch.testing.assert_close(moonep, expected, rtol=1e-2, atol=1e-2)
 
+    @staticmethod
+    def _selected_training_tensors(engine: TrainEngine, *, gradients: bool) -> dict[str, torch.Tensor]:
+        selected = {}
+        for name, parameter in engine.model.named_parameters():
+            if not any(marker in name for marker in (".experts.", ".shared_experts.", ".gate.")):
+                continue
+            value = parameter.grad if gradients else parameter
+            assert value is not None
+            if isinstance(value, DTensor):
+                value = value.to_local()
+            selected[name] = value.detach().clone()
+        return selected
+
+    def _train_two_steps(
+        self,
+        dispatcher: str,
+    ) -> tuple[list[float], list[torch.Tensor], list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
+        torch.manual_seed(20260805)
+        engine = TrainEngine(
+            model_cfg=_tiny_config("qwen", dispatcher, compile=True),
+            optim_cfg=AdamWConfig(foreach=False),
+            fsdp_cfg=FSDPConfig(ep_size=4, recompute_ratio=0.0, torch_compile=True),
+        )
+        engine.init_model_weights()
+        losses = []
+        grad_norms = []
+        gradients = []
+        try:
+            for _ in range(2):
+                step = engine.train_step([self._training_item()])
+                losses.append(step["total_loss"])
+                grad_norms.append(engine.clip_grad_norm(do_clip=False).detach().clone())
+                gradients.append(self._selected_training_tensors(engine, gradients=True))
+                engine.step_optimizer(grad_norms[-1])
+            parameters = self._selected_training_tensors(engine, gradients=False)
+            return losses, grad_norms, gradients, parameters
+        finally:
+            torch.cuda.synchronize()
+            if dispatcher == "moonep":
+                engine.model.destroy_moonep()
+            del engine
+            torch.cuda.empty_cache()
+            dist.barrier()
+
+    @staticmethod
+    def _assert_training_runs_close(
+        actual: tuple[list[float], list[torch.Tensor], list[dict[str, torch.Tensor]], dict[str, torch.Tensor]],
+        expected: tuple[list[float], list[torch.Tensor], list[dict[str, torch.Tensor]], dict[str, torch.Tensor]],
+    ) -> None:
+        actual_losses, actual_norms, actual_gradients, actual_parameters = actual
+        expected_losses, expected_norms, expected_gradients, expected_parameters = expected
+        torch.testing.assert_close(
+            torch.tensor(actual_losses, device="cuda"),
+            torch.tensor(expected_losses, device="cuda"),
+            rtol=1e-2,
+            atol=1e-3,
+        )
+        for actual_norm, expected_norm in zip(actual_norms, expected_norms):
+            torch.testing.assert_close(actual_norm, expected_norm, rtol=1e-2, atol=1e-3)
+        for actual_step, expected_step in zip(actual_gradients, expected_gradients):
+            assert actual_step.keys() == expected_step.keys()
+            for name in actual_step:
+                torch.testing.assert_close(actual_step[name], expected_step[name], rtol=1e-2, atol=1e-3)
+        assert actual_parameters.keys() == expected_parameters.keys()
+        for name in actual_parameters:
+            torch.testing.assert_close(actual_parameters[name], expected_parameters[name], rtol=1e-2, atol=1e-3)
+
     def test_qwen_fixed_length_fused_expert_forward_matches_deepep(self) -> None:
         self._assert_matches_reference("qwen", "deepep")
 
     def test_glm52_fixed_length_fused_expert_forward_matches_all2all(self) -> None:
         self._assert_matches_reference("glm52", "all2all")
+
+    def test_qwen_backward_updates_routed_expert_fsdp_shards(self) -> None:
+        self.create_pg("cuda")
+        torch.manual_seed(20260805)
+        engine = TrainEngine(
+            model_cfg=_tiny_config("qwen", "moonep", compile=True, router_compute_dtype="native"),
+            optim_cfg=AdamWConfig(foreach=False),
+            fsdp_cfg=FSDPConfig(ep_size=4, recompute_ratio=0.0, torch_compile=True),
+        )
+        engine.init_model_weights()
+        routed_parameter = next(
+            parameter for name, parameter in engine.model.named_parameters() if ".experts." in name
+        )
+        routed_parameter.grad = torch.full_like(routed_parameter, 15)
+        engine.model.scale_and_reduce_grad()
+        torch.testing.assert_close(
+            routed_parameter.grad.to_local(),
+            torch.full_like(routed_parameter.grad.to_local(), 15 / 4),
+            rtol=0,
+            atol=0,
+        )
+        engine.optimizer.zero_grad()
+        before = {
+            name: parameter.to_local().detach().clone()
+            for name, parameter in engine.model.named_parameters()
+            if ".experts." in name
+        }
+
+        try:
+            step = engine.train_step([self._training_item()])
+            assert torch.isfinite(torch.tensor(step["total_loss"], device="cuda"))
+            routed = {name: parameter for name, parameter in engine.model.named_parameters() if ".experts." in name}
+            assert routed
+            assert all(parameter.grad is not None for parameter in routed.values())
+            assert all(torch.isfinite(parameter.grad.to_local()).all() for parameter in routed.values())
+
+            grad_norm = engine.clip_grad_norm(do_clip=False)
+            engine.step_optimizer(grad_norm)
+            assert any(not torch.equal(before[name], parameter.to_local()) for name, parameter in routed.items())
+        finally:
+            torch.cuda.synchronize()
+            engine.model.destroy_moonep()
+            del engine
+            torch.cuda.empty_cache()
+            dist.barrier()
+
+    def test_qwen_two_step_training_matches_deepep(self) -> None:
+        self.create_pg("cuda")
+        expected = self._train_two_steps("deepep")
+        actual = self._train_two_steps("moonep")
+        repeated = self._train_two_steps("moonep")
+        self._assert_training_runs_close(actual, expected)
+        self._assert_training_runs_close(repeated, actual)
 
     @property
     def world_size(self) -> int:

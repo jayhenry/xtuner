@@ -208,3 +208,84 @@ staging、remote prefetch 和 dispatch 的依赖全部通过 CUDA event/device b
 - dense prefix 不注册 dispatcher、不占 generation；shared experts/gate 保持原路径；全 dense 配置在 workspace allocation 前失败。
 - staging 是数值参考路径并明确 warning；Issue 05 将用 direct FSDP landing 替换逐 forward 的完整权重 copy。
 - 结论：Issue 03 已跑通 staging forward tracer，保留 BF16 FSDP 参数身份、原 grouped-GEMM 计算和无 host sync 契约。
+
+# 2026-08-05_05-31-05_XTuner_BF16训练反向与FSDP梯度归还
+
+完成 Issue 04：`_DispatchAutograd`、`_CombineAutograd` 和 `_ExpertWeightAutograd` 将 MoonEP concrete communication、saved-plan backward、local `[2B]` grouped GEMM 与 FSDP home Parameter edge 连接为完整训练链路。Triton `k_grouped_gemm_out` 直接覆盖 invocation-owned BF16 dW 槽；fused route-weight backward 同时产生 BF16 expert-row gradient 与 FP32 route gradient。主要改动位于 `xtuner/v1/module/dispatcher/moonep.py`、`xtuner/v1/ops/moe/cuda/{group_gemm.py,route_weight.py,triton_kernels/}`、`xtuner/v1/module/{grouped_linear,decoder_layer}/` 和对应测试。
+
+## 关键单测
+
+- direct-output grouped GEMM：eager 与 `torch.compile(fullgraph=True)` 均直接覆盖调用方 BF16 target；empty expert 行从旧值/NaN 确定性写零，输出、dX、dW 与 PyTorch reference 对齐。
+- fused route derivative：逐位验证 BF16 `grad_expert`，并以 FP32 reference 验证 `grad_route=dot(grad_weighted, raw_expert_output)`。
+- 真实 BF16 FSDP2×EP4 compiled training：MoonEP 连续两个 optimizer steps 的 loss、global grad norm、全部 routed/shared/router gradient shards 和 updated parameter shards，与 DeepEP 在 `rtol=1e-2, atol=1e-3` 内一致；独立 MoonEP run 同样复现。
+- native-router cast：真实训练把 BF16 router weights 转为 MoonEP FP32 communication weights，梯度仍返回 BF16 router graph；所有 routed expert 分片得到有限梯度并更新。
+- asymmetric exact SUM：EP4 各 rank 产生 `1/2/4/8` partial，home BF16 结果逐位等于 `15`；真实 `MoE.scale_and_reduce_grad()` 只执行既有一次 `/4`，FP32 shard 等于 `15/4`。
+- slot reuse 红测：两个 layer invocation 复用同一物理 dW slot 时，后层 mutable write 不再使前层 AOT saved tensor 版本失效；无 gradient payload allocation/copy。
+- no-host-sync 与回归：MoonEP 5 个真实 EP4 workspace/async profiler tests 全部通过；dispatcher/backends/grouped-linear 为 `14 passed, 1 skipped`；Qwen/GLM no-grad forward 继续通过。
+
+## 类/接口设计和主要改动
+
+```mermaid
+classDiagram
+    class _MoonEPInvocation {
+        +dispatch(...) Result
+        +prepare_experts(...) ExpertTensorBundle
+        +combine(...) Tensor
+        -_dispatch_backward(dHidden, dRoute) Gradients
+        -_combine_backward(dOutput) DispatchedGrad, Event
+        -_complete_weight_gradients(local2B) HomeGradients
+    }
+    class _DispatchAutograd {
+        +forward(source, route, invocation) dispatched
+        +backward(dDispatched) dSource, dRoute
+    }
+    class _CombineAutograd {
+        +forward(expert, route, invocation) combined
+        +backward(dCombined) dExpert, dRoute
+    }
+    class _ExpertWeightAutograd {
+        +forward(home, local2B, invocation) local2B
+        +backward(dLocal2B) dHome
+    }
+    class GroupedGemm {
+        +forward(x, weight, counts, grad_weight_out) y
+        +backward(dY) dX, dW
+    }
+    _MoonEPInvocation --> _DispatchAutograd : owns saved plan
+    _MoonEPInvocation --> _CombineAutograd : reuses saved plan
+    _MoonEPInvocation --> _ExpertWeightAutograd : completes two projections
+    _ExpertWeightAutograd --> GroupedGemm : receives direct BF16 dW slots
+```
+
+三个 private Function 各自内聚一对 forward/backward，不新增 facade。`_MoonEPInvocation` 是唯一保存 plan、events、generation 与 grad slot 的 per-call Deep Class；Runtime/Dispatcher 不保存 `last_plan`。
+
+## 类交互和主要改动
+
+```mermaid
+sequenceDiagram
+    participant C as CombineAutograd
+    participant M as MoonEP Buffer
+    participant R as Route backward kernel
+    participant G as Grouped GEMM backward
+    participant W as ExpertVMMWorkspace
+    participant F as FSDP
+    C->>M: saved-plan dispatch(dOutput)
+    C->>W: replay duplicated weights
+    M-->>R: dispatched BF16 row gradients
+    R-->>G: BF16 dExpert + FP32 dRoute
+    W-->>G: replay completion event
+    G->>W: direct write two local 2B dW slots
+    W->>M: BF16 owner exact SUM
+    M-->>F: completed BF16 home gradients
+    F->>F: BF16 ReduceScatter to FP32 shards
+```
+
+replay 与 route derivative 可重叠，仅在 grouped-GEMM 即将读取 duplicated weights 前插入 device event wait。每个 materialization 对复用的 VMM dW storage 创建 fresh Tensor/version-counter alias；它不分配或复制 payload，只解决 AOT 对跨 layer mutable alias 的版本跟踪。
+
+## 其他重要细节
+
+- MoonEP-mod 提交：`ba3c1bc fix: isolate reused gradient slot aliases`。
+- routed dtype 流程保持 `FP32 shard → BF16 AG/compute/dW → BF16 duplicate return/ReduceScatter → FP32 shard gradient → /ep_size → FP32 optimizer`；MoonEP exact SUM 不做 average。
+- shared experts/gate 未进入 VMM，继续使用原 BF16 FSDP ReduceScatter 与 FP32 EP-replica mean AllReduce。
+- backward 只复用 forward plan，不重新 planning；staging reference 在 FSDP pre-backward AG 后重新填充可能被后续 generation 覆盖的 home landing。
+- 结论：Issue 04 已建立不依赖 engine post-backward callback 的完整 staging training 数值基准，并保持 compile 与无 host sync 契约。

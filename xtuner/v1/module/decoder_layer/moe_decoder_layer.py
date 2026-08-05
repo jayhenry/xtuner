@@ -194,12 +194,13 @@ class MoEBlock(nn.Module):
         self.moe_act = moe_act_fn_cfg.build()
 
     def forward(self, x, tokens_per_expert, decoding, *, expert_tensors=None):
-        weights = expert_tensors[0] if expert_tensors is not None else (None, None)
+        weights, grad_outputs = expert_tensors if expert_tensors is not None else ((None, None), (None, None))
         gate_up_out = self.fused_w1w3(
             x,
             tokens_per_expert,
             decoding,
             weight_override=weights[0],
+            grad_weight_out=grad_outputs[0],
         )
         out = self.moe_act(gate_up_out, split_dim=-1)
         res = self.fused_w2(
@@ -207,6 +208,7 @@ class MoEBlock(nn.Module):
             tokens_per_expert,
             decoding,
             weight_override=weights[1],
+            grad_weight_out=grad_outputs[1],
         )
         return res
 
