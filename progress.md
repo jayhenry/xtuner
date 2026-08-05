@@ -66,3 +66,65 @@ flowchart LR
 - MoonEP-mod commit：`0be637d feat: add XTuner MoonEP forward integration API`。
 - 正式 backward API 与 BF16 duplicated-gradient return 留给 Issue 02；本 issue 不提前混入训练梯度语义。
 - 结论：Issue 01 的 forward capability、显式 EP topology、VMM alias 与无 host sync 异步契约均已由真实多 GPU public tests 固化。
+
+# 2026-08-05_03-38-56_MoonEP_BF16梯度环与Duplicate_Return
+
+完成 Issue 02：`ExpertVMMWorkspace` 按调用方给定的 Domino width 分配两块 fused projection 的 BF16 gradient-slot ring，`Buffer.reduce_grad()` 新增正式 BF16 路径，并由 CUDA owner kernel 将所有 duplicated partials 执行 FP32 累加、一次 BF16 舍入的 EP-local SUM。旧 FP32 reduce-grad 接口保持兼容。
+
+## 关键单测
+
+- 两个 gradient slots：验证 BF16、连续 `[2B,O,I]`、storage 独立、slot 越界及错配 slot 拒绝；输出 target 可被生产者直接覆盖，无完整 dW copy。
+- BF16 owner SUM：真实远端 VMM reads 使用可区分 partials，逐位比较 rank-major/slot-major FP32 累加后的一次 BF16 舍入，并能检测 BF16 逐项舍入和错误 averaging。
+- 真实 8-GPU EP2/EP4/EP8：覆盖 local、remote、empty、skew、同一 expert 多 rank partials；两个 slots 先后生产、逆序完成，并跨 step 复用 slot 0。
+- non-default caller stream：gradient target 写入、owner SUM、suffix 清零和消费者只通过 returned CUDA event 排序；profiler 未发现 host scalar 或 CUDA synchronize。
+- 回归：2-GPU integration suite 为 `12 passed, 3 skipped`；原有 8-GPU E2E 通过；旧 FP32 grad-reduce suite 为 `12 passed`。
+
+## 类/接口设计和主要改动
+
+```mermaid
+classDiagram
+    class ExpertVMMWorkspace {
+        +materialize(buffer, plan, generation, grad_slot) Weights, GradTargets, Event
+        +complete_gradients(buffer, plan, local_grads, grad_slot) HomeGrads, Event
+        -local_grad_outputs : N x 2 projections x 2B
+        -distributed_duplicate_grads : N x 2 projections x R x B
+    }
+    class Buffer {
+        +reduce_grad(local_grads, distributed_duplicate_grads, accumulation_dtype)
+        +reduce_grad(legacy_fp32_args)
+    }
+    class bf16_grad_reduce_home {
+        +launch(local_2B, distributed_RB, plan, rank, num_sms)
+        -accumulator : FP32 registers
+        -input_output : BF16
+    }
+    ExpertVMMWorkspace --> Buffer : complete_gradients
+    Buffer --> bf16_grad_reduce_home : two projections
+```
+
+每个 slot 的 home `[B]` 与 duplicate `[B]` 分别拥有 physical allocation，再映射为 grouped-GEMM 可直接写入的 contiguous local `[2B]`；所有 ranks 的 duplicate chunks 另映射为 owner 可读的 distributed `[R,B]`。ring 大小只等于 `gradient_slots`，不随 layer、MTP depth 或 route 动态扩容。
+
+## 类交互和主要改动
+
+```mermaid
+flowchart LR
+    A["Caller stream: grouped dW writes local 2B"] --> B["input-ready event"]
+    B --> C["MoonEP comm stream"]
+    C --> D["device EP barrier: publish all duplicate writes"]
+    D --> E["BF16 remote reads + FP32 ordered SUM"]
+    E --> F["single BF16 home write"]
+    F --> G["device EP barrier: fence all readers"]
+    G --> H["fixed duplicate suffix clear"]
+    H --> I["completion event"]
+    I --> J["FSDP-facing home BF16 consumer"]
+```
+
+两个 barrier 都是 GPU-side EP synchronization：第一个保证 owner 不会读取尚未完成的 remote dW，第二个保证任何 rank 清理本地 suffix 前，其他 owners 已完成 remote reads。清理固定 `[B:]`，不查询 plan scalar、不按 route 决定 host launch。
+
+## 其他重要细节
+
+- MoonEP-mod commit：`df548b0 feat: return duplicated expert gradients in BF16`。
+- 新 binding 位于 `csrc/bf16_grad_reduce.cuh`；plan 先固定搬入 block shared memory，数据存储和 NVLink traffic 全程 BF16，只有寄存器 accumulator 为 FP32。
+- 当前机器默认 `/usr/local/cuda` 为 12.8；重建与 PyTorch 13.2 匹配的 extension 时显式使用环境内 `nvidia/cu13` 作为 `CUDA_HOME`，editable module 与 `_C` 均确认来自 `MoonEP-mod`。
+- `M_g=0` 行由后续 XTuner direct-output grouped-GEMM 对所有固定 groups 的覆盖写负责；workspace 不增加整块 memset 或 completion-time clone。
+- 结论：Issue 02 已建立可直接交给后续 XTuner expert autograd/FSDP handoff 的 BF16 gradient completion boundary，同时保留旧 FP32 reference path。
