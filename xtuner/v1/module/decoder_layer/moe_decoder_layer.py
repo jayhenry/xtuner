@@ -312,6 +312,9 @@ class MoEDecoderLayer(nn.Module):
         process_group = ep_mesh.get_group() if ep_mesh is not None else None
         tp_group = expert_tp_mesh.get_group() if expert_tp_mesh is not None else None
         ep_tp_group = ep_tp_mesh._flatten().get_group() if ep_tp_mesh is not None else None
+        # EP membership is static for the layer. Keep the decision outside the
+        # compiled forward; Naive EP=1 execution retains its synchronous API.
+        self._async_combine = process_group is not None and process_group.size() > 1
         self.dispatcher = build_dispatcher(
             dispatcher=dispatcher,
             n_routed_experts=n_routed_experts,
@@ -464,6 +467,7 @@ class MoEDecoderLayer(nn.Module):
             pre_dispatched=pre_dispatched,
             dispatched=dispatched,
             post_dispatched=post_dispatched,
+            async_op=self._async_combine,
             decoding=False,
         )
 
@@ -472,14 +476,24 @@ class MoEDecoderLayer(nn.Module):
             dispatched=dispatched,
             post_dispatched=post_dispatched,
             pre_combined=pre_combined,
+            async_op=self._async_combine,
             decoding=False,
         )
+
+        # EP combine 已经在通信流上异步启动；共享专家在默认流计算，只在
+        # routed + shared 相加前建立设备侧依赖，不引入 host sync。
+        if self.n_shared_experts > 0:
+            shared_experts_out = self._shared_experts_forward(hidden_states=hidden_states)
+        else:
+            shared_experts_out = None
+
         post_combined = self.dispatcher.combine_postprocess(
             pre_dispatched=pre_dispatched,
             dispatched=dispatched,
             post_dispatched=post_dispatched,
             pre_combined=pre_combined,
             combined=combined,
+            async_op=self._async_combine,
         )
         combined_hidden_states = post_combined["hidden_states"]
         combined_hidden_states = combined_hidden_states.view(*origin_shape)
@@ -488,11 +502,6 @@ class MoEDecoderLayer(nn.Module):
         # combined_hidden_states = self._hf_expert_forward_for_debug(hidden_states, router_results, origin_shape)
 
         # ProberList.after_combine(self.layer_idx, combined_hidden_states)
-
-        if self.n_shared_experts > 0:
-            shared_experts_out = self._shared_experts_forward(hidden_states=hidden_states)
-        else:
-            shared_experts_out = None
 
         hidden_states = self._post_moe_forward(
             combined_hidden_states=combined_hidden_states,

@@ -368,3 +368,80 @@ forward 和 pre-backward AllGather 都经过同一 final-output binding，因此
 - profiler 曾在整个 `TrainEngine.train_step()` 范围实测到 loss/logging 的 `.item()`、CPU `.to()` 与 `nonzero()` host sync；这些是既有 trainer 行为。缩小到 production MoonEP ranges 后同步计数为 0，未用白名单掩盖 MoonEP 调用。
 - dtype 流程保持 `FP32 shard -> BF16 AG/direct landing/compute/dW/duplicate return/RS -> FP32 shard grad -> FP32 optimizer update`；DCP 仍只观察 FSDP-owned Parameter/optimizer identity。
 - 结论：Issue 05 已把 staging tracer 升级为 production direct FSDP-to-VMM 路径，并由真实连续训练、数值对照、private-invariant 与 profiler gate共同固化无完整权重 copy、无 full-dW temporary 和 MoonEP 热路径无 host sync。
+
+# 2026-08-05_07-06-17_Domino_MTP_SP与Compile执行矩阵
+
+完成 Issue 06：MoonEP 正式路径支持 Domino micro1/micro2、MTP shared/unshared、reentrant original/replay、SP2/4/8、shared-expert overlap 和 `torch.compile`。`MoE.forward()` 在首个 MoonEP operation 前校验 trainer-resolved width；`MoEDecoderLayer` 对 EP dispatcher 异步启动 routed combine，并只在 routed/shared 相加前建立 device wait。主要改动位于 `xtuner/v1/model/moe/moe.py`、`xtuner/v1/module/decoder_layer/moe_decoder_layer.py` 与 `tests/engine/test_moonep_forward.py`。
+
+## 关键单测
+
+- 完整 MoonEP engine 文件：16 个真实 8-GPU 测试全部通过（487.85s），覆盖 BF16 FSDP2×EP4、Direct landing、compile、两层 routed tiny model、三步 optimizer 与 DeepEP 数值对照。
+- Domino ring：同一 public model 先执行 width1 forward-only、再执行 width2 三步训练；identical micro2 的 loss、grad norm 与 routed dW 精确等于 micro1 的两倍；width3 在 capacity2 下于首个 MoonEP op 前报错。
+- MTP：`share_weights=False/True, num_layers=2` 均完成两次 fixed-S `eval()+no_grad()`、三步 reentrant training/replay；main loss、MTP loss 和 global grad norm 与 DeepEP 在 `rtol=1e-2` 内一致。
+- Shared expert：`n_shared_experts=0/1`、shared gate 均得到有限梯度；独立构造各 rank 梯度后，shared gate 仍以 FP32 得到每个 EP4 row 的精确 mean。
+- SP matrix：SP2 与 EP4 部分重叠、SP4 等于 EP4、SP8 包含 EP4，三种真实训练均与同 mesh 的 DeepEP loss/grad norm 对齐，并完成 routed gradient 与 optimizer 检查。
+- Profiler：MTP shared + micro2 + reentrant + SP4 + EP4 + compile 的 MoonEP ranges 内，CUDA host synchronize、完整 home-weight copy、完整 local-dW materialization 均为 0；tiny pack length 32 的实测 peak allocated 为 0.185 GiB/rank，并设置 1 GiB 回归上限。
+- Dispatcher contract 回归为 `9 passed`；既有 pytree EP2 micro2 checkpoint 测试通过。两个 checkpoint-based engine 文件因未设置 `QWEN3_MOE_PATH`/`GLM5_2_TINY_MOE_PATH` 无法 collection；GLM EP1 shared-MTP compile 测试在 decoder 完全恢复 HEAD 后仍复现既有 `_pre_moe_forward missing self`，确认不是本 issue 引入。
+
+## 类/接口设计和主要改动
+
+```mermaid
+classDiagram
+    class MoE {
+        +forward(seq_ctx, loss_ctx) MoEModelOutputs
+        -_moonep_runtime : MoonEPRuntime
+        -config.intra_layer_micro_batch : int
+    }
+    class MoEDecoderLayer {
+        +forward(hidden_states, seq_ctx) tuple
+        -_async_combine : bool
+        -_shared_experts_forward(hidden_states) Tensor
+    }
+    class MoonEPRuntime {
+        -intra_layer_micro_batch : int
+        -home_generations : 2
+        -gradient_slots : N
+    }
+    class MoonEPDispatcher {
+        +dispatch(...) MoonEPDispatchResult
+        +combine(...) MoonEPCombineResult
+    }
+    class _MoonEPInvocation {
+        -plan
+        -grad_slot
+        -dispatch_done
+        -combine_done
+    }
+    MoE --> MoonEPRuntime : validates Domino capacity
+    MoEDecoderLayer --> MoonEPDispatcher : six-stage async calls
+    MoonEPDispatcher --> _MoonEPInvocation : fresh per logical call/replay
+    _MoonEPInvocation --> MoonEPRuntime : fixed ring and two generations
+```
+
+没有新增 facade 或 mode-specific controller。model-scoped Runtime 继续隐藏固定资源，per-call Invocation 继续隐藏 plan/events/slot；新增状态只有 decoder 构造期解析的 `_async_combine` 常量，Naive EP1 保持同步接口。
+
+## 类交互和主要改动
+
+```mermaid
+flowchart LR
+    A["Trainer resolves width N"] --> B["MoE public forward validates width <= N"]
+    B --> C["Each logical microbatch creates fresh Invocation"]
+    C --> D["Dispatch + fresh device plan"]
+    D --> E["Direct generation landing + fixed grad slot"]
+    E --> F["Grouped expert compute"]
+    F --> G["Async routed combine on comm stream"]
+    G --> H["Shared expert/gate on default stream"]
+    H --> I["Device event wait before routed + shared"]
+    I --> J["Reentrant replay creates another fresh Invocation"]
+    J --> K["BF16 duplicate return + FSDP ReduceScatter"]
+```
+
+MTP shared weights 只注册一个 physical routed layer，logical depth 与 replay 仍逐次创建 Invocation；unshared MTP 注册多个 physical layers并沿 FSDP 顺序交替 generation。SP 只在进入 model 前切分 sequence，MoonEP 固定 S 因而只看到 post-SP local tokens，不增加 full-sequence collective。
+
+## 其他重要细节
+
+- tiny fallback 配置为 3 层（dense prefix 1 + routed 2）、8 experts、top2、hidden 512、pack length 16/32；满足 Direct landing、BF16 duplicated-gradient return、compile 与至少三步 optimizer 的组合验收。
+- 两次 forward-only 调用会在 combine device dependency 入队后释放 Python plan references；随后的 training original 与 backward replay 均重新 planning，不复用过期 Invocation。
+- DeepEP/MoonEP 的 BF16 forward 舍入会经后续 router 放大，因此多层跨 dispatcher 不逐元素判 dW；loss/grad norm 对齐，gradient finite/nonzero，而 slot 累加用相同输入的 micro1/micro2 精确测试独立固化。
+- dtype 流程未改变：FP32 shard 参数经 BF16 AllGather、BF16 compute/dW/duplicate return/ReduceScatter 后形成 FP32 shard gradient，再由 FP32 optimizer 更新。
+- 结论：Issue 06 已把 Direct tracer 扩展到 XTuner 的 Domino、MTP、SP 和 compile 正式执行矩阵，同时保持固定资源、fresh invocation、shared FP32 mean、无完整 copy 与 MoonEP 热路径无 host sync。

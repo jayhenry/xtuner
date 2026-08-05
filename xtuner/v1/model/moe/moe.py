@@ -507,6 +507,11 @@ class MoE(BaseModel):
             assert isinstance(loss_ctx, list) and len(loss_ctx) == len(seq_ctx), (
                 "seq_ctx_list and loss_ctx_list must be lists of the same length"
             )
+            if self._moonep_runtime is not None and len(seq_ctx) > self.config.intra_layer_micro_batch:
+                raise ValueError(
+                    f"MoonEP Domino width {len(seq_ctx)} exceeds configured capacity "
+                    f"{self.config.intra_layer_micro_batch}"
+                )
             if loss_ctx is None:
                 raise NotImplementedError("loss_ctx must be provided for intra-layer bsz > 1")
 
