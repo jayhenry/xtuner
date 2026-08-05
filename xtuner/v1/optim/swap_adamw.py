@@ -1,6 +1,8 @@
 from collections.abc import Iterable
+from typing import Any
 
 import torch
+from torch.distributed.tensor import DTensor
 from torch.optim.adam import adam as torch_adam
 
 from xtuner.v1.utils import get_device, get_logger, get_torch_device_module
@@ -98,6 +100,59 @@ class SwapAdamW(torch.optim.AdamW):
                 self._param_to_cpu_states_map[param] = cpu_state
 
         DEVICE_MODULE.synchronize()
+
+    def state_dict(self) -> dict[str, Any]:
+        """Expose sharding metadata without changing live CPU ownership.
+
+        DCP identifies optimizer shards from DTensor placements. The live swap moments are intentionally plain local
+        CPU tensors, so this persistence view wraps a temporary device copy with the owning parameter's layout.
+        """
+        state_dict = super().state_dict()
+        for saved_group, live_group in zip(state_dict["param_groups"], self.param_groups, strict=True):
+            for parameter_id, param in zip(saved_group["params"], live_group["params"], strict=True):
+                saved_state = dict(state_dict["state"][parameter_id])
+                state_dict["state"][parameter_id] = saved_state
+                if not isinstance(param, DTensor):
+                    continue
+                for key in self._state_keys:
+                    value = saved_state.get(key)
+                    if not isinstance(value, torch.Tensor):
+                        continue
+                    local_value = self._to_local_tensor(value).to(device=param.device)
+                    saved_state[key] = DTensor.from_local(
+                        local_value,
+                        device_mesh=param.device_mesh,
+                        placements=param.placements,
+                        shape=param.shape,
+                        stride=param.stride(),
+                    )
+        return state_dict
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore loaded moments to the canonical pinned-CPU storage.
+
+        ``Optimizer.load_state_dict`` follows each parameter's device and may
+        materialize moments on CUDA. SwapAdamW must re-establish its stronger
+        invariant and refresh the buffers used by ``step()`` after every load.
+        """
+        super().load_state_dict(state_dict)
+        for param in self._param_to_group_map:
+            param_state = self.state[param]
+            cpu_state: dict[str, torch.Tensor | None] = {}
+            for key in self._state_keys:
+                loaded = param_state.get(key)
+                if loaded is None:
+                    cpu_state[key] = None
+                    continue
+                local_loaded = self._to_local_tensor(loaded)
+                canonical = local_loaded.detach().to(device="cpu").pin_memory()
+                param_state[key] = canonical
+                cpu_state[key] = canonical
+
+            step = param_state.get("step")
+            if isinstance(step, torch.Tensor):
+                param_state["step"] = self._to_local_tensor(step).detach().to(device="cpu")
+            self._param_to_cpu_states_map[param] = cpu_state
 
     @torch.no_grad()
     def step(self, closure=None):

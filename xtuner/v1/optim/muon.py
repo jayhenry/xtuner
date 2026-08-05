@@ -389,13 +389,16 @@ class Muon(Optimizer):
         else:
             self._newton_schulz_func = zeropower_via_newtonschulz5
 
-        # Ensure every parameter has a state entry so that state_dict()
-        # includes all params.  Without this, params that never receive a
-        # gradient (e.g. frozen biases) would be missing from the saved
-        # state, causing KeyError on resume.
+        # DCP reconstructs optimizer state from the fresh optimizer's schema.
+        # Materialize that schema before the first step so a checkpoint can be
+        # loaded into a cold runtime without silently dropping tensor states.
+        # zeros_like preserves each FSDP/EP DTensor placement.
         for group in self.param_groups:
             for p in group["params"]:
-                _ = self.state[p]
+                state = self.state[p]
+                state["momentum"] = torch.zeros_like(p)
+                if group["algorithm"] == "adamw":
+                    state["variance"] = torch.zeros_like(p)
 
         # Pre-create sub-group process groups for MoE sub-group all-gather optimization.
         # This must happen in __init__ so that all ranks call dist.new_group collectively.
@@ -464,8 +467,7 @@ class Muon(Optimizer):
         return loss
 
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
-        """Get optimizer state for the given parameter tensor, or lazy-
-        initialize it if it doesn't exist."""
+        """Return state, initializing parameters added after construction."""
         state = self.state[param]
         if "momentum" not in state:
             state["momentum"] = torch.zeros_like(param)

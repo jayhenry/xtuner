@@ -445,3 +445,84 @@ MTP shared weights 只注册一个 physical routed layer，logical depth 与 rep
 - DeepEP/MoonEP 的 BF16 forward 舍入会经后续 router 放大，因此多层跨 dispatcher 不逐元素判 dW；loss/grad norm 对齐，gradient finite/nonzero，而 slot 累加用相同输入的 micro1/micro2 精确测试独立固化。
 - dtype 流程未改变：FP32 shard 参数经 BF16 AllGather、BF16 compute/dW/duplicate return/ReduceScatter 后形成 FP32 shard gradient，再由 FP32 optimizer 更新。
 - 结论：Issue 06 已把 Direct tracer 扩展到 XTuner 的 Domino、MTP、SP 和 compile 正式执行矩阵，同时保持固定资源、fresh invocation、shared FP32 mean、无完整 copy 与 MoonEP 热路径无 host sync。
+
+# 2026-08-05_08-00-00_DCP_HF_Offload_Optimizer与Runtime生命周期
+
+完成 Issue 07：Direct MoonEP 继续只把 FSDP-owned Parameter/optimizer shard 作为持久化身份，VMM landing、Buffer、Invocation、plan、event 和 gradient slot 均为瞬态执行状态。`TrainEngine.close()` 统一等待异步 DCP/HF、销毁 MoonEP、释放异步保存资源；`SwapAdamW` 与 `Muon` 修复 cold-resume 所需的 optimizer state schema。主要改动位于 `xtuner/v1/engine/train_engine.py`、`xtuner/v1/model/base.py`、`xtuner/v1/train/trainer.py`、`xtuner/v1/optim/{swap_adamw,muon}.py` 和 `tests/engine/test_moonep_persistence.py`。
+
+## 关键单测
+
+- 新增 10 个真实 BF16 FSDP2×EP4 public-path tests，全部通过（308.25s）：同步/异步 DCP cold resume、同步/异步 HF fresh load、activation/router offload、SwapAdamW/Muon 两步与 DCP resume、close 幂等/关闭后失败、rank-divergent destructor。
+- DCP resume 逐项比较 checkpoint 时刻以及下一步的 model/optimizer shards，并比较 loss 与 global grad norm；async DCP/HF 在继续训练后仍恢复保存调用时的不可变 snapshot，`close()` 返回时 future 已完成。
+- checkpoint metadata 明确不含 MoonEP workspace、landing、invocation、gradient slot 或 event；fresh runtime 在首次 forward 前 load，首次 FSDP AllGather 再填充 Direct landing。
+- activation offload on/off 的 loss、grad norm、updated shards 逐位一致；router async offload 只改变 detached logging tensors 的 device，训练结果逐位一致。
+- 既有 MoonEP dispatcher tests 为 `2 passed`；Trainer async-checkpoint lifecycle test 为 `1 passed`；Ruff、compileall 与 `git diff --check` 通过。
+
+## 类/接口设计和主要改动
+
+```mermaid
+classDiagram
+    class Trainer {
+        +fit() None
+    }
+    class TrainEngine {
+        -_pending_async_saves : Future[]
+        -_closed : bool
+        +async_save_dcp(path) Future
+        +async_save_hf(path) Future
+        +close() None
+        -_ensure_open() None
+    }
+    class BaseModel {
+        +destroy_moonep() None
+    }
+    class MoE {
+        +destroy_moonep() None
+    }
+    class SwapAdamW {
+        +state_dict() Dict
+        +load_state_dict(state) None
+    }
+    class Muon {
+        -state[param].momentum
+        -state[param].variance
+    }
+    Trainer --> TrainEngine : coordinated terminal close
+    TrainEngine --> BaseModel : polymorphic MoonEP destroy
+    BaseModel <|-- MoE
+    TrainEngine --> SwapAdamW : DCP-owned state
+    TrainEngine --> Muon : DCP-owned state
+```
+
+没有新增 MoonEP checkpoint/optimizer adapter。`TrainEngine` 只负责执行资源的统一终点；`BaseModel.destroy_moonep()` 是非 MoE model 的 no-op hook，MoE override 释放既有 Runtime。SwapAdamW 的 persistence view 临时恢复 DTensor placement metadata，load 后重新建立 pinned-CPU canonical state；Muon 在构造时用 `zeros_like` 建立 cold-load schema。
+
+## 类交互和主要改动
+
+```mermaid
+sequenceDiagram
+    participant T as Trainer
+    participant E as TrainEngine
+    participant S as Async DCP or HF
+    participant M as MoE MoonEP Runtime
+    participant F as FSDP bindings
+    T->>S: wait trainer monitor
+    T->>T: all ranks quiescent barrier
+    T->>E: close()
+    E->>S: Future.result for all pending saves
+    E->>M: destroy Buffer
+    M->>F: restore target-instance bindings
+    M->>M: disconnect aliases and unmap workspace
+    E->>E: destroy async HF and DCP resources
+    E-->>T: closed
+```
+
+正常路径在所有 rank 的训练与异步写入均静止后进入 collective teardown；重复 `close()` 无操作，关闭后的 TrainEngine/model forward 明确报错。异常路径的 `__del__` 只发 `ResourceWarning`，不进入 barrier、CUDA synchronize、VMM unmap 或 process-group destroy。
+
+## 其他重要细节
+
+- dtype/ownership 未改变：checkpoint 观察 FP32 FSDP shards；运行时仍是 `FP32 shard -> BF16 AG/direct landing/compute/dW/duplicate return/RS -> FP32 shard grad -> FP32 optimizer update`。
+- `SwapAdamW.state_dict()` 的 DTensor 只是 checkpoint-time persistence view，live moments 始终以 pinned CPU tensor 为 canonical owner；`load_state_dict()` 会刷新 step 实际读取的 CPU buffer map。
+- Muon cold load 的真实根因是 PyTorch optimizer unflatten 只按 fresh optimizer 已存在的 state keys 恢复；构造期 materialization 保留 DTensor placement，并未在 MoonEP 路径按 optimizer type 分支。
+- MoonEP Runtime/config/tests 中未引入 DSA top-k cache；router training 的 ids、weights 与 counts 保持 device-resident。
+- 既有 `TestMuonFSDP` 数值 tolerance 在改动回退后仍可独立复现失败，确认不是本 Issue 引入；既有 async-HF hook 测试因当前环境未安装 FlashAttention 而在分布式退出阶段挂起，已由本 Issue 的真实 async-HF fresh-load test 覆盖目标行为。
+- 结论：Issue 07 已完成 Direct MoonEP 的持久化、offload、optimizer 与显式 lifecycle 闭环，并保持 FSDP 唯一参数所有权和异常路径无 collective cleanup。
