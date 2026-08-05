@@ -120,9 +120,22 @@ def _create_windowed_grouped_causal_mask(document_ids, window_size):
 
 
 @lru_cache
-def create_packing_block_causal_mask(seq_lens: torch.Tensor, window_size=(-1, -1), causal=True) -> BlockMask:
-    document_ids = _get_document_ids_from_seq_lens(seq_lens)
-    _, max_seq_len = document_ids.shape
+def create_packing_block_causal_mask(
+    seq_lens: torch.Tensor,
+    sequence_length: int,
+    window_size=(-1, -1),
+    causal=True,
+) -> BlockMask:
+    lengths = seq_lens[1:] - seq_lens[:-1]
+    # ``output_size`` is the Q shape already known by the caller. Supplying it
+    # keeps repeat_interleave entirely on device and avoids both a stream sync
+    # and one Dynamo/SymPy subgraph per packed document.
+    document_ids = torch.repeat_interleave(
+        torch.arange(lengths.numel(), dtype=torch.long, device=lengths.device),
+        lengths,
+        output_size=sequence_length,
+    )[None]
+    max_seq_len = sequence_length
 
     def mask_mod(b, h, q_idx, kv_idx):
         causal_mask = q_idx >= kv_idx
@@ -138,7 +151,14 @@ def create_packing_block_causal_mask(seq_lens: torch.Tensor, window_size=(-1, -1
             document_causal_mask = document_causal_mask & window_mask
         return document_causal_mask
 
-    return create_block_causal_mask_flex(mask_mod, None, None, max_seq_len, max_seq_len)
+    return create_block_causal_mask_flex(
+        mask_mod,
+        None,
+        None,
+        max_seq_len,
+        max_seq_len,
+        device=str(seq_lens.device),
+    )
 
 
 def eager_attention(
@@ -212,7 +232,12 @@ def flex_attention(
     else:
         score_mod_fn = score_mod
 
-    mask = create_packing_block_causal_mask(cu_seqlens_q, window_size=window_size, causal=causal)
+    mask = create_packing_block_causal_mask(
+        cu_seqlens_q,
+        sequence_length=q.shape[-2],
+        window_size=window_size,
+        causal=causal,
+    )
     enable_gqa = k.size(1) != q.size(1)
 
     raw_output, softmax_lse = compile_friendly_flex_attention(
