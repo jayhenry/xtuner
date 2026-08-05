@@ -1,5 +1,6 @@
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -61,6 +62,15 @@ dispatcher = build_dispatcher(None, n_routed_experts=4)
 assert isinstance(dispatcher, NaiveDispatcher)
 """
     subprocess.run([sys.executable, "-c", source], check=True, capture_output=True, text=True)
+
+
+def test_fully_shard_private_api_is_isolated_to_the_landing_module() -> None:
+    dispatcher_dir = Path(__file__).parents[3] / "xtuner" / "v1" / "module" / "dispatcher"
+    users = [
+        path.name for path in dispatcher_dir.glob("*.py") if "torch.distributed.fsdp._fully_shard" in path.read_text()
+    ]
+
+    assert users == ["fsdp_vmm_landing.py"]
 
 
 def test_existing_dispatcher_keeps_public_preprocess_behavior() -> None:

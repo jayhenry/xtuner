@@ -23,6 +23,7 @@ def _tiny_config(
     *,
     compile: bool,
     router_compute_dtype: str = "float32",
+    staging_reference: bool | None = None,
 ) -> MoEConfig:
     common = dict(
         vocab_size=256,
@@ -44,7 +45,7 @@ def _tiny_config(
         ep_size=4,
         dispatcher=dispatcher,
         router_compute_dtype=router_compute_dtype,
-        moonep_staging_reference=dispatcher == "moonep",
+        moonep_staging_reference=False if staging_reference is None else staging_reference,
         balancing_loss_cfg=None,
         compile_cfg=(
             {"xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEBlock.forward": {"fullgraph": True}}
@@ -184,10 +185,17 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
     def _train_two_steps(
         self,
         dispatcher: str,
+        *,
+        staging_reference: bool | None = None,
     ) -> tuple[list[float], list[torch.Tensor], list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
         torch.manual_seed(20260805)
         engine = TrainEngine(
-            model_cfg=_tiny_config("qwen", dispatcher, compile=True),
+            model_cfg=_tiny_config(
+                "qwen",
+                dispatcher,
+                compile=True,
+                staging_reference=staging_reference,
+            ),
             optim_cfg=AdamWConfig(foreach=False),
             fsdp_cfg=FSDPConfig(ep_size=4, recompute_ratio=0.0, torch_compile=True),
         )
@@ -293,6 +301,92 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
         repeated = self._train_two_steps("moonep")
         self._assert_training_runs_close(actual, expected)
         self._assert_training_runs_close(repeated, actual)
+
+    def test_qwen_direct_landing_matches_staging_training(self) -> None:
+        self.create_pg("cuda")
+        staging = self._train_two_steps("moonep", staging_reference=True)
+        direct = self._train_two_steps("moonep", staging_reference=False)
+        self._assert_training_runs_close(direct, staging)
+
+    def test_qwen_direct_hot_path_has_no_full_weight_copy_or_host_sync(self) -> None:
+        self.create_pg("cuda")
+
+        def profile_mode(staging_reference: bool) -> tuple[int, int, list[str]]:
+            torch.manual_seed(20260805)
+            engine = TrainEngine(
+                model_cfg=_tiny_config(
+                    "qwen",
+                    "moonep",
+                    compile=True,
+                    staging_reference=staging_reference,
+                ),
+                optim_cfg=AdamWConfig(foreach=False),
+                fsdp_cfg=FSDPConfig(ep_size=4, recompute_ratio=0.0, torch_compile=True),
+            )
+            engine.init_model_weights()
+            try:
+                # Compile/autotune before profiling so their setup-only CUDA
+                # synchronization cannot be confused with the steady hot path.
+                engine.train_step([self._training_item()])
+                grad_norm = engine.clip_grad_norm(do_clip=False)
+                engine.step_optimizer(grad_norm)
+
+                with torch.profiler.profile(
+                    activities=(torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA),
+                    record_shapes=True,
+                ) as profiler:
+                    engine.train_step([self._training_item()])
+
+                full_home_shapes = {(2, 2048, 512), (2, 512, 1024)}
+                full_local_dw_shapes = {(4, 2048, 512), (4, 512, 1024)}
+                full_weight_copies = 0
+                full_dw_materializations = 0
+                host_syncs: list[str] = []
+                for event in profiler.events():
+                    tensor_shapes = {
+                        tuple(shape)
+                        for shape in event.input_shapes
+                        if isinstance(shape, list) and all(isinstance(dim, int) for dim in shape)
+                    }
+                    if event.name == "aten::copy_" and tensor_shapes & full_home_shapes:
+                        full_weight_copies += 1
+                    if event.name in {"aten::clone", "aten::copy_", "aten::zeros_like"} and (
+                        tensor_shapes & full_local_dw_shapes
+                    ):
+                        full_dw_materializations += 1
+
+                    parent = event.cpu_parent
+                    inside_gate = False
+                    while parent is not None:
+                        if parent.name.startswith("MoonEP::"):
+                            inside_gate = True
+                            break
+                        parent = parent.cpu_parent
+                    if inside_gate and event.name in {
+                        "cudaDeviceSynchronize",
+                        "cudaEventSynchronize",
+                        "cudaStreamSynchronize",
+                    }:
+                        ancestry = []
+                        parent = event.cpu_parent
+                        while parent is not None:
+                            ancestry.append(parent.name)
+                            parent = parent.cpu_parent
+                        host_syncs.append(f"{event.name} <- {' <- '.join(ancestry)}")
+                return full_weight_copies, full_dw_materializations, host_syncs
+            finally:
+                torch.cuda.synchronize()
+                engine.model.destroy_moonep()
+                del engine
+                torch.cuda.empty_cache()
+                dist.barrier()
+
+        staging_copies, _, _ = profile_mode(True)
+        direct_copies, direct_dw_materializations, direct_host_syncs = profile_mode(False)
+        assert staging_copies > 0  # Calibrates the shape-based copy detector.
+        assert direct_copies == 0
+        assert direct_dw_materializations == 0
+        assert direct_host_syncs == [], direct_host_syncs
 
     @property
     def world_size(self) -> int:

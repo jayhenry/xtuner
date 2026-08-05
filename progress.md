@@ -289,3 +289,82 @@ replay 与 route derivative 可重叠，仅在 grouped-GEMM 即将读取 duplica
 - shared experts/gate 未进入 VMM，继续使用原 BF16 FSDP ReduceScatter 与 FP32 EP-replica mean AllReduce。
 - backward 只复用 forward plan，不重新 planning；staging reference 在 FSDP pre-backward AG 后重新填充可能被后续 generation 覆盖的 home landing。
 - 结论：Issue 04 已建立不依赖 engine post-backward callback 的完整 staging training 数值基准，并保持 compile 与无 host sync 契约。
+
+# 2026-08-05_05-48-39_Direct_FSDP到VMM与无Host_Sync
+
+完成 Issue 05：新增版本锁定的 `fsdp_vmm_landing` Deep Module，使 FSDP2 fused AllGather 的最终 per-parameter unpack 直接写入 MoonEP 双 generation VMM landing；原生 FSDP 仍管理 Parameter identity、SHARDED/UNSHARDED 切换、BF16 ReduceScatter 和 FP32 optimizer shard。正式路径不再复制完整 home weight，staging 仅作为显式 warning reference。主要改动位于 `xtuner/v1/module/dispatcher/{fsdp_vmm_landing.py,moonep.py}` 及对应 contract/engine tests。
+
+## 关键单测
+
+- TDD 红测首先确认 `moonep_staging_reference=False` 在真实 BF16 FSDP2×EP4 compiled 两步训练中因 direct adapter 缺失而失败；实现后转绿。
+- production direct 对 DeepEP：Qwen tiny 的 output、loss、global grad norm、router/routed/shared gradient shards 和更新后 FP32 parameter shards 在既定容差内一致；GLM tiny forward 与 All2All 一致。
+- direct 对 staging：独立建模并连续训练两个 optimizer steps，比较两步 loss、grad norm、全部 selected gradients 和 updated shards。
+- profiler calibration：staging 能检测到完整 `[B,O,I]` `aten::copy_`；direct 同形 copy 为 0，local `[2B,O,I]` dW clone/copy/zeros-like 为 0。
+- profiler host-sync gate：warmup compile 后检查 `MoonEP::dispatch_forward/prepare_experts/combine_forward/combine_backward/dispatch_backward/gradient_handoff`，未发现 `cudaDevice/Event/StreamSynchronize`。
+- contract：XTuner dispatcher 目录仅 `fsdp_vmm_landing.py` 导入 `_fully_shard` private API；非 FSDP target 的 direct 安装明确失败、销毁 workspace，且不回退 staging。
+- 回归结果：完整 8-GPU engine 文件为 `6 passed`；dispatcher contract/六阶段行为为 `9 passed`；Ruff 与 `git diff --check` 通过。
+
+## 类/接口设计和主要改动
+
+```mermaid
+classDiagram
+    class MoonEPRuntime {
+        +install_fsdp(model, config, staging_reference) None
+        +destroy() None
+        -fsdp_params : tuple
+        -staging_reference : bool
+    }
+    class fsdp_vmm_landing {
+        +install_fsdp_vmm_landing(model, targets) FSDPParams
+        +fsdp_current_unsharded_expert_weights(experts) ProjectionPair
+        +uninstall_fsdp_vmm_landing(params) None
+        -init_direct_all_gather_outputs(...)
+        -keep_direct_all_gather_storage(...)
+    }
+    class FSDPParam {
+        +init_all_gather_outputs(...)
+        +alloc_all_gather_outputs()
+        +free_unsharded_param()
+        +init_unsharded_param()
+    }
+    class ExpertVMMWorkspace {
+        +landing(generation) ProjectionPair
+    }
+    MoonEPRuntime --> fsdp_vmm_landing : direct install/current view/uninstall
+    fsdp_vmm_landing --> FSDPParam : target-instance methods only
+    ExpertVMMWorkspace --> fsdp_vmm_landing : fixed external landing
+```
+
+`fsdp_vmm_landing.py` 是唯一理解目标 PyTorch private layout 的模块，没有新增 adapter class。Installer 通过 FSDP 保存的 `(module identity, parameter name)` 精确选择 routed `fused_w1w3.weight` 与 `fused_w2.weight`；只给这些 instances 绑定三个 storage lifecycle methods，原生 `init_unsharded_param()` 和 Parameter switching 保持不变。
+
+## 类交互和主要改动
+
+```mermaid
+sequenceDiagram
+    participant F as FSDP2
+    participant A as fsdp_vmm_landing
+    participant V as VMM landing
+    participant M as MoonEP
+    participant G as Grouped GEMM
+    F->>A: init_all_gather_outputs(metadata)
+    A-->>F: landing.flatten as final out
+    F->>V: split_with_sizes_copy(out=landing)
+    F->>F: init_unsharded_param + Parameter switch
+    M->>A: current unsharded expert views
+    A-->>M: BF16 views aliasing landing
+    M->>G: local 2B weights + direct dW slots
+    G->>M: BF16 local 2B partials
+    M->>M: duplicate owner SUM
+    M-->>F: BF16 home gradient on Parameter edge
+    F->>F: BF16 ReduceScatter then FP32 shard gradient
+```
+
+forward 和 pre-backward AllGather 都经过同一 final-output binding，因此每次自动刷新该 physical routed layer 的 ordinal generation；dense/shared layers不注册 target，也不占 generation。MoonEP 调用只读取已经 unsharded 的 current view，不主动触发 AllGather；通信依赖继续由 CUDA event 和 GPU-side EP barrier 排序。
+
+## 其他重要细节
+
+- 安装前固定校验 PyTorch `2.12.1+cu132`、dim-0 contiguous、无 padding、单一默认 AllGather output、无 post-AllGather extension、BF16 dtype、device/numel 以及首次 AG 前状态；invariant 改变会明确报错。
+- direct 的 `alloc_all_gather_outputs()`/`free_unsharded_param()` 对 external VMM storage 为 no-op，禁止原生 `resize_`；卸载在 FSDP idle boundary 先公开 `reshard()`，再删除 unsharded alias、landing metadata 和 instance methods，最后才 unmap workspace。
+- profiler 曾在整个 `TrainEngine.train_step()` 范围实测到 loss/logging 的 `.item()`、CPU `.to()` 与 `nonzero()` host sync；这些是既有 trainer 行为。缩小到 production MoonEP ranges 后同步计数为 0，未用白名单掩盖 MoonEP 调用。
+- dtype 流程保持 `FP32 shard -> BF16 AG/direct landing/compute/dW/duplicate return/RS -> FP32 shard grad -> FP32 optimizer update`；DCP 仍只观察 FSDP-owned Parameter/optimizer identity。
+- 结论：Issue 05 已把 staging tracer 升级为 production direct FSDP-to-VMM 路径，并由真实连续训练、数值对照、private-invariant 与 profiler gate共同固化无完整权重 copy、无 full-dW temporary 和 MoonEP 热路径无 host sync。

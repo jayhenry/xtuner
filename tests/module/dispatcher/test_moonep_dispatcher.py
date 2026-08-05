@@ -208,3 +208,41 @@ def test_staging_dispatcher_runs_the_public_six_stage_forward_seam(backend) -> N
             topk_ids=torch.zeros(4, 2, dtype=torch.int64),
             topk_weights=torch.full((4, 2), 0.5),
         )
+
+
+def test_direct_install_failure_is_explicit_and_never_falls_back_to_staging(backend) -> None:
+    ep_group = SimpleNamespace(size=lambda: 2)
+    runtime = MoonEPRuntime(
+        ep_group=ep_group,
+        hidden_size=128,
+        intermediate_size=128,
+        num_experts=4,
+        top_k=2,
+        intra_layer_micro_batch=1,
+    )
+    experts = _Experts()
+    build_dispatcher(
+        dispatcher="moonep",
+        n_routed_experts=4,
+        ep_group=ep_group,
+        training_dtype="bf16",
+        generate_dtype="bf16",
+        moonep_runtime=runtime,
+        layer_fqn="layers.0.experts",
+        experts=experts,
+    )
+
+    with pytest.raises(RuntimeError, match="could not find FSDPParam"):
+        runtime.install_fsdp(
+            fully_sharded_model=experts,
+            fsdp_config=SimpleNamespace(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
+                requires_grad=True,
+                cpu_offload=False,
+                reshard_after_forward=True,
+            ),
+            staging_reference=False,
+        )
+
+    assert _Workspace.allocated[-1].destroyed
