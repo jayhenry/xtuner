@@ -150,12 +150,19 @@ class TrainEngine:
         fsdp_cfg: FSDPConfig,
         intra_layer_micro_batch: int = 1,
     ) -> None:
+        if intra_layer_micro_batch < 1:
+            raise ValueError("intra_layer_micro_batch must be positive")
+        self.intra_layer_micro_batch = intra_layer_micro_batch
+        execution_cfg = getattr(model_cfg, "text_config", model_cfg)
+        if getattr(execution_cfg, "dispatcher", None) == "moonep":
+            # Resolve the one execution-width scalar before meta model build;
+            # model code never receives TrainerConfig or a duplicate width.
+            setattr(execution_cfg, "intra_layer_micro_batch", intra_layer_micro_batch)
         self.model_cfg = model_cfg
         self.optim_cfg = optim_cfg
         self.fsdp_cfg = fsdp_cfg
         self.model = self.build_model()
         self.optimizer = self.build_optimizer(optim_cfg)
-        self.intra_layer_micro_batch = intra_layer_micro_batch
         self._count = 0
         self.has_freeze_params = self.__has_freeze_params()
         self._async_checkpoint_pg: dist.ProcessGroup | None = None

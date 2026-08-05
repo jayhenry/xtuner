@@ -28,14 +28,34 @@ logger = get_logger()
 # TODO: (yehaochen) This interface declaration does not follow the Liskov Substitution Principle.
 # Maybe we should find a better way to handle the dispatchers.
 def build_dispatcher(
-    dispatcher: Literal["deepep", "all2all", "agrs"] | None,
+    dispatcher: Literal["deepep", "all2all", "agrs", "moonep"] | None,
     n_routed_experts: int,
     ep_group: dist.ProcessGroup | None = None,
     tp_group: dist.ProcessGroup | None = None,
     ep_tp_group: dist.ProcessGroup | None = None,
     training_dtype: Literal["bf16", "fp8"] = "bf16",
     generate_dtype: Literal["bf16", "fp8"] = "bf16",
+    *,
+    moonep_runtime=None,
+    layer_fqn: str | None = None,
+    experts=None,
 ) -> DispacherInterface:
+    if dispatcher == "moonep":
+        if ep_group is None or ep_group.size() not in (2, 4, 8):
+            raise ValueError("MoonEP requires ep_size in {2, 4, 8}")
+        if n_routed_experts % ep_group.size():
+            raise ValueError("MoonEP requires n_routed_experts divisible by ep_size")
+        if training_dtype != "bf16" or generate_dtype != "bf16":
+            raise ValueError("MoonEP v1 supports BF16 expert execution only")
+        if os.environ.get("XTUNER_USE_CUTLASS_GROUP_GEMM", "0") == "1":
+            raise ValueError("MoonEP requires the device-count Triton grouped GEMM backend")
+        if moonep_runtime is None or layer_fqn is None or experts is None:
+            raise ValueError("MoonEP runtime, layer_fqn, and experts are required")
+        return moonep_runtime.dispatcher_for(
+            layer_fqn=layer_fqn,
+            experts=experts,
+        )  # type: ignore[return-value]
+
     if ep_group is None or ep_group.size() == 1:
         if dispatcher is not None:
             log_rank0.warning(f"{dispatcher} will not be used because the ep group is None.")
@@ -93,7 +113,9 @@ def build_dispatcher(
             generate_dtype=generate_dtype,
         )  # type: ignore[return-value]
     else:
-        raise ValueError(f"Unknown dispatcher name: {dispatcher}, name must be one of 'deepep' or 'all2all'.")
+        raise ValueError(
+            f"Unknown dispatcher name: {dispatcher}, name must be one of 'deepep', 'all2all', 'agrs', or 'moonep'."
+        )
 
 
 __all__ = [

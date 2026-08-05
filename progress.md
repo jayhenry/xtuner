@@ -128,3 +128,83 @@ flowchart LR
 - 当前机器默认 `/usr/local/cuda` 为 12.8；重建与 PyTorch 13.2 匹配的 extension 时显式使用环境内 `nvidia/cu13` 作为 `CUDA_HOME`，editable module 与 `_C` 均确认来自 `MoonEP-mod`。
 - `M_g=0` 行由后续 XTuner direct-output grouped-GEMM 对所有固定 groups 的覆盖写负责；workspace 不增加整块 memset 或 completion-time clone。
 - 结论：Issue 02 已建立可直接交给后续 XTuner expert autograd/FSDP handoff 的 BF16 gradient completion boundary，同时保留旧 FP32 reference path。
+
+# 2026-08-05_05-01-57_XTuner_Staging_Forward端到端链路
+
+完成 Issue 03：XTuner 新增可选的 `dispatcher="moonep"`、model-scoped `MoonEPRuntime`、per-forward `_MoonEPInvocation` 和六阶段 `MoonEPDispatcher`。Router 统一传递 device-resident `tokens_per_expert`；原生 FSDP 安装后才分配 VMM workspace，并通过显式 `moonep_staging_reference` 将完整 BF16 home expert 权重复制到 landing。主要改动位于 `xtuner/v1/module/dispatcher/moonep.py`、`xtuner/v1/model/moe/moe.py`、`xtuner/v1/module/decoder_layer/moe_decoder_layer.py`、`xtuner/v1/module/grouped_linear/moe_group_linear.py` 和对应测试。
+
+## 关键单测
+
+- backend contract：验证 lazy optional import、integration API/capability、module source、固定 PyTorch 版本和 meta-only validation。
+- dispatcher public API：验证 staging 显式开关与 warning、Fixed-S、双 generation、六阶段结果以及 completion event 顺序。
+- 原有 grouped GEMM public API：验证 `weight_override` 接收 local `[2B]` fused weights，默认 Parameter 路径不变。
+- 真实 8-GPU compiled forward：Qwen-compatible tiny 模型在 BF16 FSDP2×EP4 下与 DeepEP 对齐，并连续运行四次 MoonEP no-grad forward；GLM5.2 tiny 模型与 All2All 对齐。
+- 非 MoonEP 回归：NoEP、DeepEP、All2All、AGRS 的统一 `tokens_per_expert` seam 通过，合计 `14 passed, 1 skipped`。
+- MoonEP-mod peer-skew 回归：在一个 rank 的 landing copy 前注入 GPU-only 延迟，确认 prefetch 不会读取上一 generation 的远端旧权重；profiler 继续排除 `.item()` 和 CUDA host synchronization。
+
+## 类/接口设计和主要改动
+
+```mermaid
+classDiagram
+    class MoonEPRuntime {
+        +dispatcher_for(layer_fqn, experts) MoonEPDispatcher
+        +install_fsdp(model, fsdp_config, staging_reference) None
+        +destroy() None
+        -buffer : Buffer
+        -workspace : ExpertVMMWorkspace
+        -fixed_tokens_per_rank : int
+    }
+    class MoonEPDispatcher {
+        +dispatch_preprocess(...) MoonEPPreDispatchResult
+        +dispatch(...) MoonEPDispatchResult
+        +dispatch_postprocess(...) MoonEPPostDispatchResult
+        +combine_preprocess(...) MoonEPPreCombineResult
+        +combine(...) MoonEPCombineResult
+        +combine_postprocess(...) MoonEPPostCombineResult
+    }
+    class _MoonEPInvocation {
+        +dispatch(...) Result
+        +prepare_experts(...) ExpertTensorBundle
+        +combine(...) Tensor
+        +wait_combined() None
+        +finish_forward_only() None
+    }
+    class GroupedLinear {
+        +forward(x, tokens_per_expert, weight_override) Tensor
+    }
+    MoonEPRuntime --> MoonEPDispatcher : registers physical routed layers
+    MoonEPDispatcher --> _MoonEPInvocation : creates per forward
+    _MoonEPInvocation --> GroupedLinear : supplies local 2B tensors
+```
+
+`MoonEPRuntime` 隐藏 model/EP-group 资源和 Fixed-S 生命周期；`_MoonEPInvocation` 隐藏一次 dispatch/combine 的 plan 与 device events；decoder 仅消费六阶段 TypedDict 和显式 tensor bundle，不按 backend 分支执行专家计算。
+
+## 类交互和主要改动
+
+```mermaid
+sequenceDiagram
+    participant R as Router
+    participant D as MoonEPDispatcher
+    participant W as ExpertVMMWorkspace
+    participant G as GroupedLinear
+    participant B as MoonEP Buffer
+    R->>D: hidden, topk ids/weights, tokens_per_expert
+    D->>B: dispatch(async event)
+    D->>W: stage BF16 FSDP views into home landing
+    W->>W: GPU EP barrier, prefetch remote duplicates
+    W-->>D: local 2B weights, direct grad targets, event
+    D->>G: ExpertTensorBundle
+    G-->>D: local expert output
+    D->>B: route-scaled combine
+    B-->>D: completion event
+```
+
+staging、remote prefetch 和 dispatch 的依赖全部通过 CUDA event/device barrier 排序。真实 peer-skew 复现定位到远端 rank landing 尚未发布的竞态，因此 MoonEP-mod 在 prefetch 前增加已有的 GPU inter-rank barrier；热路径未增加 host sync。
+
+## 其他重要细节
+
+- MoonEP-mod 修复提交：`4b3aefe fix: synchronize staged weights before prefetch`。
+- `intra_layer_micro_batch` 由 Trainer 在 model build 前只传入一个 scalar；未传递整个 TrainerConfig。
+- dense prefix 不注册 dispatcher、不占 generation；shared experts/gate 保持原路径；全 dense 配置在 workspace allocation 前失败。
+- staging 是数值参考路径并明确 warning；Issue 05 将用 direct FSDP landing 替换逐 forward 的完整权重 copy。
+- 结论：Issue 03 已跑通 staging forward tracer，保留 BF16 FSDP 参数身份、原 grouped-GEMM 计算和无 host sync 契约。

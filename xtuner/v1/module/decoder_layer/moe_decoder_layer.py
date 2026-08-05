@@ -193,10 +193,21 @@ class MoEBlock(nn.Module):
         )
         self.moe_act = moe_act_fn_cfg.build()
 
-    def forward(self, x, tokens_per_expert, decoding):
-        gate_up_out = self.fused_w1w3(x, tokens_per_expert, decoding)
+    def forward(self, x, tokens_per_expert, decoding, *, expert_tensors=None):
+        weights = expert_tensors[0] if expert_tensors is not None else (None, None)
+        gate_up_out = self.fused_w1w3(
+            x,
+            tokens_per_expert,
+            decoding,
+            weight_override=weights[0],
+        )
         out = self.moe_act(gate_up_out, split_dim=-1)
-        res = self.fused_w2(out, tokens_per_expert, decoding)
+        res = self.fused_w2(
+            out,
+            tokens_per_expert,
+            decoding,
+            weight_override=weights[1],
+        )
         return res
 
 
@@ -229,10 +240,12 @@ class MoEDecoderLayer(nn.Module):
         moe_act_fn_cfg: MoEActFnConfig,
         float8_cfg: Float8Config | None = None,
         layer_idx: int = 0,
-        dispatcher: Literal["deepep", "all2all", "agrs"] | None,
+        dispatcher: Literal["deepep", "all2all", "agrs", "moonep"] | None,
         ep_mesh: DeviceMesh | None = None,
         expert_tp_mesh: DeviceMesh | None = None,
         ep_tp_mesh: DeviceMesh | None = None,
+        moonep_runtime=None,
+        layer_fqn: str | None = None,
     ):
         super().__init__()
         self.ep_mesh = ep_mesh
@@ -305,6 +318,9 @@ class MoEDecoderLayer(nn.Module):
             ep_tp_group=ep_tp_group,
             training_dtype="fp8" if float8_cfg is not None else "bf16",
             generate_dtype=generate_config.dtype if generate_config is not None else "bf16",
+            moonep_runtime=moonep_runtime,
+            layer_fqn=layer_fqn,
+            experts=self.experts,
         )
 
     def forward(
@@ -433,6 +449,7 @@ class MoEDecoderLayer(nn.Module):
             post_dispatched["hidden_states"],
             post_dispatched["tokens_per_expert"],
             decoding=False,
+            expert_tensors=post_dispatched.get("expert_tensors"),
         )
         # ProberList.before_combine(
         #     self.layer_idx,
@@ -558,6 +575,7 @@ class MoEDecoderLayer(nn.Module):
                 post_dispatched["hidden_states"],
                 post_dispatched["tokens_per_expert"],
                 decoding=False,
+                expert_tensors=post_dispatched.get("expert_tensors"),
             )
 
             pre_combined = self.dispatcher.combine_preprocess(

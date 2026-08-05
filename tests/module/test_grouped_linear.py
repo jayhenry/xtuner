@@ -5,6 +5,7 @@ TestGroupedLinearFactory
 """
 
 import pytest
+import torch
 
 from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 from xtuner.v1.float8.float8_gmm_tile_wise import ADAPTIVEGEMM_INSTALLED, TileWiseFloat8GroupedLinear
@@ -42,3 +43,23 @@ class TestGroupedLinearFactory:
         )
 
         assert type(layer) is expected_type
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_grouped_linear_uses_invocation_weight_override_without_parameter_swap() -> None:
+    layer = GroupedLinear(in_features=128, out_features=128, num_routed_experts=2).cuda().bfloat16()
+    original_parameter = layer.weight
+    override = torch.randn(2, 128, 128, device="cuda", dtype=torch.bfloat16)
+    hidden_states = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+    counts = torch.tensor([2, 2], device="cuda", dtype=torch.int32)
+
+    output = layer(hidden_states, counts, weight_override=override)
+    expected = torch.cat(
+        (
+            hidden_states[:2] @ override[0].T,
+            hidden_states[2:] @ override[1].T,
+        )
+    )
+
+    assert layer.weight is original_parameter
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)

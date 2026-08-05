@@ -159,9 +159,22 @@ class GroupedLinear(nn.Module):
                 else:
                     self.bias = nn.Parameter(bias)
 
-    def forward(self, x: torch.Tensor, tokens_per_expert: torch.Tensor, decoding: bool = False):
-        weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
-        weight = weight.view(-1, self.local_out_features, self.local_in_features)
+    def forward(
+        self,
+        x: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        decoding: bool = False,
+        *,
+        weight_override: torch.Tensor | None = None,
+    ):
+        # MoonEP supplies a contiguous local [home B, duplicate B] VMM alias.
+        # Keeping this as a call-scoped override preserves the FSDP Parameter
+        # identity and avoids a module-wide ``.data`` swap.
+        if weight_override is None:
+            weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+            weight = weight.view(-1, self.local_out_features, self.local_in_features)
+        else:
+            weight = weight_override
         out = group_gemm(x, weight, tokens_per_expert)
 
         if self.moe_bias:

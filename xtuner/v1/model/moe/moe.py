@@ -148,7 +148,14 @@ class MoEConfig(TransformerConfig):
     moe_intermediate_size: Annotated[int, Parameter(group="moe")]
     ep_size: Annotated[int, Parameter(group="moe")] = 1
     expert_tp_size: Annotated[int, Parameter(group="moe")] = 1
-    dispatcher: Annotated[Literal["deepep", "all2all", "agrs"] | None, Parameter(group="moe")] = None
+    dispatcher: Annotated[Literal["deepep", "all2all", "agrs", "moonep"] | None, Parameter(group="moe")] = None
+    # Staging keeps the native FSDP unsharded tensor and copies its BF16 home
+    # experts into MoonEP VMM after AllGather. It is an explicit bring-up path;
+    # production direct landing is installed by the later FSDP adapter.
+    moonep_staging_reference: bool = False
+    # TrainEngine resolves this scalar before model build. MoonEP uses it to
+    # size per-invocation resources without depending on TrainerConfig.
+    intra_layer_micro_batch: int = 1
     router: GreedyRouterConfig | NoAuxRouterConfig
     balancing_loss_cfg: BalancingLossConfig | None = BalancingLossConfig()
     z_loss_cfg: ZLossConfig | None = None
@@ -238,6 +245,23 @@ class MoE(BaseModel):
             self.ep_mesh = None
             self.expert_tp_mesh = None
             self.ep_tp_mesh = None
+
+        self._moonep_runtime = None
+        if config.dispatcher == "moonep":
+            if self.ep_mesh is None:
+                raise ValueError("MoonEP requires expert parallelism")
+            if config.moe_bias:
+                raise ValueError("MoonEP does not support routed-expert linear bias")
+            from xtuner.v1.module.dispatcher.moonep import MoonEPRuntime
+
+            self._moonep_runtime = MoonEPRuntime(
+                ep_group=self.ep_mesh.get_group(),
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                num_experts=config.n_routed_experts,
+                top_k=config.num_experts_per_tok,
+                intra_layer_micro_batch=config.intra_layer_micro_batch,
+            )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, type=config.rms_norm_type)
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, bias=False)
@@ -1040,6 +1064,8 @@ class MoE(BaseModel):
                     ep_mesh=self.ep_mesh,
                     expert_tp_mesh=self.expert_tp_mesh,
                     ep_tp_mesh=self.ep_tp_mesh,
+                    moonep_runtime=self._moonep_runtime,
+                    layer_fqn=f"layers.{layer_idx}.experts",
                 )
                 if self.config.freeze_routers:
                     layers[str(layer_idx)].gate.requires_grad_(False)
@@ -1107,6 +1133,8 @@ class MoE(BaseModel):
                 ep_mesh=self.ep_mesh,
                 expert_tp_mesh=self.expert_tp_mesh,
                 ep_tp_mesh=self.ep_tp_mesh,
+                moonep_runtime=self._moonep_runtime,
+                layer_fqn=f"mtp_block.layers.{i}.decoder_layer.experts",
             )
 
             # Wrap decoder layer in MTPLayer
@@ -1319,6 +1347,12 @@ class MoE(BaseModel):
 
         self._init_load_spec()
         self._to_empty_meta()
+        if self._moonep_runtime is not None:
+            self._moonep_runtime.install_fsdp(
+                fully_sharded_model=self,
+                fsdp_config=fsdp_config,
+                staging_reference=self.config.moonep_staging_reference,
+            )
         return self
 
     @property
@@ -1328,6 +1362,11 @@ class MoE(BaseModel):
             return MOE_EP_COMPILE_CFG
         else:
             return MOE_NON_EP_COMPILE_CFG
+
+    def destroy_moonep(self) -> None:
+        """Release optional MoonEP execution resources before PG teardown."""
+        if self._moonep_runtime is not None:
+            self._moonep_runtime.destroy()
 
     @property
     def need_update_bias(self) -> bool:
