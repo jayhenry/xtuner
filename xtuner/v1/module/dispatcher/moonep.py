@@ -74,6 +74,7 @@ class MoonEPRuntime:
         num_experts: int,
         top_k: int,
         intra_layer_micro_batch: int,
+        num_sms: int = 64,
     ) -> None:
         self._backend = require_moonep_backend()
         if intra_layer_micro_batch < 1:
@@ -85,6 +86,7 @@ class MoonEPRuntime:
         self._num_experts = num_experts
         self._top_k = top_k
         self._intra_layer_micro_batch = intra_layer_micro_batch
+        self._num_sms = num_sms
 
         # This is deliberately the complete meta-build action.  The backend
         # validates kernel metadata here but cannot create CUDA/VMM/socket
@@ -208,6 +210,7 @@ class MoonEPRuntime:
                 num_ep_ranks=self._ep_group.size(),
                 group=self._ep_group,
                 explicitly_destroy=True,
+                num_sms=self._num_sms,
                 # FSDP collectives use the caller stream.  Giving MoonEP the
                 # same device-side launch order prevents orthogonal EP/FSDP
                 # progress waves without introducing a host synchronization.

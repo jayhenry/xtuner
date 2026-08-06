@@ -26,12 +26,14 @@ class _Buffer:
         group,
         explicitly_destroy,
         use_caller_stream,
+        num_sms,
     ):
         self.S = S
         self.K = K
         self.E = E
         self.B = E // num_ep_ranks
         self.use_caller_stream = use_caller_stream
+        self.num_sms = num_sms
         self.destroyed = False
 
     def dispatch(
@@ -214,6 +216,7 @@ def test_staging_dispatcher_runs_the_public_six_stage_forward_seam(backend) -> N
     assert post["expert_tensors"][0][0].shape == (4, 256, 128)
     assert torch.equal(result["hidden_states"], hidden_states * 0.5)
     assert runtime._buffer.use_caller_stream is True
+    assert runtime._buffer.num_sms == 64
 
     with pytest.raises(RuntimeError, match="fixed S changed"):
         dispatcher.dispatch_preprocess(

@@ -153,6 +153,10 @@ class MoEConfig(TransformerConfig):
     # experts into MoonEP VMM after AllGather. It is an explicit bring-up path;
     # production direct landing is installed by the later FSDP adapter.
     moonep_staging_reference: bool = False
+    # MoonEP reserves this many SMs for its communication kernels.  The
+    # H200 acceptance workload is measurably faster at 64 than its upstream
+    # default of 32; keep it model-scoped so other deployments can tune it.
+    moonep_num_sms: int = 64
     # TrainEngine resolves this scalar before model build. MoonEP uses it to
     # size per-invocation resources without depending on TrainerConfig.
     intra_layer_micro_batch: int = 1
@@ -261,6 +265,7 @@ class MoE(BaseModel):
                 num_experts=config.n_routed_experts,
                 top_k=config.num_experts_per_tok,
                 intra_layer_micro_batch=config.intra_layer_micro_batch,
+                num_sms=config.moonep_num_sms,
             )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, type=config.rms_norm_type)

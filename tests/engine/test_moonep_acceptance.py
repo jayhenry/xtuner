@@ -54,6 +54,7 @@ def test_qwen35_acceptance_config_locks_the_formal_workload(monkeypatch, tmp_pat
     assert model.text_config.ep_size == 4
     assert model.text_config.dispatcher == backend
     assert model.text_config.moonep_staging_reference is False
+    assert model.text_config.moonep_num_sms == 64
     assert model.text_config.router_async_offload is False
     assert model.text_config.router_compute_dtype == "float32"
     assert (

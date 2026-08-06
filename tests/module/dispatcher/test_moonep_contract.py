@@ -48,6 +48,7 @@ def test_moonep_is_a_standard_model_config_choice() -> None:
 
     assert config.dispatcher == "moonep"
     assert config.moonep_staging_reference is True
+    assert config.moonep_num_sms == 64
     assert config.intra_layer_micro_batch == 1
 
 
