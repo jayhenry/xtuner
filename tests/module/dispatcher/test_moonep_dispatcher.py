@@ -15,11 +15,23 @@ class _Event:
 
 
 class _Buffer:
-    def __init__(self, *, S, H, K, E, num_ep_ranks, group, explicitly_destroy):
+    def __init__(
+        self,
+        *,
+        S,
+        H,
+        K,
+        E,
+        num_ep_ranks,
+        group,
+        explicitly_destroy,
+        use_caller_stream,
+    ):
         self.S = S
         self.K = K
         self.E = E
         self.B = E // num_ep_ranks
+        self.use_caller_stream = use_caller_stream
         self.destroyed = False
 
     def dispatch(
@@ -120,7 +132,7 @@ def backend(monkeypatch):
     _Workspace.allocated.clear()
     module = SimpleNamespace(
         __file__="/tmp/MoonEP-mod/moonep/__init__.py",
-        XTUNER_INTEGRATION_API_VERSION=1,
+        XTUNER_INTEGRATION_API_VERSION=2,
         Buffer=_Buffer,
         ExpertVMMWorkspace=_Workspace,
     )
@@ -201,6 +213,7 @@ def test_staging_dispatcher_runs_the_public_six_stage_forward_seam(backend) -> N
     assert post["tokens_per_expert"].shape == (4,)
     assert post["expert_tensors"][0][0].shape == (4, 256, 128)
     assert torch.equal(result["hidden_states"], hidden_states * 0.5)
+    assert runtime._buffer.use_caller_stream is True
 
     with pytest.raises(RuntimeError, match="fixed S changed"):
         dispatcher.dispatch_preprocess(

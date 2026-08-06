@@ -105,7 +105,7 @@ def test_runtime_meta_build_only_validates_the_optional_backend(monkeypatch) -> 
 
     backend = SimpleNamespace(
         __file__="/tmp/MoonEP-mod/moonep/__init__.py",
-        XTUNER_INTEGRATION_API_VERSION=1,
+        XTUNER_INTEGRATION_API_VERSION=2,
         Buffer=object,
         ExpertVMMWorkspace=FakeWorkspace,
     )

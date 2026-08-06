@@ -29,7 +29,7 @@ from .fsdp_vmm_landing import (
 )
 
 
-_INTEGRATION_API_VERSION = 1
+_INTEGRATION_API_VERSION = 2
 _TARGET_TORCH_VERSION = "2.12.1+cu132"
 
 
@@ -208,6 +208,10 @@ class MoonEPRuntime:
                 num_ep_ranks=self._ep_group.size(),
                 group=self._ep_group,
                 explicitly_destroy=True,
+                # FSDP collectives use the caller stream.  Giving MoonEP the
+                # same device-side launch order prevents orthogonal EP/FSDP
+                # progress waves without introducing a host synchronization.
+                use_caller_stream=True,
             )
         return self._buffer
 
