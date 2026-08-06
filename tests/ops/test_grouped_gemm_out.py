@@ -60,8 +60,12 @@ def test_fused_route_weight_backward_returns_bf16_rows_and_fp32_weights() -> Non
         expert_output,
         route_weights,
     )
-    expected_expert = (grad_weighted.float() * route_weights[:, None]).bfloat16()
-    expected_route = (grad_weighted.float() * expert_output.float()).sum(dim=-1)
+    # grouped-gemm's BF16 unpermute backward first rounds the FP32 router
+    # weight to BF16, and its route-gradient dot rounds every product to BF16
+    # before the FP32 reduction. MoonEP must preserve that public numerical
+    # contract when it fuses the same operation into combine backward.
+    expected_expert = grad_weighted * route_weights.bfloat16()[:, None]
+    expected_route = (grad_weighted * expert_output).float().sum(dim=-1)
 
     assert grad_expert.dtype is torch.bfloat16
     assert grad_route.dtype is torch.float32

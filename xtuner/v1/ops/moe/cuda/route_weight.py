@@ -15,15 +15,22 @@ def _route_weight_rows_backward_kernel(
     block_size: tl.constexpr,
 ):
     row = tl.program_id(0)
-    route_weight = tl.load(route_weights + row).to(tl.float32)
+    # Match grouped-gemm BF16 unpermute backward: the FP32 router weight is
+    # rounded before multiplication, and each route-gradient product is
+    # rounded before its FP32 reduction.
+    route_weight = tl.load(route_weights + row).to(tl.bfloat16).to(tl.float32)
     route_grad = 0.0
     for start in tl.static_range(0, hidden_size, block_size):
         offsets = start + tl.arange(0, block_size)
         mask = offsets < hidden_size
         grad = tl.load(grad_weighted + row * hidden_size + offsets, mask=mask, other=0.0).to(tl.float32)
         output = tl.load(expert_output + row * hidden_size + offsets, mask=mask, other=0.0).to(tl.float32)
-        tl.store(grad_expert + row * hidden_size + offsets, grad * route_weight, mask=mask)
-        route_grad += tl.sum(grad * output, axis=0)
+        tl.store(
+            grad_expert + row * hidden_size + offsets,
+            (grad * route_weight).to(tl.bfloat16),
+            mask=mask,
+        )
+        route_grad += tl.sum((grad * output).to(tl.bfloat16).to(tl.float32), axis=0)
     tl.store(grad_route + row, route_grad)
 
 
