@@ -526,3 +526,86 @@ sequenceDiagram
 - MoonEP Runtime/config/tests 中未引入 DSA top-k cache；router training 的 ids、weights 与 counts 保持 device-resident。
 - 既有 `TestMuonFSDP` 数值 tolerance 在改动回退后仍可独立复现失败，确认不是本 Issue 引入；既有 async-HF hook 测试因当前环境未安装 FlashAttention 而在分布式退出阶段挂起，已由本 Issue 的真实 async-HF fresh-load test 覆盖目标行为。
 - 结论：Issue 07 已完成 Direct MoonEP 的持久化、offload、optimizer 与显式 lifecycle 闭环，并保持 FSDP 唯一参数所有权和异常路径无 collective cleanup。
+
+# 2026-08-06_12-01-13_Qwen3.5数值与性能最终验收
+
+完成 Issue 08：真实 Qwen3.5-35B-A3B 在 8×H200、BF16 FSDP2×EP4、Direct landing、`torch.compile` 和 Triton grouped GEMM 下完成 MTP0/MTP1 两组 DeepEP/MoonEP 各 20-step 对照训练。验收期间修复跨 compute-rank 的 BF16 combine 舍入语义，并新增可配置的 MoonEP SM budget。主要接口为 MoonEP 的 `MoonEPCommPlan.topk_experts`、`Buffer.combine()`，XTuner 的 `MoEConfig.moonep_num_sms`、`MoonEPRuntime` 和 `AcceptanceRun`/`compare_runs()`；完整结果见 `xtuner_moonep_acceptance.md`。
+
+## 关键单测
+
+- 正式四次 Qwen3.5 训练均使用 pack length 65536，未使用 tiny fallback；MTP0/MTP1 的 steps 6–20 吞吐比分别为 `1.011047`、`1.009522`，超过 `0.95` 门禁。
+- 两组 loss、total loss 与 global grad norm 均 finite；全部 paired curves cosine `>= 0.999997`，mean relative difference `< 0.62%`。
+- MoonEP-mod public EP2/4/8 integration 每 rank `16 passed, 2 skipped`，EP4 combine kernel 每 rank `14 passed`；新增 top-k8 跨 compute-rank 红测固化 DeepEP 的 home-rank BF16 partial 语义。
+- XTuner 当前提交完整 forward/MTP/Domino/SP/compile 为 `16 passed`，persistence/DCP/HF/offload/optimizer/lifecycle 为 `10 passed`，dispatcher 回归为 `13 passed, 1 skipped`，config/acceptance contract 为 `15 passed`。
+- Direct profiler gate 为 `1 passed`：完整 home-weight copy、full-dW temporary、MoonEP planning 到 duplicated-gradient handoff 区间内 host sync 均为 `0`。
+
+## 类/接口设计和主要改动
+
+```mermaid
+classDiagram
+    class MoEConfig {
+        +moonep_num_sms : int = 64
+    }
+    class MoonEPRuntime {
+        -num_sms : int
+        -buffers : Buffer[]
+        +buffer_for(group) Buffer
+    }
+    class Buffer {
+        +dispatch(hidden, topk_experts, ...) MoonEPCommPlan
+        +combine(expert_outputs, plan, ...) Tensor
+    }
+    class MoonEPCommPlan {
+        +topk_experts : Tensor
+    }
+    class AcceptanceRun {
+        +tokens_per_second : float[]
+        +curves : Dict
+        +from_directory(path) AcceptanceRun
+    }
+    class PairComparison {
+        +throughput_ratio : float
+        +curves : CurveComparison[]
+        +passed : bool
+    }
+    MoEConfig --> MoonEPRuntime : model-scoped setting
+    MoonEPRuntime --> Buffer : creates one per EP group
+    Buffer --> MoonEPCommPlan : retains GPU route identity
+    AcceptanceRun --> PairComparison : compare_runs
+```
+
+`MoonEPCommPlan` 只按引用保留原始 device `topk_experts`，没有新增 host mirror 或 device copy。`Buffer.combine()` 依据 expert home rank 与 top-k 顺序形成 BF16 local partial，再以 FP32 按 home rank 合并，从而在动态 compute placement 下保持 DeepEP grouped-GEMM 的舍入语义。XTuner 仅增加 model-scoped `moonep_num_sms` 并传给唯一 `Buffer`，不引入额外 controller。
+
+## 类交互和主要改动
+
+```mermaid
+sequenceDiagram
+    participant T as Trainer
+    participant D as MoonEPDispatcher
+    participant B as MoonEP Buffer
+    participant P as MoonEPCommPlan
+    participant G as Grouped GEMM
+    participant C as Combine kernel
+    participant A as Acceptance comparator
+    T->>D: BF16 FSDP2×EP4 forward
+    D->>B: dispatch(hidden, topk experts)
+    B-->>P: retain GPU route identity
+    P-->>D: dynamic compute placement
+    D->>G: local expert BF16 compute
+    G->>C: every physical route output
+    P->>C: home expert ids and top-k order
+    C->>C: BF16 home-local partials
+    C->>C: FP32 sum across home ranks
+    C-->>T: BF16 combined output
+    T->>A: 20-step tracker and manifest
+    A-->>T: throughput and numerical PASS
+```
+
+验收器从 rank0 JSONL 读取全部 step samples，丢弃前 5 个 compile/warm-up steps后计算吞吐中位数，并对相同 step 的 loss/grad-norm 曲线统一计算 finite、cosine 和 mean relative difference；manifest 同时固化 commit、实际 import 路径、完整 config、环境和 GPU 信息。
+
+## 其他重要细节
+
+- 真实根因是 BF16 加法非结合性，不是梯度丢失：动态 compute-rank grouping 改变了 DeepEP 原本按 expert home rank 形成 top-k partial 的舍入边界。MoonEP commit `c14bd43` 修复该语义，XTuner commit `21edfccc` 将 H200 microbenchmark 最优的 `num_sms=64` 固化为可调默认值。
+- 正式 dtype/ownership 流程保持 `FP32 FSDP shard -> BF16 AG/direct landing/compute/dW/duplicate return/ReduceScatter -> FP32 shard grad -> FP32 optimizer update`；DCP 仍只观察 FSDP-owned Parameter 与 optimizer identity。
+- 首版只声明 BF16、TP1、node-local EP2/4/8（性能验收 EP4）、FSDP2、训练及已覆盖的 MTP/Domino/SP；TP、FP8、跨节点、`no_sync`、PP、decoding 和 XTuner 自管 expert+DCP 适配仍为待办。
+- 结论：Issue 08 的数值、性能、回归和无 host sync 门禁全部通过，MoonEP 接入达到第一版 Definition of Done。
