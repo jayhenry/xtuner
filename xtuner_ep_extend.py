@@ -2,9 +2,9 @@
 
 这不是可直接替换 XTuner 文件的 patch。它刻意展示：
 
-1. model-scoped runtime Interface；
+1. concrete model-scoped runtimes；
 2. per-layer Dispatcher Adapter 与已有六阶段；
-3. per-call invocation façade；
+3. Dispatcher stage results 与 backend-private state；
 4. storage-neutral expert execution；
 5. 单 microbatch、Domino、FSDP install 和 teardown 的主要调用端流程。
 
@@ -14,8 +14,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, Literal, NamedTuple, Sequence, TypedDict, cast
+from typing import Any, Literal, NamedTuple, Sequence, TypeAlias, TypedDict, cast
 
 import torch
 from torch import Tensor, nn
@@ -54,35 +53,24 @@ class ProjectionExecution(NamedTuple):
     secondary_grad_out: Tensor | None = None
 
 
-class ExpertExecution(NamedTuple):
-    gate_up: ProjectionExecution
-    down: ProjectionExecution
-
-
-class ExpertBatch(NamedTuple):
-    hidden_states: Tensor
-    tokens_per_expert: Tensor  # local physical compute groups, not Router [E] counts
-    execution: ExpertExecution | None
+ExpertExecution: TypeAlias = tuple[ProjectionExecution, ProjectionExecution]
 
 
 # =============================================================================
-# 2. [CHANGED BASE] 既有六阶段 + per-call façade
+# 2. [CHANGED BASE] 直接复用既有六阶段
 # =============================================================================
 
 
 class GenericDispatcher(ABC):
     """保留现有六阶段 Interface。
 
-    新增的 ``begin_invocation`` 是 pre-attention 调用生命周期入口；默认是 identity。
-    ``invocation_state`` 只在 eager control plane 传递，后续阶段可从 pre result 取得。
+    ``prepare_layer_input`` 是 UltraEP backward ordering 所需的唯一
+    pre-attention hook；默认返回 identity tensor 和空 state。它不包装、替代
+    或缓存后续六阶段。
     """
 
-    def begin_invocation(self, layer_input: Tensor) -> RoutedExpertInvocation:
-        return RoutedExpertInvocation(
-            dispatcher=self,
-            layer_input=layer_input,
-            backend_state=None,
-        )
+    def prepare_layer_input(self, layer_input: Tensor) -> tuple[Tensor, object | None]:
+        return layer_input, None
 
     @abstractmethod
     def dispatch_preprocess(
@@ -92,7 +80,7 @@ class GenericDispatcher(ABC):
         topk_ids: Tensor,
         topk_weights: Tensor,
         tokens_per_expert: Tensor,
-        invocation_state: object | None,
+        layer_state: object | None,
         async_op: bool = False,
     ) -> StageResult:
         """阶段 1；tokens_per_expert 是 Router-owned logical [E] counts。"""
@@ -158,139 +146,12 @@ class GenericDispatcher(ABC):
         """阶段 6。"""
 
 
-class RoutedExpertInvocation:
-    """一次 routed-expert call 的有状态 façade。
-
-    它只编排现有 Dispatcher 六阶段，不实现 transport。调用顺序是业务 invariant，
-    所以伪代码不为每一步增加浅层 defensive state machine。
-    """
-
-    def __init__(
-        self,
-        *,
-        dispatcher: GenericDispatcher,
-        layer_input: Tensor,
-        backend_state: object | None,
-    ) -> None:
-        self.dispatcher = dispatcher
-        self.layer_input = layer_input
-        self.backend_state = backend_state
-        self.topk_weights: Tensor
-        self.pre_dispatched: StageResult
-        self.dispatched: StageResult
-        self.post_dispatched: StageResult
-        self.pre_combined: StageResult
-        self.combined: StageResult
-
-    def dispatch_preprocess(
-        self,
-        *,
-        hidden_states: Tensor,
-        topk_ids: Tensor,
-        topk_weights: Tensor,
-        tokens_per_expert: Tensor,
-        async_op: bool = False,
-    ) -> None:
-        self.topk_weights = topk_weights
-        self.pre_dispatched = self.dispatcher.dispatch_preprocess(
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            tokens_per_expert=tokens_per_expert,
-            invocation_state=self.backend_state,
-            async_op=async_op,
-        )
-
-    def dispatch(self, *, async_op: bool = False, decoding: bool = False) -> None:
-        self.dispatched = self.dispatcher.dispatch(
-            pre_dispatched=self.pre_dispatched,
-            topk_weights=self.topk_weights,
-            async_op=async_op,
-            decoding=decoding,
-        )
-
-    def dispatch_postprocess(self, *, async_op: bool = False) -> ExpertBatch:
-        self.post_dispatched = self.dispatcher.dispatch_postprocess(
-            pre_dispatched=self.pre_dispatched,
-            dispatched=self.dispatched,
-            async_op=async_op,
-        )
-        return ExpertBatch(
-            hidden_states=self.post_dispatched["hidden_states"],
-            tokens_per_expert=self.post_dispatched["tokens_per_expert"],
-            # 所有 Adapter 固定写 key，避免 compile 路径使用 optional-key .get()。
-            execution=self.post_dispatched["expert_execution"],
-        )
-
-    def combine_preprocess(
-        self,
-        expert_output: Tensor,
-        *,
-        async_op: bool = False,
-        decoding: bool = False,
-    ) -> None:
-        self.pre_combined = self.dispatcher.combine_preprocess(
-            hidden_states=expert_output,
-            pre_dispatched=self.pre_dispatched,
-            dispatched=self.dispatched,
-            post_dispatched=self.post_dispatched,
-            async_op=async_op,
-            decoding=decoding,
-        )
-
-    def combine(self, *, async_op: bool = False, decoding: bool = False) -> None:
-        self.combined = self.dispatcher.combine(
-            pre_dispatched=self.pre_dispatched,
-            dispatched=self.dispatched,
-            post_dispatched=self.post_dispatched,
-            pre_combined=self.pre_combined,
-            async_op=async_op,
-            decoding=decoding,
-        )
-
-    def combine_postprocess(self, *, async_op: bool = False) -> Tensor:
-        post = self.dispatcher.combine_postprocess(
-            pre_dispatched=self.pre_dispatched,
-            dispatched=self.dispatched,
-            post_dispatched=self.post_dispatched,
-            pre_combined=self.pre_combined,
-            combined=self.combined,
-            async_op=async_op,
-        )
-        return post["hidden_states"]
-
-
 # Existing Naive/All2All/DeepEP/AGRS Adapters only need two mechanical changes:
 #
-# 1. dispatch_preprocess accepts required Router tokens_per_expert and invocation_state;
+# 1. dispatch_preprocess accepts required Router tokens_per_expert and opaque layer_state;
 # 2. dispatch_postprocess always returns expert_execution=None.
 #
 # Their communication Implementation and remaining five stages stay unchanged.
-
-
-# =============================================================================
-# 3. [NEW COMMON LIFECYCLE] model-scoped runtime Interface
-# =============================================================================
-
-
-class EPExecutionRuntime(ABC):
-    """模型级 dynamic-expert resources 的 owner。"""
-
-    @abstractmethod
-    def bind_dispatcher(self, *, layer_fqn: str, experts: MoEBlock) -> GenericDispatcher:
-        """Meta build 时注册 physical layer；不得创建 per-call state。"""
-
-    @abstractmethod
-    def validate_before_fsdp(self, *, model: nn.Module, fsdp_config: Any) -> None:
-        """任何 FSDP mutation / CUDA allocation 前集中拒绝 unsupported config。"""
-
-    @abstractmethod
-    def install_after_fsdp(self, *, model: nn.Module, fsdp_config: Any) -> None:
-        """FSDP parameter identity/layout 明确后安装 backend resources。"""
-
-    @abstractmethod
-    def close(self) -> None:
-        """幂等；必须在相关 process groups 销毁前协调调用。"""
 
 
 # =============================================================================
@@ -322,12 +183,12 @@ class _MoonEPInvocation:
         return (
             hidden_states,
             local_counts,
-            ExpertExecution(
-                gate_up=ProjectionExecution(
+            (
+                ProjectionExecution(
                     primary_weight=w1w3,
                     primary_grad_out=dw1w3,
                 ),
-                down=ProjectionExecution(
+                ProjectionExecution(
                     primary_weight=w2,
                     primary_grad_out=dw2,
                 ),
@@ -353,8 +214,8 @@ class _MoonEPInvocation:
         raise NotImplementedError
 
 
-class MoonEPRuntime(EPExecutionRuntime):
-    """现有 model-scoped MoonEP runtime 的通用 lifecycle Adapter。"""
+class MoonEPRuntime:
+    """现有 model-scoped MoonEP runtime；直接实现 model 使用的 lifecycle。"""
 
     def __init__(self, *, config: Any, ep_group: Any) -> None:
         self.config = config
@@ -366,13 +227,6 @@ class MoonEPRuntime(EPExecutionRuntime):
     def bind_dispatcher(self, *, layer_fqn: str, experts: MoEBlock) -> GenericDispatcher:
         binding = register_moonep_layer(self, layer_fqn, experts)
         return MoonEPDispatcher(runtime=self, layer_binding=binding)
-
-    def begin_invocation(self, layer_binding: object) -> _MoonEPInvocation:
-        # Fresh plan state. The real v1 dispatcher selects a deterministic ordinal in its
-        # statically sized Domino gradient ring; it is not a dynamic completion-tracked lease.
-        # A second independent graph is outside the v1 client contract; scheduler/config
-        # boundaries must not construct it, and this hot path adds no host completion tracker.
-        return create_moonep_invocation(self, layer_binding)
 
     def validate_before_fsdp(self, *, model: nn.Module, fsdp_config: Any) -> None:
         validate_moonep_fsdp_config(model, fsdp_config)
@@ -390,14 +244,7 @@ class MoonEPDispatcher(GenericDispatcher):
     def __init__(self, *, runtime: MoonEPRuntime, layer_binding: object) -> None:
         self.runtime = runtime
         self.layer_binding = layer_binding
-
-    def begin_invocation(self, layer_input: Tensor) -> RoutedExpertInvocation:
-        state = self.runtime.begin_invocation(self.layer_binding)
-        return RoutedExpertInvocation(
-            dispatcher=self,
-            layer_input=layer_input,  # MoonEP does not need a pre-attention join.
-            backend_state=state,
-        )
+        self._next_gradient_slot = 0
 
     def dispatch_preprocess(
         self,
@@ -406,17 +253,16 @@ class MoonEPDispatcher(GenericDispatcher):
         topk_ids: Tensor,
         topk_weights: Tensor,
         tokens_per_expert: Tensor,
-        invocation_state: object | None,
+        layer_state: object | None,
         async_op: bool = False,
     ) -> StageResult:
-        invocation = cast(_MoonEPInvocation, invocation_state)
+        del layer_state, async_op
         return {
             "hidden_states": hidden_states,
             "topk_ids": topk_ids.to(torch.int32).contiguous(),
             "topk_weights": topk_weights,
             # Router histogram is reused; no second bincount(topk_ids).
             "tokens_per_expert": tokens_per_expert.to(torch.int32).contiguous(),
-            "_invocation": invocation,
         }
 
     def dispatch(
@@ -427,7 +273,13 @@ class MoonEPDispatcher(GenericDispatcher):
         async_op: bool = False,
         decoding: bool = False,
     ) -> StageResult:
-        invocation = cast(_MoonEPInvocation, pre_dispatched["_invocation"])
+        grad_slot = self._next_gradient_slot
+        self._next_gradient_slot = (grad_slot + 1) % self.runtime.config.intra_layer_micro_batch
+        invocation = create_moonep_invocation(
+            self.runtime,
+            self.layer_binding,
+            grad_slot=grad_slot,
+        )
         hidden_states, weights = invocation.dispatch(
             pre_dispatched["hidden_states"],
             pre_dispatched["topk_ids"],
@@ -439,6 +291,7 @@ class MoonEPDispatcher(GenericDispatcher):
         return {
             "hidden_states": hidden_states,
             "topk_weights": weights,
+            "_invocation": invocation,
         }
 
     def dispatch_postprocess(
@@ -448,7 +301,7 @@ class MoonEPDispatcher(GenericDispatcher):
         dispatched: StageResult,
         async_op: bool = False,
     ) -> StageResult:
-        invocation = cast(_MoonEPInvocation, pre_dispatched["_invocation"])
+        invocation = cast(_MoonEPInvocation, dispatched["_invocation"])
         hidden_states, local_counts, execution = invocation.materialize_expert_execution()
         return {
             "hidden_states": hidden_states,
@@ -466,7 +319,7 @@ class MoonEPDispatcher(GenericDispatcher):
         async_op: bool = False,
         decoding: bool = False,
     ) -> StageResult:
-        invocation = cast(_MoonEPInvocation, pre_dispatched["_invocation"])
+        invocation = cast(_MoonEPInvocation, dispatched["_invocation"])
         return {
             "hidden_states": invocation.combine_preprocess(hidden_states, async_op=async_op),
         }
@@ -481,7 +334,7 @@ class MoonEPDispatcher(GenericDispatcher):
         async_op: bool = False,
         decoding: bool = False,
     ) -> StageResult:
-        invocation = cast(_MoonEPInvocation, pre_dispatched["_invocation"])
+        invocation = cast(_MoonEPInvocation, dispatched["_invocation"])
         return {
             "hidden_states": invocation.combine(
                 pre_combined["hidden_states"],
@@ -500,7 +353,7 @@ class MoonEPDispatcher(GenericDispatcher):
         combined: StageResult,
         async_op: bool = False,
     ) -> StageResult:
-        invocation = cast(_MoonEPInvocation, pre_dispatched["_invocation"])
+        invocation = cast(_MoonEPInvocation, dispatched["_invocation"])
         output = invocation.combine_postprocess(combined["hidden_states"], async_op=async_op)
         if not torch.is_grad_enabled():
             invocation.finish_forward_only()
@@ -512,233 +365,68 @@ class MoonEPDispatcher(GenericDispatcher):
 # =============================================================================
 
 
-@dataclass(frozen=True)
-class UltraEPLayerBinding:
-    layer_fqn: str
-    experts: MoEBlock
-    external_layer_handle: object | None
-
-
-class UltraEPManagerAdapter:
-    """External UltraEP API、本地 staging 和显式销毁的唯一 Locality 边界。"""
-
-    def __init__(self, *, config: Any, ep_group: Any) -> None:
-        self.external_manager = create_external_ultraep_manager(
-            config=config,
-            ep_group=ep_group,
-            explicitly_destroy=True,
-        )
-        self._active_layer_calls: set[str] = set()
-
-    def register_layer(self, layer_fqn: str, experts: MoEBlock) -> UltraEPLayerBinding:
-        handle = self.external_manager.register_layer(layer_fqn)
-        return UltraEPLayerBinding(layer_fqn, experts, handle)
-
-    def lease_slot(self, binding: UltraEPLayerBinding) -> object:
-        # UltraEP v1 has shared replica weight/grad storage. A virtual placement slot alone
-        # cannot isolate a second call of the same physical layer.
-        if binding.layer_fqn in self._active_layer_calls:
-            raise RuntimeError("UltraEP v1 permits one active invocation per physical layer")
-        slot = self.external_manager.allocate_microbatch_slot(binding.external_layer_handle)
-        self._active_layer_calls.add(binding.layer_fqn)
-        return slot
-
-    def refresh_master_pointers(self, binding: UltraEPLayerBinding) -> None:
-        # Isolates external movable-pointer knowledge after each FSDP unshard.
-        refresh_external_master_pointers(self.external_manager, binding.experts)
-
-    def update_placement(
-        self,
-        *,
-        binding: UltraEPLayerBinding,
-        slot: object,
-        logical_ids: Tensor,
-        logical_counts: Tensor,
-    ) -> object:
-        self.external_manager.update_placement_sparse(
-            binding.external_layer_handle,
-            slot,
-            logical_ids,
-            logical_counts,
-        )
-        # The external API mutates placement tables owned by this virtual slot.
-        return slot
-
-    def weight_sync(self, *, slot: object, placement: object, async_finish: bool) -> object:
-        return self.external_manager.weight_sync(slot, placement, async_finish=async_finish)
-
-    def reroute(self, *, slot: object, placement: object, logical_ids: Tensor) -> Tensor:
-        # The Router-owned logical tensor remains untouched.
-        physical_ids = logical_ids.clone()
-        self.external_manager.reroute_sparse(slot, placement, physical_ids)
-        return physical_ids
-
-    def replica_execution(self, *, slot: object) -> ExpertExecution:
-        replica_w1, replica_w2 = self.external_manager.replica_weights(slot)
-        replica_dw1, replica_dw2 = self.external_manager.replica_grad_buffers(slot)
-        return ExpertExecution(
-            gate_up=ProjectionExecution(
-                primary_weight=None,  # GroupedLinear master Parameter [B]
-                primary_grad_out=None,
-                secondary_weight=replica_w1,  # official strided [R, ...] view
-                secondary_grad_out=replica_dw1,
-            ),
-            down=ProjectionExecution(
-                primary_weight=None,
-                primary_grad_out=None,
-                secondary_weight=replica_w2,
-                secondary_grad_out=replica_dw2,
-            ),
-        )
-
-    def replay_weights(self, *, slot: object, placement: object) -> None:
-        self.external_manager.weight_sync(slot, placement, async_finish=False)
-
-    def start_grad_reduce(
-        self,
-        *,
-        binding: UltraEPLayerBinding,
-        slot: object,
-        placement: object,
-    ) -> object:
-        stage_master_grads_to_fp32(binding.experts)
-        return self.external_manager.grad_reduce(slot, placement, async_finish=True)
-
-    def finish_grad_reduce(
-        self,
-        *,
-        binding: UltraEPLayerBinding,
-        reduce_event: object,
-    ) -> None:
-        self.external_manager.wait_grad_reduce(reduce_event)
-        restore_fp32_master_grads_to_fsdp(binding.experts)
-
-    def release_slot(self, binding: UltraEPLayerBinding, slot: object) -> None:
-        # The external API allocates virtual IDs cyclically and has no storage lease object;
-        # this Adapter owns the active-call guard and permits reuse only after completion.
-        del slot
-        self._active_layer_calls.remove(binding.layer_fqn)
-
-    def close(self) -> None:
-        self.external_manager.destroy()
-
-
-class _UltraEPInvocation:
-    """一个调用唯一拥有 placement、slot、events 和 backward ordering。"""
-
-    def __init__(
-        self,
-        *,
-        manager: UltraEPManagerAdapter,
-        binding: UltraEPLayerBinding,
-        slot: object,
-    ) -> None:
-        self.manager = manager
-        self.binding = binding
-        self.slot = slot
-        self.placement: object
-        self.weight_event: object
-        self.reduce_event: object
-        self._released = False
-
-    def prepare_physical_dispatch(
-        self,
-        *,
-        logical_ids: Tensor,
-        logical_counts: Tensor,
-    ) -> Tensor:
-        self.placement = self.manager.update_placement(
-            binding=self.binding,
-            slot=self.slot,
-            logical_ids=logical_ids,
-            logical_counts=logical_counts,
-        )
-        self.manager.refresh_master_pointers(self.binding)
-        self.weight_event = self.manager.weight_sync(
-            slot=self.slot,
-            placement=self.placement,
-            async_finish=True,
-        )
-        return self.manager.reroute(
-            slot=self.slot,
-            placement=self.placement,
-            logical_ids=logical_ids,
-        )
-
-    def wait_weights_at_first_consumer(self) -> None:
-        # Real code inserts current-stream wait_event; it does not synchronize the host.
-        current_stream_wait_event(self.weight_event)
-
-    def expert_execution(self) -> ExpertExecution:
-        return self.manager.replica_execution(slot=self.slot)
-
-    def replay_weights_for_backward(self) -> None:
-        self.manager.replay_weights(slot=self.slot, placement=self.placement)
-
-    def start_grad_reduce(self) -> None:
-        self.reduce_event = self.manager.start_grad_reduce(
-            binding=self.binding,
-            slot=self.slot,
-            placement=self.placement,
-        )
-
-    def wait_grad_reduce_restore_and_release(self) -> None:
-        self.manager.finish_grad_reduce(
-            binding=self.binding,
-            reduce_event=self.reduce_event,
-        )
-        self.release()
-
-    def release(self) -> None:
-        if not self._released:
-            self.manager.release_slot(self.binding, self.slot)
-            self._released = True
-
-
 class _UltraEPGradReduceJoin(torch.autograd.Function):
     """Forward 位于 attention 前；backward 在 FSDP completion boundary 前 join。"""
 
     @staticmethod
-    def forward(ctx: Any, layer_input: Tensor, invocation: _UltraEPInvocation) -> Tensor:
-        ctx.invocation = invocation
+    def forward(
+        ctx: Any,
+        layer_input: Tensor,
+        dispatcher: UltraEPDispatcher,
+        virtual_layer_id: int,
+    ) -> Tensor:
+        ctx.dispatcher = dispatcher
+        ctx.virtual_layer_id = virtual_layer_id
         return layer_input
 
     @staticmethod
-    def backward(ctx: Any, grad_input: Tensor) -> tuple[Tensor, None]:
-        ctx.invocation.wait_grad_reduce_restore_and_release()
-        return grad_input, None
+    def backward(ctx: Any, grad_input: Tensor) -> tuple[Tensor, None, None]:
+        ctx.dispatcher._finish_grad_reduce(ctx.virtual_layer_id)
+        return grad_input, None, None
 
 
 class _UltraEPGradReduceStart(torch.autograd.Function):
     """Forward 位于 dispatch 前；backward 在 expert/dispatch backward 后启动 reduce。"""
 
     @staticmethod
-    def forward(ctx: Any, hidden_states: Tensor, invocation: _UltraEPInvocation) -> Tensor:
-        ctx.invocation = invocation
+    def forward(
+        ctx: Any,
+        hidden_states: Tensor,
+        dispatcher: UltraEPDispatcher,
+        virtual_layer_id: int,
+    ) -> Tensor:
+        ctx.dispatcher = dispatcher
+        ctx.virtual_layer_id = virtual_layer_id
         return hidden_states
 
     @staticmethod
-    def backward(ctx: Any, grad_hidden: Tensor) -> tuple[Tensor, None]:
-        ctx.invocation.start_grad_reduce()
-        return grad_hidden, None
+    def backward(ctx: Any, grad_hidden: Tensor) -> tuple[Tensor, None, None]:
+        ctx.dispatcher._start_grad_reduce(ctx.virtual_layer_id)
+        return grad_hidden, None, None
 
 
 class _UltraEPWeightSyncForBackward(torch.autograd.Function):
     """Forward 位于 expert output 后；backward 在 expert DGrad 前 replay replicas。"""
 
     @staticmethod
-    def forward(ctx: Any, expert_output: Tensor, invocation: _UltraEPInvocation) -> Tensor:
-        ctx.invocation = invocation
+    def forward(
+        ctx: Any,
+        expert_output: Tensor,
+        dispatcher: UltraEPDispatcher,
+        virtual_layer_id: int,
+    ) -> Tensor:
+        ctx.dispatcher = dispatcher
+        ctx.virtual_layer_id = virtual_layer_id
         return expert_output
 
     @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None]:
-        ctx.invocation.replay_weights_for_backward()
-        return grad_output, None
+    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None, None]:
+        ctx.dispatcher._replay_weights_for_backward(ctx.virtual_layer_id)
+        return grad_output, None, None
 
 
-class UltraEPRuntime(EPExecutionRuntime):
-    """唯一拥有 Manager；不使用 Provider + global registry 双缓存。"""
+class UltraEPRuntime:
+    """External Manager、FP32 staging 与 FSDP lifecycle 的 model-scoped owner。"""
 
     def __init__(self, *, config: Any, ep_group: Any) -> None:
         self.config = config
@@ -748,7 +436,11 @@ class UltraEPRuntime(EPExecutionRuntime):
         self.replica_slots_per_rank = config.ultraep_cfg.replica_slots_per_rank
         self.ep_size = ep_group.size()
         self._closed = False
-        self.manager: UltraEPManagerAdapter | None = None
+        self.manager: Any | None = None
+        self.master_grad_staging: tuple[Tensor, Tensor] | None = None
+        self.dispatchers: list[UltraEPDispatcher] = []
+        self._active_layer_calls: set[int] = set()
+        self._grad_reduce_events: dict[int, object] = {}
 
     @property
     def num_physical_experts(self) -> int:
@@ -757,38 +449,58 @@ class UltraEPRuntime(EPExecutionRuntime):
         return self.num_experts + self.ep_size * self.replica_slots_per_rank
 
     def bind_dispatcher(self, *, layer_fqn: str, experts: MoEBlock) -> GenericDispatcher:
-        # Binding object can be resource-free during meta build; real manager handle is installed later.
-        binding = UltraEPLayerBinding(layer_fqn, experts, external_layer_handle=None)
+        del layer_fqn
         inner = build_deepep_dispatcher(
             n_routed_experts=self.num_physical_experts,
             ep_group=self.ep_group,
         )
-        return UltraEPDispatcher(runtime=self, binding=binding, inner=inner)
+        dispatcher = UltraEPDispatcher(
+            runtime=self,
+            # UltraEP virtual IDs encode this stable physical decoder ordinal.
+            layer_id=len(self.dispatchers),
+            experts=experts,
+            inner=inner,
+        )
+        self.dispatchers.append(dispatcher)
+        return dispatcher
 
     def validate_before_fsdp(self, *, model: nn.Module, fsdp_config: Any) -> None:
         validate_ultraep_fsdp_config(model, fsdp_config)
         validate_dual_gmm_supports_configured_replica_layout(self.config)
 
     def install_after_fsdp(self, *, model: nn.Module, fsdp_config: Any) -> None:
-        self.manager = UltraEPManagerAdapter(config=self.config, ep_group=self.ep_group)
-        for dispatcher in iter_ultraep_dispatchers(model):
-            dispatcher.binding = self.manager.register_layer(
-                dispatcher.binding.layer_fqn,
-                dispatcher.binding.experts,
+        del model, fsdp_config
+        self.manager = create_external_ultraep_manager(
+            config=self.config,
+            ep_group=self.ep_group,
+            explicitly_destroy=True,
+        )
+        self.master_grad_staging = allocate_ultraep_master_grad_staging(self.config)
+        for dispatcher in self.dispatchers:
+            dispatcher.expert_execution = bind_ultraep_layer_storage(
+                manager=self.manager,
+                master_grad_staging=self.master_grad_staging,
+                layer_id=dispatcher.layer_id,
+                experts=dispatcher.experts,
+                config=self.config,
             )
 
-    def begin_invocation(self, binding: UltraEPLayerBinding) -> _UltraEPInvocation:
-        manager = cast(UltraEPManagerAdapter, self.manager)
-        return _UltraEPInvocation(
-            manager=manager,
-            binding=binding,
-            slot=manager.lease_slot(binding),
-        )
+    def _allocate_virtual_layer_id(self, dispatcher: UltraEPDispatcher) -> int:
+        # A virtual placement ID does not isolate UltraEP v1's shared replica tensors.
+        if dispatcher.layer_id in self._active_layer_calls:
+            raise RuntimeError("UltraEP v1 permits one active call per physical layer")
+        manager = cast(Any, self.manager)
+        virtual_layer_id = manager.allocate_microbatch_slot(dispatcher.layer_id)
+        self._active_layer_calls.add(dispatcher.layer_id)
+        return virtual_layer_id
+
+    def _release_virtual_layer_id(self, layer_id: int) -> None:
+        self._active_layer_calls.remove(layer_id)
 
     def close(self) -> None:
         if not self._closed:
             if self.manager is not None:
-                self.manager.close()
+                self.manager.destroy()
             self._closed = True
 
 
@@ -799,21 +511,20 @@ class UltraEPDispatcher(GenericDispatcher):
         self,
         *,
         runtime: UltraEPRuntime,
-        binding: UltraEPLayerBinding,
+        layer_id: int,
+        experts: MoEBlock,
         inner: GenericDispatcher,
     ) -> None:
         self.runtime = runtime
-        self.binding = binding
+        self.layer_id = layer_id
+        self.experts = experts
         self.inner = inner
+        self.expert_execution: ExpertExecution
 
-    def begin_invocation(self, layer_input: Tensor) -> RoutedExpertInvocation:
-        invocation = self.runtime.begin_invocation(self.binding)
-        joined_input = _UltraEPGradReduceJoin.apply(layer_input, invocation)
-        return RoutedExpertInvocation(
-            dispatcher=self,
-            layer_input=joined_input,
-            backend_state=invocation,
-        )
+    def prepare_layer_input(self, layer_input: Tensor) -> tuple[Tensor, object | None]:
+        virtual_layer_id = self.runtime._allocate_virtual_layer_id(self)
+        joined_input = _UltraEPGradReduceJoin.apply(layer_input, self, virtual_layer_id)
+        return joined_input, virtual_layer_id
 
     def dispatch_preprocess(
         self,
@@ -822,26 +533,39 @@ class UltraEPDispatcher(GenericDispatcher):
         topk_ids: Tensor,
         topk_weights: Tensor,
         tokens_per_expert: Tensor,
-        invocation_state: object | None,
+        layer_state: object | None,
         async_op: bool = False,
     ) -> StageResult:
-        invocation = cast(_UltraEPInvocation, invocation_state)
-        physical_ids = invocation.prepare_physical_dispatch(
-            logical_ids=topk_ids,
-            logical_counts=tokens_per_expert,
+        virtual_layer_id = cast(int, layer_state)
+        manager = cast(Any, self.runtime.manager)
+        # Placement, weight materialization and reroute share one external state key.
+        manager.update_placement_sparse(virtual_layer_id, topk_ids)
+        # Router counts remain the common phase-1 contract; UltraEP's real API
+        # derives placement loads from IDs and therefore does not consume them.
+        refresh_external_master_pointers(manager, self.layer_id, self.experts)
+        weight_sync_event = manager.weight_sync(virtual_layer_id, async_finish=True)
+        physical_ids = topk_ids.clone()
+        manager.reroute_sparse(virtual_layer_id, physical_ids)
+        dispatch_input = _UltraEPGradReduceStart.apply(
+            hidden_states,
+            self,
+            virtual_layer_id,
         )
-        dispatch_input = _UltraEPGradReduceStart.apply(hidden_states, invocation)
         inner_pre = self.inner.dispatch_preprocess(
             hidden_states=dispatch_input,
             topk_ids=physical_ids,
             topk_weights=topk_weights,
             # The inner DeepEP Adapter currently derives physical counts from IDs.
-            # It accepts this required source-count argument but does not reinterpret it.
+            # It accepts the required source-count argument but does not reinterpret it.
             tokens_per_expert=tokens_per_expert,
-            invocation_state=None,
+            layer_state=None,
             async_op=async_op,
         )
-        return {"inner": inner_pre, "_invocation": invocation}
+        return {
+            "inner": inner_pre,
+            "_virtual_layer_id": virtual_layer_id,
+            "_weight_sync_event": weight_sync_event,
+        }
 
     def dispatch(
         self,
@@ -867,18 +591,18 @@ class UltraEPDispatcher(GenericDispatcher):
         dispatched: StageResult,
         async_op: bool = False,
     ) -> StageResult:
-        invocation = cast(_UltraEPInvocation, pre_dispatched["_invocation"])
         inner_post = self.inner.dispatch_postprocess(
             pre_dispatched=pre_dispatched["inner"],
             dispatched=dispatched["inner"],
             async_op=async_op,
         )
-        invocation.wait_weights_at_first_consumer()
+        # Device-side dependency only; do not synchronize the host.
+        current_stream_wait_event(pre_dispatched["_weight_sync_event"])
         return {
             "hidden_states": inner_post["hidden_states"],
             # DeepEP local order is fixed to [B master groups, R replica groups].
             "tokens_per_expert": inner_post["tokens_per_expert"],
-            "expert_execution": invocation.expert_execution(),
+            "expert_execution": self.expert_execution,
             "inner": inner_post,
         }
 
@@ -892,8 +616,12 @@ class UltraEPDispatcher(GenericDispatcher):
         async_op: bool = False,
         decoding: bool = False,
     ) -> StageResult:
-        invocation = cast(_UltraEPInvocation, pre_dispatched["_invocation"])
-        replay_edge = _UltraEPWeightSyncForBackward.apply(hidden_states, invocation)
+        virtual_layer_id = cast(int, pre_dispatched["_virtual_layer_id"])
+        replay_edge = _UltraEPWeightSyncForBackward.apply(
+            hidden_states,
+            self,
+            virtual_layer_id,
+        )
         inner_pre_combined = self.inner.combine_preprocess(
             hidden_states=replay_edge,
             pre_dispatched=pre_dispatched["inner"],
@@ -935,7 +663,6 @@ class UltraEPDispatcher(GenericDispatcher):
         combined: StageResult,
         async_op: bool = False,
     ) -> StageResult:
-        invocation = cast(_UltraEPInvocation, pre_dispatched["_invocation"])
         inner_post = self.inner.combine_postprocess(
             pre_dispatched=pre_dispatched["inner"],
             dispatched=dispatched["inner"],
@@ -945,8 +672,27 @@ class UltraEPDispatcher(GenericDispatcher):
             async_op=async_op,
         )
         if not torch.is_grad_enabled():
-            invocation.release()
+            self.runtime._release_virtual_layer_id(self.layer_id)
         return {"hidden_states": inner_post["hidden_states"]}
+
+    def _replay_weights_for_backward(self, virtual_layer_id: int) -> None:
+        manager = cast(Any, self.runtime.manager)
+        manager.weight_sync(virtual_layer_id, async_finish=False)
+
+    def _start_grad_reduce(self, virtual_layer_id: int) -> None:
+        manager = cast(Any, self.runtime.manager)
+        staging = cast(tuple[Tensor, Tensor], self.runtime.master_grad_staging)
+        stage_master_grads_to_fp32(staging, virtual_layer_id, self.experts)
+        self.runtime._grad_reduce_events[virtual_layer_id] = manager.grad_reduce(
+            virtual_layer_id,
+            async_finish=True,
+        )
+
+    def _finish_grad_reduce(self, virtual_layer_id: int) -> None:
+        current_stream_wait_event(self.runtime._grad_reduce_events.pop(virtual_layer_id))
+        staging = cast(tuple[Tensor, Tensor], self.runtime.master_grad_staging)
+        restore_fp32_master_grads_to_fsdp(staging, virtual_layer_id, self.experts)
+        self.runtime._release_virtual_layer_id(self.layer_id)
 
 
 # =============================================================================
@@ -1039,15 +785,16 @@ class MoEBlock(nn.Module):
         # Config validation guarantees dynamic paths use this concrete capability.
         w1w3 = cast(GroupedLinear, self.fused_w1w3)
         w2 = cast(GroupedLinear, self.fused_w2)
+        gate_up_execution, down_execution = execution
         gate_up = w1w3.forward_with_execution(
             hidden_states,
             tokens_per_expert,
-            execution.gate_up,
+            gate_up_execution,
         )
         return w2.forward_with_execution(
             self.moe_act(gate_up),
             tokens_per_expert,
-            execution.down,
+            down_execution,
         )
 
 
@@ -1067,43 +814,71 @@ class MoEDecoderLayer(nn.Module):
         seq_ctx: Any,
         position_embeddings: tuple[Tensor, Tensor],
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        # Only lifecycle extension outside the six post-router stages.
-        invocation = self.dispatcher.begin_invocation(layer_input)
+        # The only hook outside the existing six stages. For all non-UltraEP Adapters
+        # this is an identity; opaque state is handed directly to phase 1.
+        layer_input, layer_state = self.dispatcher.prepare_layer_input(layer_input)
 
         residual, routed_hidden, router = self._pre_moe_forward(
-            hidden_states=invocation.layer_input,
+            hidden_states=layer_input,
             seq_ctx=seq_ctx,
             position_embeddings=position_embeddings,
         )
         origin_shape = routed_hidden.shape
 
-        invocation.dispatch_preprocess(
+        pre_dispatched = self.dispatcher.dispatch_preprocess(
             hidden_states=routed_hidden.view(-1, routed_hidden.shape[-1]),
             topk_ids=router["topk_ids"],
             topk_weights=router["topk_weights"],
             tokens_per_expert=router["tokens_per_expert"],
+            layer_state=layer_state,
         )
-        invocation.dispatch()
-        batch = invocation.dispatch_postprocess()
+        dispatched = self.dispatcher.dispatch(
+            pre_dispatched=pre_dispatched,
+            topk_weights=router["topk_weights"],
+        )
+        post_dispatched = self.dispatcher.dispatch_postprocess(
+            pre_dispatched=pre_dispatched,
+            dispatched=dispatched,
+        )
 
         expert_output = self.experts(
-            batch.hidden_states,
-            batch.tokens_per_expert,
+            post_dispatched["hidden_states"],
+            post_dispatched["tokens_per_expert"],
             decoding=False,
-            execution=batch.execution,
+            execution=post_dispatched["expert_execution"],
         )
-        invocation.combine_preprocess(expert_output, async_op=True)
-        invocation.combine(async_op=True)
+        pre_combined = self.dispatcher.combine_preprocess(
+            hidden_states=expert_output,
+            pre_dispatched=pre_dispatched,
+            dispatched=dispatched,
+            post_dispatched=post_dispatched,
+            async_op=True,
+        )
+        combined = self.dispatcher.combine(
+            pre_dispatched=pre_dispatched,
+            dispatched=dispatched,
+            post_dispatched=post_dispatched,
+            pre_combined=pre_combined,
+            async_op=True,
+        )
 
         # Existing overlap stays: routed combine runs while shared experts compute.
         shared_output = self._shared_experts_forward(routed_hidden) if self.n_shared_experts > 0 else None
-        routed_output = invocation.combine_postprocess(async_op=True).view(*origin_shape)
+        post_combined = self.dispatcher.combine_postprocess(
+            pre_dispatched=pre_dispatched,
+            dispatched=dispatched,
+            post_dispatched=post_dispatched,
+            pre_combined=pre_combined,
+            combined=combined,
+            async_op=True,
+        )
+        routed_output = post_combined["hidden_states"].view(*origin_shape)
         output = self._post_moe_forward(
             combined_hidden_states=routed_output,
             residual=residual,
             shared_experts_out=shared_output,
         )
-        # Public return remains logical; UltraEP physical IDs never leave its invocation.
+        # Public return remains logical; UltraEP physical IDs stay inside its Dispatcher.
         return output, router["logits"], router["router_weights"], router["topk_ids"]
 
     def _micro_batch_forward(
@@ -1114,59 +889,115 @@ class MoEDecoderLayer(nn.Module):
     ) -> tuple[Tensor, ...]:
         # This common scheduler is enabled only for backends whose validation declares
         # intra-layer concurrency. MoonEP uses its static ordinal ring; UltraEP v1 rejects it.
-        invocations: list[RoutedExpertInvocation] = []
         residuals: list[Tensor] = []
         routed_hiddens: list[Tensor] = []
         routers: list[RouterResults] = []
+        pre_dispatched_list: list[StageResult] = []
 
-        # Attention + logical router + phase 1. Each call leases independent state.
+        # Attention + logical router + phase 1.
         for layer_input, seq_ctx, pos_emb in zip(layer_inputs, seq_ctxs, position_embeddings):
-            invocation = self.dispatcher.begin_invocation(layer_input)
+            layer_input, layer_state = self.dispatcher.prepare_layer_input(layer_input)
             residual, routed_hidden, router = self._pre_moe_forward(
-                hidden_states=invocation.layer_input,
+                hidden_states=layer_input,
                 seq_ctx=seq_ctx,
                 position_embeddings=pos_emb,
             )
-            invocation.dispatch_preprocess(
+            pre_dispatched = self.dispatcher.dispatch_preprocess(
                 hidden_states=routed_hidden.view(-1, routed_hidden.shape[-1]),
                 topk_ids=router["topk_ids"],
                 topk_weights=router["topk_weights"],
                 tokens_per_expert=router["tokens_per_expert"],
+                layer_state=layer_state,
                 async_op=True,
             )
-            invocations.append(invocation)
             residuals.append(residual)
             routed_hiddens.append(routed_hidden)
             routers.append(router)
+            pre_dispatched_list.append(pre_dispatched)
 
         # Phases 2-4 and expert compute.
-        for invocation in invocations:
-            invocation.dispatch(async_op=True)
-            batch = invocation.dispatch_postprocess(async_op=True)
-            expert_output = self.experts(
-                batch.hidden_states,
-                batch.tokens_per_expert,
-                decoding=False,
-                execution=batch.execution,
+        dispatched_list: list[StageResult] = []
+        post_dispatched_list: list[StageResult] = []
+        pre_combined_list: list[StageResult] = []
+        for router, pre_dispatched in zip(routers, pre_dispatched_list):
+            dispatched = self.dispatcher.dispatch(
+                pre_dispatched=pre_dispatched,
+                topk_weights=router["topk_weights"],
+                async_op=True,
             )
-            invocation.combine_preprocess(expert_output, async_op=True)
+            post_dispatched = self.dispatcher.dispatch_postprocess(
+                pre_dispatched=pre_dispatched,
+                dispatched=dispatched,
+                async_op=True,
+            )
+            expert_output = self.experts(
+                post_dispatched["hidden_states"],
+                post_dispatched["tokens_per_expert"],
+                decoding=False,
+                execution=post_dispatched["expert_execution"],
+            )
+            pre_combined = self.dispatcher.combine_preprocess(
+                hidden_states=expert_output,
+                pre_dispatched=pre_dispatched,
+                dispatched=dispatched,
+                post_dispatched=post_dispatched,
+                async_op=True,
+            )
+            dispatched_list.append(dispatched)
+            post_dispatched_list.append(post_dispatched)
+            pre_combined_list.append(pre_combined)
 
         # Phase 5 is launched for all microbatches before shared expert compute.
-        for invocation in invocations:
-            invocation.combine(async_op=True)
+        combined_list: list[StageResult] = []
+        for pre_dispatched, dispatched, post_dispatched, pre_combined in zip(
+            pre_dispatched_list,
+            dispatched_list,
+            post_dispatched_list,
+            pre_combined_list,
+        ):
+            combined_list.append(
+                self.dispatcher.combine(
+                    pre_dispatched=pre_dispatched,
+                    dispatched=dispatched,
+                    post_dispatched=post_dispatched,
+                    pre_combined=pre_combined,
+                    async_op=True,
+                )
+            )
 
         shared_outputs = [
             self._shared_experts_forward(hidden) if self.n_shared_experts > 0 else None for hidden in routed_hiddens
         ]
 
         outputs: list[Tensor] = []
-        for invocation, residual, routed_hidden, shared_output in zip(
-            invocations,
+        for (
+            pre_dispatched,
+            dispatched,
+            post_dispatched,
+            pre_combined,
+            combined,
+            residual,
+            routed_hidden,
+            shared_output,
+        ) in zip(
+            pre_dispatched_list,
+            dispatched_list,
+            post_dispatched_list,
+            pre_combined_list,
+            combined_list,
             residuals,
             routed_hiddens,
             shared_outputs,
         ):
-            routed_output = invocation.combine_postprocess(async_op=True).view_as(routed_hidden)
+            post_combined = self.dispatcher.combine_postprocess(
+                pre_dispatched=pre_dispatched,
+                dispatched=dispatched,
+                post_dispatched=post_dispatched,
+                pre_combined=pre_combined,
+                combined=combined,
+                async_op=True,
+            )
+            routed_output = post_combined["hidden_states"].view_as(routed_hidden)
             outputs.append(
                 self._post_moe_forward(
                     combined_hidden_states=routed_output,
@@ -1226,7 +1057,7 @@ def build_ep_runtime(
     *,
     config: MoEConfig,
     ep_group: Any,
-) -> EPExecutionRuntime | None:
+) -> MoonEPRuntime | UltraEPRuntime | None:
     """One discriminator; UltraEP is not deepep + an orthogonal decoder overlay。"""
     if config.dispatcher == "moonep":
         return MoonEPRuntime(config=config, ep_group=ep_group)
@@ -1239,7 +1070,7 @@ def build_layer_dispatcher(
     *,
     config: MoEConfig,
     ep_group: Any,
-    runtime: EPExecutionRuntime | None,
+    runtime: MoonEPRuntime | UltraEPRuntime | None,
     layer_fqn: str,
     experts: MoEBlock,
 ) -> GenericDispatcher:
@@ -1354,6 +1185,8 @@ def register_moonep_layer(runtime: MoonEPRuntime, layer_fqn: str, experts: MoEBl
 def create_moonep_invocation(
     runtime: MoonEPRuntime,
     layer_binding: object,
+    *,
+    grad_slot: int,
 ) -> _MoonEPInvocation: ...
 
 
@@ -1383,13 +1216,36 @@ def create_external_ultraep_manager(
 ) -> Any: ...
 
 
-def refresh_external_master_pointers(manager: Any, experts: MoEBlock) -> None: ...
+def allocate_ultraep_master_grad_staging(config: MoEConfig) -> tuple[Tensor, Tensor]: ...
 
 
-def stage_master_grads_to_fp32(experts: MoEBlock) -> None: ...
+def bind_ultraep_layer_storage(
+    *,
+    manager: Any,
+    master_grad_staging: tuple[Tensor, Tensor],
+    layer_id: int,
+    experts: MoEBlock,
+    config: MoEConfig,
+) -> ExpertExecution:
+    """Register master pointers and return views over official strided replica storage。"""
+    ...
 
 
-def restore_fp32_master_grads_to_fsdp(experts: MoEBlock) -> None: ...
+def refresh_external_master_pointers(manager: Any, layer_id: int, experts: MoEBlock) -> None: ...
+
+
+def stage_master_grads_to_fp32(
+    master_grad_staging: tuple[Tensor, Tensor],
+    virtual_layer_id: int,
+    experts: MoEBlock,
+) -> None: ...
+
+
+def restore_fp32_master_grads_to_fsdp(
+    master_grad_staging: tuple[Tensor, Tensor],
+    virtual_layer_id: int,
+    experts: MoEBlock,
+) -> None: ...
 
 
 def current_stream_wait_event(event: object) -> None: ...
@@ -1420,9 +1276,6 @@ def validate_ultraep_fsdp_config(model: nn.Module, fsdp_config: Any) -> None:
 
 
 def validate_dual_gmm_supports_configured_replica_layout(config: Any) -> None: ...
-
-
-def iter_ultraep_dispatchers(model: nn.Module) -> Sequence[UltraEPDispatcher]: ...
 
 
 def build_deepep_dispatcher(*, n_routed_experts: int, ep_group: Any) -> GenericDispatcher: ...
@@ -1478,8 +1331,8 @@ def close_other_engine_resources(engine: TrainEngine) -> None: ...
 # - Router logical IDs/counts never mutate or leak physical semantics;
 # - MoonEP / UltraEP completion happens before FSDP post-backward;
 # - official R=2 strided replica views work, or config rejects them before FSDP mutation;
-# - UltraEP v1 rejects a second same-layer invocation before shared storage is overwritten;
+# - UltraEP v1 rejects a second same-layer call before shared storage is overwritten;
 # - each backend only enables Domino/MTP/reentrant paths declared by its capability boundary;
 # - ordinary FP8/CUTLASS/NPU paths still call their original three-argument Interface;
-# - DCP/HF state excludes all runtime/invocation tensors and cold-runtime restore works;
+# - DCP/HF state excludes all runtime/private-state tensors and cold-runtime restore works;
 # - explicit close permits rebuilding a different runtime in the same process.
