@@ -4,8 +4,8 @@
 
 1. concrete model-scoped runtimes；
 2. per-layer Dispatcher Adapter 与已有六阶段；
-3. Dispatcher stage results 与 backend-private state；
-4. storage-neutral expert execution；
+3. predecessor-only Dispatcher state 与 backend-private state；
+4. MLP-level expert weight layout 与 two-segment grouped linear；
 5. 单 microbatch、Domino、FSDP install 和 teardown 的主要调用端流程。
 
 省略了真实 backend import、stream 细节、错误文本和现有 Dispatcher 的具体通信代码。
@@ -21,7 +21,7 @@ from torch import Tensor, nn
 from torch.distributed.tensor import DTensor
 
 
-StageResult = dict[str, Any]
+StageState = dict[str, Any]
 DispatcherName = Literal["naive", "all2all", "deepep", "moonep", "ultraep"] | None
 
 
@@ -40,20 +40,20 @@ class RouterResults(TypedDict):
     tokens_per_expert: Tensor  # [E] logical counts；替代 topkens_per_expert
 
 
-class ProjectionExecution(NamedTuple):
-    """一层 grouped projection 的 storage-neutral tensor contract。
+ProjectionPair: TypeAlias = tuple[Tensor, Tensor]  # (fused_w1w3, fused_w2)
 
-    ``primary_weight=None`` 表示使用 GroupedLinear 自己的 Parameter。
-    ``secondary_weight`` 存在时，counts 的 group 顺序固定为 primary 后 secondary。
+
+class ExpertWeightLayout(NamedTuple):
+    """MLP-level tensor value; no runtime/plan/event crosses the compile Seam.
+
+    The trainable segment must return dW to autograd.  The optional external
+    segment is runtime-owned and receives dW only through explicit output tensors.
     """
 
-    primary_weight: Tensor | None = None
-    primary_grad_out: Tensor | None = None
-    secondary_weight: Tensor | None = None
-    secondary_grad_out: Tensor | None = None
-
-
-ExpertExecution: TypeAlias = tuple[ProjectionExecution, ProjectionExecution]
+    trainable_weights: ProjectionPair | None = None
+    trainable_wgrad_outs: ProjectionPair | None = None
+    external_weights: ProjectionPair | None = None
+    external_wgrad_outs: ProjectionPair | None = None
 
 
 # =============================================================================
@@ -62,11 +62,11 @@ ExpertExecution: TypeAlias = tuple[ProjectionExecution, ProjectionExecution]
 
 
 class GenericDispatcher(ABC):
-    """保留现有六阶段 Interface。
+    """六阶段 predecessor-only state pipeline。
 
     ``prepare_layer_input`` 是 UltraEP backward ordering 所需的唯一
     pre-attention hook；默认返回 identity tensor 和空 state。它不包装、替代
-    或缓存后续六阶段。
+    或缓存后续六阶段。Flags 只在 phase 1 写入 state。
     """
 
     def prepare_layer_input(self, layer_input: Tensor) -> tuple[Tensor, object | None]:
@@ -81,81 +81,60 @@ class GenericDispatcher(ABC):
         topk_weights: Tensor,
         tokens_per_expert: Tensor,
         layer_state: object | None,
-        async_op: bool = False,
-    ) -> StageResult:
+        dispatch_async: bool = False,
+        combine_async: bool = False,
+        decoding: bool = False,
+    ) -> StageState:
         """阶段 1；tokens_per_expert 是 Router-owned logical [E] counts。"""
 
     @abstractmethod
     def dispatch(
         self,
-        *,
-        pre_dispatched: StageResult,
-        topk_weights: Tensor,
-        async_op: bool = False,
-        decoding: bool = False,
-    ) -> StageResult:
-        """阶段 2。"""
+        state: StageState,
+    ) -> StageState:
+        """阶段 2；只消费 phase-1 state。"""
 
     @abstractmethod
     def dispatch_postprocess(
         self,
-        *,
-        pre_dispatched: StageResult,
-        dispatched: StageResult,
-        async_op: bool = False,
-    ) -> StageResult:
-        """阶段 3；必须固定返回 expert_execution key，普通路径值为 None。"""
+        state: StageState,
+    ) -> StageState:
+        """阶段 3；交付 local tensors 与 call-local ExpertWeightLayout。"""
 
     @abstractmethod
     def combine_preprocess(
         self,
-        *,
-        hidden_states: Tensor,
-        pre_dispatched: StageResult,
-        dispatched: StageResult,
-        post_dispatched: StageResult,
-        async_op: bool = False,
-        decoding: bool = False,
-    ) -> StageResult:
-        """阶段 4。"""
+        state: StageState,
+        expert_output: Tensor,
+    ) -> StageState:
+        """阶段 4；state 是 phase-3 output。"""
 
     @abstractmethod
     def combine(
         self,
-        *,
-        pre_dispatched: StageResult,
-        dispatched: StageResult,
-        post_dispatched: StageResult,
-        pre_combined: StageResult,
-        async_op: bool = False,
-        decoding: bool = False,
-    ) -> StageResult:
-        """阶段 5。"""
+        state: StageState,
+    ) -> StageState:
+        """阶段 5；只消费 phase-4 state。"""
 
     @abstractmethod
     def combine_postprocess(
         self,
-        *,
-        pre_dispatched: StageResult,
-        dispatched: StageResult,
-        post_dispatched: StageResult,
-        pre_combined: StageResult,
-        combined: StageResult,
-        async_op: bool = False,
-    ) -> StageResult:
-        """阶段 6。"""
+        state: StageState,
+    ) -> Tensor:
+        """阶段 6；返回 routed expert output。"""
 
 
-# Existing Naive/All2All/DeepEP/AGRS Adapters only need two mechanical changes:
+# Existing Naive/All2All/DeepEP/AGRS Adapters only need three mechanical changes:
 #
-# 1. dispatch_preprocess accepts required Router tokens_per_expert and opaque layer_state;
-# 2. dispatch_postprocess always returns expert_execution=None.
+# 1. phase 1 stores flags/route metadata in its call-local state;
+# 2. every later phase accepts only the predecessor state;
+# 3. phase 3 returns ExpertWeightLayout() for the ordinary trainable-only path.
 #
 # Their communication Implementation and remaining five stages stay unchanged.
 
 
 # =============================================================================
-# 4. [MOONEP ADAPTER] 保留 Buffer / VMM / private autograd Implementation
+# 3. [MOONEP ADAPTER] 保留 Buffer / VMM / private autograd Implementation
 # =============================================================================
 
 
@@ -173,25 +152,19 @@ class _MoonEPInvocation:
     ) -> tuple[Tensor, Tensor]:
         raise NotImplementedError
 
-    def materialize_expert_execution(
+    def materialize_expert_layout(
         self,
-    ) -> tuple[Tensor, Tensor, ExpertExecution]:
-        """返回 dispatched hidden、local [2B] counts 和两 projection specs。"""
+    ) -> tuple[Tensor, Tensor, ExpertWeightLayout]:
+        """返回 dispatched hidden、local [2B] counts 和 MLP-level layout。"""
         hidden_states, local_counts, weights, grad_outputs = materialize_moonep_local_tensors(self)
-        w1w3, w2 = weights  # Differentiable _ExpertWeightAutograd outputs.
-        dw1w3, dw2 = grad_outputs
         return (
             hidden_states,
             local_counts,
-            (
-                ProjectionExecution(
-                    primary_weight=w1w3,
-                    primary_grad_out=dw1w3,
-                ),
-                ProjectionExecution(
-                    primary_weight=w2,
-                    primary_grad_out=dw2,
-                ),
+            ExpertWeightLayout(
+                # These aliases are differentiable _ExpertWeightAutograd outputs,
+                # so their direct dW must also be returned along that autograd edge.
+                trainable_weights=weights,
+                trainable_wgrad_outs=grad_outputs,
             ),
         )
 
@@ -254,25 +227,25 @@ class MoonEPDispatcher(GenericDispatcher):
         topk_weights: Tensor,
         tokens_per_expert: Tensor,
         layer_state: object | None,
-        async_op: bool = False,
-    ) -> StageResult:
-        del layer_state, async_op
+        dispatch_async: bool = False,
+        combine_async: bool = False,
+        decoding: bool = False,
+    ) -> StageState:
+        del layer_state, decoding
         return {
             "hidden_states": hidden_states,
             "topk_ids": topk_ids.to(torch.int32).contiguous(),
             "topk_weights": topk_weights,
             # Router histogram is reused; no second bincount(topk_ids).
             "tokens_per_expert": tokens_per_expert.to(torch.int32).contiguous(),
+            "_dispatch_async": dispatch_async,
+            "_combine_async": combine_async,
         }
 
     def dispatch(
         self,
-        *,
-        pre_dispatched: StageResult,
-        topk_weights: Tensor,
-        async_op: bool = False,
-        decoding: bool = False,
-    ) -> StageResult:
+        state: StageState,
+    ) -> StageState:
         grad_slot = self._next_gradient_slot
         self._next_gradient_slot = (grad_slot + 1) % self.runtime.config.intra_layer_micro_batch
         invocation = create_moonep_invocation(
@@ -281,87 +254,82 @@ class MoonEPDispatcher(GenericDispatcher):
             grad_slot=grad_slot,
         )
         hidden_states, weights = invocation.dispatch(
-            pre_dispatched["hidden_states"],
-            pre_dispatched["topk_ids"],
+            state["hidden_states"],
+            state["topk_ids"],
             # Keep the differentiable cast used by MoonEP's fused route-scaled combine.
-            topk_weights.to(torch.float32).contiguous(),
-            pre_dispatched["tokens_per_expert"],
-            async_op=async_op,
+            state["topk_weights"].to(torch.float32).contiguous(),
+            state["tokens_per_expert"],
+            async_op=state["_dispatch_async"],
         )
         return {
             "hidden_states": hidden_states,
             "topk_weights": weights,
             "_invocation": invocation,
+            "_combine_async": state["_combine_async"],
         }
 
     def dispatch_postprocess(
         self,
-        *,
-        pre_dispatched: StageResult,
-        dispatched: StageResult,
-        async_op: bool = False,
-    ) -> StageResult:
-        invocation = cast(_MoonEPInvocation, dispatched["_invocation"])
-        hidden_states, local_counts, execution = invocation.materialize_expert_execution()
+        state: StageState,
+    ) -> StageState:
+        invocation = cast(_MoonEPInvocation, state["_invocation"])
+        hidden_states, local_counts, weight_layout = invocation.materialize_expert_layout()
         return {
             "hidden_states": hidden_states,
             "tokens_per_expert": local_counts,  # [2B], device resident
-            "expert_execution": execution,
+            "expert_weight_layout": weight_layout,
+            "topk_weights": state["topk_weights"],
+            "_invocation": invocation,
+            "_combine_async": state["_combine_async"],
         }
 
     def combine_preprocess(
         self,
-        *,
-        hidden_states: Tensor,
-        pre_dispatched: StageResult,
-        dispatched: StageResult,
-        post_dispatched: StageResult,
-        async_op: bool = False,
-        decoding: bool = False,
-    ) -> StageResult:
-        invocation = cast(_MoonEPInvocation, dispatched["_invocation"])
+        state: StageState,
+        expert_output: Tensor,
+    ) -> StageState:
+        invocation = cast(_MoonEPInvocation, state["_invocation"])
         return {
-            "hidden_states": invocation.combine_preprocess(hidden_states, async_op=async_op),
+            "hidden_states": invocation.combine_preprocess(
+                expert_output,
+                async_op=state["_combine_async"],
+            ),
+            "topk_weights": state["topk_weights"],
+            "_invocation": invocation,
+            "_combine_async": state["_combine_async"],
         }
 
     def combine(
         self,
-        *,
-        pre_dispatched: StageResult,
-        dispatched: StageResult,
-        post_dispatched: StageResult,
-        pre_combined: StageResult,
-        async_op: bool = False,
-        decoding: bool = False,
-    ) -> StageResult:
-        invocation = cast(_MoonEPInvocation, dispatched["_invocation"])
+        state: StageState,
+    ) -> StageState:
+        invocation = cast(_MoonEPInvocation, state["_invocation"])
         return {
             "hidden_states": invocation.combine(
-                pre_combined["hidden_states"],
-                dispatched["topk_weights"],
-                async_op=async_op,
+                state["hidden_states"],
+                state["topk_weights"],
+                async_op=state["_combine_async"],
             ),
+            "_invocation": invocation,
+            "_combine_async": state["_combine_async"],
         }
 
     def combine_postprocess(
         self,
-        *,
-        pre_dispatched: StageResult,
-        dispatched: StageResult,
-        post_dispatched: StageResult,
-        pre_combined: StageResult,
-        combined: StageResult,
-        async_op: bool = False,
-    ) -> StageResult:
-        invocation = cast(_MoonEPInvocation, dispatched["_invocation"])
-        output = invocation.combine_postprocess(combined["hidden_states"], async_op=async_op)
+        state: StageState,
+    ) -> Tensor:
+        invocation = cast(_MoonEPInvocation, state["_invocation"])
+        output = invocation.combine_postprocess(
+            state["hidden_states"],
+            async_op=state["_combine_async"],
+        )
         if not torch.is_grad_enabled():
             invocation.finish_forward_only()
-        return {"hidden_states": output}
+        return output
 
 
 # =============================================================================
-# 5. [ULTRAEP ADAPTER] model runtime + DeepEP decorator + ordering nodes
+# 4. [ULTRAEP ADAPTER] model runtime + DeepEP decorator + ordering nodes
 # =============================================================================
 
 
@@ -466,7 +434,7 @@ class UltraEPRuntime:
 
     def validate_before_fsdp(self, *, model: nn.Module, fsdp_config: Any) -> None:
         validate_ultraep_fsdp_config(model, fsdp_config)
-        validate_dual_gmm_supports_configured_replica_layout(self.config)
+        validate_two_segment_gmm_supports_configured_layout(self.config)
 
     def install_after_fsdp(self, *, model: nn.Module, fsdp_config: Any) -> None:
         del model, fsdp_config
@@ -477,7 +445,7 @@ class UltraEPRuntime:
         )
         self.master_grad_staging = allocate_ultraep_master_grad_staging(self.config)
         for dispatcher in self.dispatchers:
-            dispatcher.expert_execution = bind_ultraep_layer_storage(
+            bind_ultraep_layer_storage(
                 manager=self.manager,
                 master_grad_staging=self.master_grad_staging,
                 layer_id=dispatcher.layer_id,
@@ -505,7 +473,7 @@ class UltraEPRuntime:
 
 
 class UltraEPDispatcher(GenericDispatcher):
-    """UltraEP control plane around an unchanged DeepEP six-stage Implementation。"""
+    """UltraEP control plane around DeepEP's unchanged communication Implementation。"""
 
     def __init__(
         self,
@@ -519,7 +487,6 @@ class UltraEPDispatcher(GenericDispatcher):
         self.layer_id = layer_id
         self.experts = experts
         self.inner = inner
-        self.expert_execution: ExpertExecution
 
     def prepare_layer_input(self, layer_input: Tensor) -> tuple[Tensor, object | None]:
         virtual_layer_id = self.runtime._allocate_virtual_layer_id(self)
@@ -534,8 +501,10 @@ class UltraEPDispatcher(GenericDispatcher):
         topk_weights: Tensor,
         tokens_per_expert: Tensor,
         layer_state: object | None,
-        async_op: bool = False,
-    ) -> StageResult:
+        dispatch_async: bool = False,
+        combine_async: bool = False,
+        decoding: bool = False,
+    ) -> StageState:
         virtual_layer_id = cast(int, layer_state)
         manager = cast(Any, self.runtime.manager)
         # Placement, weight materialization and reroute share one external state key.
@@ -559,7 +528,9 @@ class UltraEPDispatcher(GenericDispatcher):
             # It accepts the required source-count argument but does not reinterpret it.
             tokens_per_expert=tokens_per_expert,
             layer_state=None,
-            async_op=async_op,
+            dispatch_async=dispatch_async,
+            combine_async=combine_async,
+            decoding=decoding,
         )
         return {
             "inner": inner_pre,
@@ -569,111 +540,75 @@ class UltraEPDispatcher(GenericDispatcher):
 
     def dispatch(
         self,
-        *,
-        pre_dispatched: StageResult,
-        topk_weights: Tensor,
-        async_op: bool = False,
-        decoding: bool = False,
-    ) -> StageResult:
+        state: StageState,
+    ) -> StageState:
         return {
-            "inner": self.inner.dispatch(
-                pre_dispatched=pre_dispatched["inner"],
-                topk_weights=topk_weights,
-                async_op=async_op,
-                decoding=decoding,
-            )
+            "inner": self.inner.dispatch(state["inner"]),
+            "_virtual_layer_id": state["_virtual_layer_id"],
+            "_weight_sync_event": state["_weight_sync_event"],
         }
 
     def dispatch_postprocess(
         self,
-        *,
-        pre_dispatched: StageResult,
-        dispatched: StageResult,
-        async_op: bool = False,
-    ) -> StageResult:
-        inner_post = self.inner.dispatch_postprocess(
-            pre_dispatched=pre_dispatched["inner"],
-            dispatched=dispatched["inner"],
-            async_op=async_op,
-        )
+        state: StageState,
+    ) -> StageState:
+        inner_post = self.inner.dispatch_postprocess(state["inner"])
         # Device-side dependency only; do not synchronize the host.
-        current_stream_wait_event(pre_dispatched["_weight_sync_event"])
+        current_stream_wait_event(state["_weight_sync_event"])
+        external_weights, external_wgrad_outs = get_ultraep_call_storage(
+            manager=cast(Any, self.runtime.manager),
+            layer_id=self.layer_id,
+            virtual_layer_id=state["_virtual_layer_id"],
+        )
         return {
             "hidden_states": inner_post["hidden_states"],
             # DeepEP local order is fixed to [B master groups, R replica groups].
             "tokens_per_expert": inner_post["tokens_per_expert"],
-            "expert_execution": self.expert_execution,
+            "expert_weight_layout": ExpertWeightLayout(
+                external_weights=external_weights,
+                external_wgrad_outs=external_wgrad_outs,
+            ),
             "inner": inner_post,
+            "_virtual_layer_id": state["_virtual_layer_id"],
         }
 
     def combine_preprocess(
         self,
-        *,
-        hidden_states: Tensor,
-        pre_dispatched: StageResult,
-        dispatched: StageResult,
-        post_dispatched: StageResult,
-        async_op: bool = False,
-        decoding: bool = False,
-    ) -> StageResult:
-        virtual_layer_id = cast(int, pre_dispatched["_virtual_layer_id"])
+        state: StageState,
+        expert_output: Tensor,
+    ) -> StageState:
+        virtual_layer_id = cast(int, state["_virtual_layer_id"])
         replay_edge = _UltraEPWeightSyncForBackward.apply(
-            hidden_states,
+            expert_output,
             self,
             virtual_layer_id,
         )
         inner_pre_combined = self.inner.combine_preprocess(
-            hidden_states=replay_edge,
-            pre_dispatched=pre_dispatched["inner"],
-            dispatched=dispatched["inner"],
-            post_dispatched=post_dispatched["inner"],
-            async_op=async_op,
-            decoding=decoding,
+            state["inner"],
+            replay_edge,
         )
-        return {"inner": inner_pre_combined}
+        return {
+            "inner": inner_pre_combined,
+            "_virtual_layer_id": virtual_layer_id,
+        }
 
     def combine(
         self,
-        *,
-        pre_dispatched: StageResult,
-        dispatched: StageResult,
-        post_dispatched: StageResult,
-        pre_combined: StageResult,
-        async_op: bool = False,
-        decoding: bool = False,
-    ) -> StageResult:
+        state: StageState,
+    ) -> StageState:
         return {
-            "inner": self.inner.combine(
-                pre_dispatched=pre_dispatched["inner"],
-                dispatched=dispatched["inner"],
-                post_dispatched=post_dispatched["inner"],
-                pre_combined=pre_combined["inner"],
-                async_op=async_op,
-                decoding=decoding,
-            )
+            "inner": self.inner.combine(state["inner"]),
+            "_virtual_layer_id": state["_virtual_layer_id"],
         }
 
     def combine_postprocess(
         self,
-        *,
-        pre_dispatched: StageResult,
-        dispatched: StageResult,
-        post_dispatched: StageResult,
-        pre_combined: StageResult,
-        combined: StageResult,
-        async_op: bool = False,
-    ) -> StageResult:
-        inner_post = self.inner.combine_postprocess(
-            pre_dispatched=pre_dispatched["inner"],
-            dispatched=dispatched["inner"],
-            post_dispatched=post_dispatched["inner"],
-            pre_combined=pre_combined["inner"],
-            combined=combined["inner"],
-            async_op=async_op,
-        )
+        state: StageState,
+    ) -> Tensor:
+        output = self.inner.combine_postprocess(state["inner"])
         if not torch.is_grad_enabled():
             self.runtime._release_virtual_layer_id(self.layer_id)
-        return {"hidden_states": inner_post["hidden_states"]}
+        return output
 
     def _replay_weights_for_backward(self, virtual_layer_id: int) -> None:
         manager = cast(Any, self.runtime.manager)
@@ -696,12 +631,26 @@ class UltraEPDispatcher(GenericDispatcher):
 
 
 # =============================================================================
-# 6. [CHANGED EXPERT COMPUTE] 普通路径不接收动态 backend kwargs
+# 5. [CHANGED EXPERT COMPUTE] one/two-segment grouped-linear Interface
 # =============================================================================
 
 
+class _GroupedGemmSchedule(NamedTuple):
+    """Per-call, read-only device metadata shared by both fused projections."""
+
+    counts: Tensor
+    group_starts: Tensor
+    group_ends: Tensor
+    padded_group_starts: Tensor
+    group_by_m_tile: Tensor
+    padded_rows: Tensor
+
+
+GROUPED_GEMM_M_TILE = 128  # Triton Implementation constant, not a public layout field.
+
+
 class GroupedLinear(nn.Module):
-    """仅展示 public old path 与 dynamic BF16 capability。"""
+    """Parameter owner with one canonical forward Interface."""
 
     weight: nn.Parameter
     local_out_features: int
@@ -710,59 +659,40 @@ class GroupedLinear(nn.Module):
     def forward(
         self,
         hidden_states: Tensor,
-        tokens_per_expert: Tensor,
-        decoding: bool = False,
+        schedule: _GroupedGemmSchedule,
+        *,
+        trainable_weight: Tensor | None = None,
+        trainable_wgrad_out: Tensor | None = None,
+        external_weight: Tensor | None = None,
+        external_wgrad_out: Tensor | None = None,
     ) -> Tensor:
-        # Existing public Interface used by ordinary BF16/FP8/CUTLASS/NPU substitutes.
-        weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
-        weight = weight.view(-1, self.local_out_features, self.local_in_features)
-        return existing_group_gemm(
-            hidden_states,
-            weight,
-            tokens_per_expert,
-            decoding=decoding,
-        )
-
-    def forward_with_execution(
-        self,
-        hidden_states: Tensor,
-        tokens_per_expert: Tensor,
-        execution: ProjectionExecution,
-    ) -> Tensor:
-        """Only validated dynamic BF16 configs call this concrete capability。"""
-        if execution.primary_weight is None:
-            primary = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
-            primary = primary.view(-1, self.local_out_features, self.local_in_features)
-        else:
-            # MoonEP already supplies a shaped contiguous local [2B, out, in] VMM view.
-            primary = execution.primary_weight
-
-        if execution.secondary_weight is None:
-            if execution.primary_grad_out is None:
-                return existing_group_gemm(hidden_states, primary, tokens_per_expert)
-            return group_gemm_with_direct_grad_out(
-                hidden_states,
-                primary,
-                tokens_per_expert,
-                grad_weight_out=execution.primary_grad_out,
+        if trainable_weight is None:
+            trainable_weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+            trainable_weight = trainable_weight.view(
+                -1,
+                self.local_out_features,
+                self.local_in_features,
             )
 
-        # Kernel uses the external storage contract directly. It must not call contiguous().
-        return dual_allocation_group_gemm(
+        return grouped_linear(
             hidden_states,
-            primary_weight=primary,
-            secondary_weight=execution.secondary_weight,
-            tokens_per_expert=tokens_per_expert,
-            primary_grad_out=execution.primary_grad_out,
-            secondary_grad_out=execution.secondary_grad_out,
-            secondary_expert_stride=execution.secondary_weight.stride(0),
+            schedule,
+            trainable_weight,
+            trainable_wgrad_out=trainable_wgrad_out,
+            external_weight=external_weight,
+            external_wgrad_out=external_wgrad_out,
         )
 
 
 class MoEBlock(nn.Module):
-    """不出现 MoonEP/UltraEP backend name。"""
+    """Owns fused projections; no Dispatcher/backend names enter this Module."""
 
-    def __init__(self, fused_w1w3: nn.Module, fused_w2: nn.Module, moe_act: nn.Module) -> None:
+    def __init__(
+        self,
+        fused_w1w3: GroupedLinear,
+        fused_w2: GroupedLinear,
+        moe_act: nn.Module,
+    ) -> None:
         super().__init__()
         self.fused_w1w3 = fused_w1w3
         self.fused_w2 = fused_w2
@@ -773,33 +703,44 @@ class MoEBlock(nn.Module):
         hidden_states: Tensor,
         tokens_per_expert: Tensor,
         *,
-        decoding: bool,
-        execution: ExpertExecution | None,
+        weight_layout: ExpertWeightLayout,
     ) -> Tensor:
-        if execution is None:
-            # Crucial: no new kwargs reach TileWise FP8/CUTLASS/NPU substitutes.
-            gate_up = self.fused_w1w3(hidden_states, tokens_per_expert, decoding)
-            activated = self.moe_act(gate_up)
-            return self.fused_w2(activated, tokens_per_expert, decoding)
-
-        # Config validation guarantees dynamic paths use this concrete capability.
-        w1w3 = cast(GroupedLinear, self.fused_w1w3)
-        w2 = cast(GroupedLinear, self.fused_w2)
-        gate_up_execution, down_execution = execution
-        gate_up = w1w3.forward_with_execution(
-            hidden_states,
+        # Critical for Domino: this value is owned by this call/autograd graph.
+        # Never cache it on MoEBlock, GroupedLinear, or Dispatcher.
+        schedule = build_grouped_gemm_schedule(
             tokens_per_expert,
-            gate_up_execution,
+            num_rows=hidden_states.shape[0],
         )
-        return w2.forward_with_execution(
+
+        trainable_w1w3 = None if weight_layout.trainable_weights is None else weight_layout.trainable_weights[0]
+        trainable_w2 = None if weight_layout.trainable_weights is None else weight_layout.trainable_weights[1]
+        trainable_dw1w3 = None if weight_layout.trainable_wgrad_outs is None else weight_layout.trainable_wgrad_outs[0]
+        trainable_dw2 = None if weight_layout.trainable_wgrad_outs is None else weight_layout.trainable_wgrad_outs[1]
+        external_w1w3 = None if weight_layout.external_weights is None else weight_layout.external_weights[0]
+        external_w2 = None if weight_layout.external_weights is None else weight_layout.external_weights[1]
+        external_dw1w3 = None if weight_layout.external_wgrad_outs is None else weight_layout.external_wgrad_outs[0]
+        external_dw2 = None if weight_layout.external_wgrad_outs is None else weight_layout.external_wgrad_outs[1]
+
+        gate_up = self.fused_w1w3(
+            hidden_states,
+            schedule,
+            trainable_weight=trainable_w1w3,
+            trainable_wgrad_out=trainable_dw1w3,
+            external_weight=external_w1w3,
+            external_wgrad_out=external_dw1w3,
+        )
+        return self.fused_w2(
             self.moe_act(gate_up),
-            tokens_per_expert,
-            down_execution,
+            schedule,
+            trainable_weight=trainable_w2,
+            trainable_wgrad_out=trainable_dw2,
+            external_weight=external_w2,
+            external_wgrad_out=external_dw2,
         )
 
 
 # =============================================================================
-# 7. [CLIENT] Decoder 单 microbatch 与 Domino 的主要流程
+# 6. [CLIENT] Decoder 单 microbatch 与 Domino 的主要流程
 # =============================================================================
 
 
@@ -825,54 +766,30 @@ class MoEDecoderLayer(nn.Module):
         )
         origin_shape = routed_hidden.shape
 
-        pre_dispatched = self.dispatcher.dispatch_preprocess(
+        state = self.dispatcher.dispatch_preprocess(
             hidden_states=routed_hidden.view(-1, routed_hidden.shape[-1]),
             topk_ids=router["topk_ids"],
             topk_weights=router["topk_weights"],
             tokens_per_expert=router["tokens_per_expert"],
             layer_state=layer_state,
+            dispatch_async=False,
+            combine_async=True,
+            decoding=False,
         )
-        dispatched = self.dispatcher.dispatch(
-            pre_dispatched=pre_dispatched,
-            topk_weights=router["topk_weights"],
-        )
-        post_dispatched = self.dispatcher.dispatch_postprocess(
-            pre_dispatched=pre_dispatched,
-            dispatched=dispatched,
-        )
+        state = self.dispatcher.dispatch(state)
+        state = self.dispatcher.dispatch_postprocess(state)
 
         expert_output = self.experts(
-            post_dispatched["hidden_states"],
-            post_dispatched["tokens_per_expert"],
-            decoding=False,
-            execution=post_dispatched["expert_execution"],
+            state["hidden_states"],
+            state["tokens_per_expert"],
+            weight_layout=state["expert_weight_layout"],
         )
-        pre_combined = self.dispatcher.combine_preprocess(
-            hidden_states=expert_output,
-            pre_dispatched=pre_dispatched,
-            dispatched=dispatched,
-            post_dispatched=post_dispatched,
-            async_op=True,
-        )
-        combined = self.dispatcher.combine(
-            pre_dispatched=pre_dispatched,
-            dispatched=dispatched,
-            post_dispatched=post_dispatched,
-            pre_combined=pre_combined,
-            async_op=True,
-        )
+        state = self.dispatcher.combine_preprocess(state, expert_output)
+        state = self.dispatcher.combine(state)
 
         # Existing overlap stays: routed combine runs while shared experts compute.
         shared_output = self._shared_experts_forward(routed_hidden) if self.n_shared_experts > 0 else None
-        post_combined = self.dispatcher.combine_postprocess(
-            pre_dispatched=pre_dispatched,
-            dispatched=dispatched,
-            post_dispatched=post_dispatched,
-            pre_combined=pre_combined,
-            combined=combined,
-            async_op=True,
-        )
-        routed_output = post_combined["hidden_states"].view(*origin_shape)
+        routed_output = self.dispatcher.combine_postprocess(state).view(*origin_shape)
         output = self._post_moe_forward(
             combined_hidden_states=routed_output,
             residual=residual,
@@ -892,7 +809,7 @@ class MoEDecoderLayer(nn.Module):
         residuals: list[Tensor] = []
         routed_hiddens: list[Tensor] = []
         routers: list[RouterResults] = []
-        pre_dispatched_list: list[StageResult] = []
+        states: list[StageState] = []
 
         # Attention + logical router + phase 1.
         for layer_input, seq_ctx, pos_emb in zip(layer_inputs, seq_ctxs, position_embeddings):
@@ -902,102 +819,51 @@ class MoEDecoderLayer(nn.Module):
                 seq_ctx=seq_ctx,
                 position_embeddings=pos_emb,
             )
-            pre_dispatched = self.dispatcher.dispatch_preprocess(
+            state = self.dispatcher.dispatch_preprocess(
                 hidden_states=routed_hidden.view(-1, routed_hidden.shape[-1]),
                 topk_ids=router["topk_ids"],
                 topk_weights=router["topk_weights"],
                 tokens_per_expert=router["tokens_per_expert"],
                 layer_state=layer_state,
-                async_op=True,
+                dispatch_async=True,
+                combine_async=True,
+                decoding=False,
             )
             residuals.append(residual)
             routed_hiddens.append(routed_hidden)
             routers.append(router)
-            pre_dispatched_list.append(pre_dispatched)
+            states.append(state)
 
-        # Phases 2-4 and expert compute.
-        dispatched_list: list[StageResult] = []
-        post_dispatched_list: list[StageResult] = []
-        pre_combined_list: list[StageResult] = []
-        for router, pre_dispatched in zip(routers, pre_dispatched_list):
-            dispatched = self.dispatcher.dispatch(
-                pre_dispatched=pre_dispatched,
-                topk_weights=router["topk_weights"],
-                async_op=True,
-            )
-            post_dispatched = self.dispatcher.dispatch_postprocess(
-                pre_dispatched=pre_dispatched,
-                dispatched=dispatched,
-                async_op=True,
-            )
+        # Preserve xtuner_ep_domino.md's Loop B: phases 2-4 stay consecutive
+        # for each microbatch.  D1 can overlap E0/Cpre0 on another stream.
+        for index, state in enumerate(states):
+            state = self.dispatcher.dispatch(state)
+            state = self.dispatcher.dispatch_postprocess(state)
+            # The schedule and weight layout are captured by this microbatch's
+            # autograd graph; neither is cached on the shared Dispatcher/Module.
             expert_output = self.experts(
-                post_dispatched["hidden_states"],
-                post_dispatched["tokens_per_expert"],
-                decoding=False,
-                execution=post_dispatched["expert_execution"],
+                state["hidden_states"],
+                state["tokens_per_expert"],
+                weight_layout=state["expert_weight_layout"],
             )
-            pre_combined = self.dispatcher.combine_preprocess(
-                hidden_states=expert_output,
-                pre_dispatched=pre_dispatched,
-                dispatched=dispatched,
-                post_dispatched=post_dispatched,
-                async_op=True,
-            )
-            dispatched_list.append(dispatched)
-            post_dispatched_list.append(post_dispatched)
-            pre_combined_list.append(pre_combined)
+            states[index] = self.dispatcher.combine_preprocess(state, expert_output)
 
         # Phase 5 is launched for all microbatches before shared expert compute.
-        combined_list: list[StageResult] = []
-        for pre_dispatched, dispatched, post_dispatched, pre_combined in zip(
-            pre_dispatched_list,
-            dispatched_list,
-            post_dispatched_list,
-            pre_combined_list,
-        ):
-            combined_list.append(
-                self.dispatcher.combine(
-                    pre_dispatched=pre_dispatched,
-                    dispatched=dispatched,
-                    post_dispatched=post_dispatched,
-                    pre_combined=pre_combined,
-                    async_op=True,
-                )
-            )
+        for index, state in enumerate(states):
+            states[index] = self.dispatcher.combine(state)
 
         shared_outputs = [
             self._shared_experts_forward(hidden) if self.n_shared_experts > 0 else None for hidden in routed_hiddens
         ]
 
         outputs: list[Tensor] = []
-        for (
-            pre_dispatched,
-            dispatched,
-            post_dispatched,
-            pre_combined,
-            combined,
-            residual,
-            routed_hidden,
-            shared_output,
-        ) in zip(
-            pre_dispatched_list,
-            dispatched_list,
-            post_dispatched_list,
-            pre_combined_list,
-            combined_list,
+        for state, residual, routed_hidden, shared_output in zip(
+            states,
             residuals,
             routed_hiddens,
             shared_outputs,
         ):
-            post_combined = self.dispatcher.combine_postprocess(
-                pre_dispatched=pre_dispatched,
-                dispatched=dispatched,
-                post_dispatched=post_dispatched,
-                pre_combined=pre_combined,
-                combined=combined,
-                async_op=True,
-            )
-            routed_output = post_combined["hidden_states"].view_as(routed_hidden)
+            routed_output = self.dispatcher.combine_postprocess(state).view_as(routed_hidden)
             outputs.append(
                 self._post_moe_forward(
                     combined_hidden_states=routed_output,
@@ -1036,7 +902,7 @@ class MoEDecoderLayer(nn.Module):
 
 
 # =============================================================================
-# 8. [CLIENT] Config、model build、FSDP install 与 teardown
+# 7. [CLIENT] Config、model build、FSDP install 与 teardown
 # =============================================================================
 
 
@@ -1137,42 +1003,132 @@ def trainer_normal_teardown(trainer: Any) -> None:
 
 
 # =============================================================================
-# 9. [KERNEL CONTRACT] dual allocation 不复制 official strided replicas
+# 8. [KERNEL CONTRACT] one schedule + two ownership segments
 # =============================================================================
 
 
-def dual_allocation_group_gemm(
-    hidden_states: Tensor,
-    *,
-    primary_weight: Tensor,
-    secondary_weight: Tensor,
+def build_grouped_gemm_schedule(
     tokens_per_expert: Tensor,
-    primary_grad_out: Tensor | None,
-    secondary_grad_out: Tensor | None,
-    secondary_expert_stride: int,
+    num_rows: int,
+) -> _GroupedGemmSchedule:
+    """Build device metadata once; no ``cpu()``, ``item()`` or Module cache."""
+    counts = tokens_per_expert.to(torch.int32).contiguous()
+    group_ends = counts.cumsum(0)
+    group_starts = group_ends - counts
+    padded_counts = ((counts + GROUPED_GEMM_M_TILE - 1) // GROUPED_GEMM_M_TILE) * GROUPED_GEMM_M_TILE
+    padded_ends = padded_counts.cumsum(0)
+    padded_group_starts = padded_ends - padded_counts
+    tiles_per_group = padded_counts // GROUPED_GEMM_M_TILE
+    # Fixed-capacity output avoids a host read of sum(tiles_per_group).
+    group_by_m_tile = counts.new_empty(num_rows // GROUPED_GEMM_M_TILE + counts.shape[0])
+    device_repeat_interleave_out(
+        torch.arange(counts.shape[0], device=counts.device, dtype=torch.int32),
+        tiles_per_group,
+        group_by_m_tile,
+    )
+    return _GroupedGemmSchedule(
+        counts=counts,
+        group_starts=group_starts,
+        group_ends=group_ends,
+        padded_group_starts=padded_group_starts,
+        group_by_m_tile=group_by_m_tile,
+        padded_rows=padded_ends[-1:],
+    )
+
+
+class _TwoSegmentGroupedLinear(torch.autograd.Function):
+    """Autograd Adapter around fixed-schema stride-aware custom ops."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: Tensor,
+        trainable_weight: Tensor,
+        trainable_wgrad_out: Tensor | None,
+        external_weight: Tensor | None,
+        external_wgrad_out: Tensor | None,
+        *schedule_tensors: Tensor,
+    ) -> Tensor:
+        schedule = _GroupedGemmSchedule(*schedule_tensors)
+        if external_weight is None:
+            # Private zero-group canonicalization keeps the custom-op schema fixed;
+            # the caller never passes sentinel tensors.
+            external_weight = trainable_weight.new_empty((0, trainable_weight.shape[1], trainable_weight.shape[2]))
+            external_wgrad_out = torch.empty_like(external_weight)
+
+        # Runtime-owned replicas may be replayed before DGrad.  Keeping this as a
+        # plain ctx attribute avoids a saved-tensor version check on refreshed data.
+        ctx.external_weight = external_weight
+        ctx.external_wgrad_out = external_wgrad_out
+        ctx.trainable_wgrad_out = trainable_wgrad_out
+        ctx.save_for_backward(x, trainable_weight, *schedule_tensors)
+        return grouped_linear_forward_op(
+            x,
+            trainable_weight,
+            external_weight,
+            schedule.counts,
+            schedule.group_starts,
+            schedule.group_ends,
+            schedule.padded_group_starts,
+            schedule.group_by_m_tile,
+            schedule.padded_rows,
+        )
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor | None, ...]:
+        x, trainable_weight, *schedule_tensors = ctx.saved_tensors
+        schedule = _GroupedGemmSchedule(*schedule_tensors)
+        trainable_dw = ctx.trainable_wgrad_out
+        if trainable_dw is None:
+            trainable_dw = torch.empty_like(trainable_weight)
+
+        external_dw = ctx.external_wgrad_out
+        assert external_dw is not None  # production validation enforces paired storage
+        dx = grouped_linear_backward_out_op(
+            grad_output,
+            x,
+            trainable_weight,
+            ctx.external_weight,
+            trainable_dw,
+            external_dw,
+            schedule.counts,
+            schedule.group_starts,
+            schedule.group_ends,
+            schedule.padded_group_starts,
+            schedule.group_by_m_tile,
+            schedule.padded_rows,
+        )
+        # external_weight is runtime-owned: its dW is only the explicit side output.
+        return dx, trainable_dw, None, None, None, *(None for _ in schedule_tensors)
+
+
+def grouped_linear(
+    x: Tensor,
+    schedule: _GroupedGemmSchedule,
+    trainable_weight: Tensor,
+    *,
+    trainable_wgrad_out: Tensor | None = None,
+    external_weight: Tensor | None = None,
+    external_wgrad_out: Tensor | None = None,
 ) -> Tensor:
-    """伪代码 contract；真实 op 实现 forward、DGrad 和两类 WGrad。
+    """The only caller-facing grouped-linear Interface.
 
-    Group ordering:
-        tokens_per_expert[:primary_weight.shape[0]] -> primary allocation
-        remaining groups -> secondary allocation
-
-    ``secondary_expert_stride`` comes from the real view. The op must not assert that
-    ``secondary_weight.is_contiguous()`` and must not create a contiguous snapshot.
+    Groups are ordered ``[trainable, external]``.  Every tensor carries its own
+    storage offset/strides; no backend name, transpose flag or explicit expert
+    stride enters this Interface.
     """
-    return launch_stride_aware_dual_gmm(
-        hidden_states,
-        primary_weight,
-        secondary_weight,
-        tokens_per_expert,
-        primary_grad_out,
-        secondary_grad_out,
-        secondary_expert_stride,
+    return _TwoSegmentGroupedLinear.apply(
+        x,
+        trainable_weight,
+        trainable_wgrad_out,
+        external_weight,
+        external_wgrad_out,
+        *schedule,
     )
 
 
 # =============================================================================
-# 10. Omitted production implementations / external boundaries
+# 9. Omitted production implementations / external boundaries
 # =============================================================================
 
 
@@ -1226,8 +1182,18 @@ def bind_ultraep_layer_storage(
     layer_id: int,
     experts: MoEBlock,
     config: MoEConfig,
-) -> ExpertExecution:
-    """Register master pointers and return views over official strided replica storage。"""
+) -> None:
+    """Register current layer storage; per-call views are fetched by virtual ID。"""
+    ...
+
+
+def get_ultraep_call_storage(
+    *,
+    manager: Any,
+    layer_id: int,
+    virtual_layer_id: int,
+) -> tuple[ProjectionPair, ProjectionPair]:
+    """Return (external weights, external WGrad targets) for this call only。"""
     ...
 
 
@@ -1275,31 +1241,50 @@ def validate_ultraep_fsdp_config(model: nn.Module, fsdp_config: Any) -> None:
         raise ValueError("UltraEP v1 does not support activation recompute")
 
 
-def validate_dual_gmm_supports_configured_replica_layout(config: Any) -> None: ...
+def validate_two_segment_gmm_supports_configured_layout(config: Any) -> None: ...
 
 
 def build_deepep_dispatcher(*, n_routed_experts: int, ep_group: Any) -> GenericDispatcher: ...
 
 
-def existing_group_gemm(
-    hidden_states: Tensor,
-    weight: Tensor,
-    tokens_per_expert: Tensor,
-    *,
-    decoding: bool = False,
-) -> Tensor: ...
+def device_repeat_interleave_out(
+    group_ids: Tensor,
+    repeats: Tensor,
+    out: Tensor,
+) -> None: ...
 
 
-def group_gemm_with_direct_grad_out(
-    hidden_states: Tensor,
-    weight: Tensor,
-    tokens_per_expert: Tensor,
-    *,
-    grad_weight_out: Tensor,
-) -> Tensor: ...
+def grouped_linear_forward_op(
+    x: Tensor,
+    trainable_weight: Tensor,
+    external_weight: Tensor,
+    counts: Tensor,
+    group_starts: Tensor,
+    group_ends: Tensor,
+    padded_group_starts: Tensor,
+    group_by_m_tile: Tensor,
+    padded_rows: Tensor,
+) -> Tensor:
+    """Fixed-schema, stride-aware one/two-segment forward custom op。"""
+    ...
 
 
-def launch_stride_aware_dual_gmm(*args: Any) -> Tensor: ...
+def grouped_linear_backward_out_op(
+    grad_output: Tensor,
+    x: Tensor,
+    trainable_weight: Tensor,
+    external_weight: Tensor,
+    trainable_dw_out: Tensor,
+    external_dw_out: Tensor,
+    counts: Tensor,
+    group_starts: Tensor,
+    group_ends: Tensor,
+    padded_group_starts: Tensor,
+    group_by_m_tile: Tensor,
+    padded_rows: Tensor,
+) -> Tensor:
+    """Return DGrad and cover both WGrad targets declared in ``mutates_args``。"""
+    ...
 
 
 def build_existing_dispatcher(
