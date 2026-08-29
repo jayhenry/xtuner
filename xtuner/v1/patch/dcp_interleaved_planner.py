@@ -63,6 +63,20 @@ class InterleavedShardSavePlanner(XtunerCacheSavePlanner):
 
     _interleaved_runs: dict[str, dict[tuple, Run]]
 
+    def capture_async_dtensor_layouts(self, state_dict: dict[str, object]) -> None:
+        """Resolve training-process meshes before a spawned saver sees them."""
+        self.set_up_planner(state_dict)
+        self._async_dtensor_runs: dict[str, tuple[Run, ...] | None] = {}
+        for fqn, obj in self.state_dict.items():
+            if isinstance(obj, DTensor):
+                layout = RuntimeLayout.from_dtensor(obj)
+                self._async_dtensor_runs[fqn] = tuple(layout.owned_runs()) if layout.is_interleaved else None
+
+        # The process saver receives the staged state_dict separately. Keep
+        # only pure layout metadata on the pickled planner, never live tensors.
+        del self.state_dict
+        self.mappings = {}
+
     def create_local_plan(self) -> SavePlan:
         # Build write items directly. Interleaved DTensors must NOT reach torch's default write-item
         # builder: ``compute_local_shape_and_global_offset`` raises for their ``_StridedShard``
@@ -77,9 +91,14 @@ class InterleavedShardSavePlanner(XtunerCacheSavePlanner):
             if isinstance(obj, DTensor):
                 if obj.device_mesh.get_coordinate() is None:
                     continue
-                layout = RuntimeLayout.from_dtensor(obj)
-                if layout.is_interleaved:
-                    items, run_map = _interleaved_write_items(fqn, obj, layout.owned_runs())
+                async_dtensor_runs = getattr(self, "_async_dtensor_runs", {})
+                if fqn in async_dtensor_runs:
+                    runs = async_dtensor_runs[fqn]
+                else:
+                    layout = RuntimeLayout.from_dtensor(obj)
+                    runs = tuple(layout.owned_runs()) if layout.is_interleaved else None
+                if runs is not None:
+                    items, run_map = _interleaved_write_items(fqn, obj, runs)
                     requests.extend(items)
                     self._interleaved_runs[fqn] = run_map
                 else:

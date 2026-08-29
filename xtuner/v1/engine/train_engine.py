@@ -450,14 +450,18 @@ class TrainEngine:
             async_save_kwargs: dict[str, Any] = {}
             state_dict_saver = importlib.import_module("torch.distributed.checkpoint.state_dict_saver")
             async_checkpointer_type = getattr(state_dict_saver, "AsyncCheckpointerType", None)
+            planner = InterleavedShardSavePlanner()
             if async_checkpointer_type is not None:
                 async_save_kwargs["async_checkpointer_type"] = async_checkpointer_type.PROCESS
+                # The spawned checkpoint process owns a fresh Gloo world and
+                # cannot resolve DeviceMesh PG names from the training process.
+                planner.capture_async_dtensor_layouts(state_dict)
 
             with profile_time_and_memory(f"[DCP async_save for {weights_dir}]"):
                 return cast(Any, dcp.async_save)(
                     state_dict,
                     checkpoint_id=incomplete_dir,
-                    planner=InterleavedShardSavePlanner(),
+                    planner=planner,
                     storage_writer=storage_writer,
                     process_group=async_checkpoint_pg,
                     **async_save_kwargs,

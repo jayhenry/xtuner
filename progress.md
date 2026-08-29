@@ -762,3 +762,27 @@ flowchart LR
 ```
 
 该门禁现在验证的是新架构的真实性能边界：MoonEP 可以为复用标准 Triton、CUTLASS 和 FP8 Adapter 支付一次明确的私有 D2D staging，但不能产生第二份 full-dW 临时量或把该细节泄漏回 GroupedLinear/GMM Interface。
+
+# 2026-08-29_EP扩展重构-07-Async-DCP布局固化
+
+最终 persistence 验收暴露出基线已有的 process-mode async DCP 缺陷：spawn 出的 checkpoint child 只有独立 Gloo world，无法解析训练进程 DeviceMesh 的 process-group names。修复在 parent 捕获 flattened FQN 对应的 DTensor run metadata，child 只消费纯整数布局，不再重新解析训练 PG。
+
+## 诊断与测试记录
+
+- 完整 persistence suite 首次为 `9 passed, 1 failed`；失败固定在 `InterleavedShardSavePlanner.create_local_plan()` 调用 `RuntimeLayout.from_dtensor()`。
+- 单例重复运行稳定失败；在 async launch 后立即 `future.result()` 仍失败，排除了并发 optimizer step、`TrainEngine.close()` 顺序和 MoonEP VMM teardown。
+- 临时 detached worktree 在重构前提交 `f3dbcc46` 运行同一用例仍以相同 PG-name 错误失败，确认不是本轮 EP 改造引入。
+- `InterleavedShardSavePlanner.capture_async_dtensor_layouts()` 在 parent flatten state dict，记录普通 DTensor 或 interleaved owned runs，随后主动丢弃 live tensor 引用；checkpoint child 继续对 staged state dict 生成标准 DCP plan。
+- 修复后 async DCP 并发 step/close/fresh-load 单例为 `1 passed`；planner 同步 round-trip/跨 topology reshard 为 `2 passed`；完整 persistence/lifecycle 为 `10 passed`。
+
+```mermaid
+flowchart LR
+    A["Training process<br/>full DeviceMesh PG registry"] --> B["Capture flattened DTensor runs"]
+    B --> C["Pure integer planner metadata"]
+    D["Shared-memory staged state_dict"] --> E["Spawned checkpoint process"]
+    C --> E
+    E --> F["Interleaved DCP SavePlan"]
+    F --> G["Checkpoint + fresh load PASS"]
+```
+
+该修复保持 checkpoint global-coordinate format、shared-memory staging 和 process writer 不变，也不让 planner 持有 model、DTensor 或 ProcessGroup；它只把必须在训练 PG 存活时解析的 layout 提前到正确的生命周期边界。
