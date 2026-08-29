@@ -501,16 +501,18 @@ UltraEP 则不同：同一次逻辑 GMM 横跨 trainable `[B]` 和 external `[R]
 | GMM Implementation | 当前关键性质 | MoonEP | UltraEP | 设计结论 |
 | --- | --- | --- | --- | --- |
 | XTuner BF16 Triton allocation-return | device counts；contiguous `[G,O,I]`；自然 BF16 dW | 直接兼容 `[2B]` alias | 不能表达两块 weight/两种 dW ownership | MoonEP 默认；复用 launcher 新增 UltraEP two-segment FWD/DGrad/WGrad |
-| XTuner BF16 CUTLASS | 自然 dW；当前 wrapper 对 counts `.cpu()`；单 base allocation | 数学与 autograd 兼容，但当前 host sync 不合格 | 现有 op 不兼容 | 先让 batch-size/problem arguments 全程 device-resident；UltraEP 需私有 multi-base problem descriptors，WGrad 建议按 BF16 master/FP32 external 分两次 typed launch |
+| XTuner BF16 CUTLASS | CUDA `int64` counts；device-only problem builder；自然 BF16 dW；单 base allocation | 已兼容 `[2B]` alias、empty expert 与 compile | 现有 one-segment op 不兼容 | MoonEP 可选；UltraEP 需私有 multi-base problem descriptors，WGrad 建议按 BF16 master/FP32 external 分两次 typed launch |
 | TileWise FP8 AdaptiveGEMM + Triton WGrad | device counts；weight data+block scales；FP8 FWD/DGrad；自然 BF16 dW | BF16 override + dynamic quant 已匹配 `[2B]`；固定容量尾部由 Dispatcher 归一化 | 不支持 strided external scales 或 FP32 external dW | MoonEP 首版组合；规避 Adaptive FP8 WGrad 的真实 shape/SM launch 缺陷；UltraEP FP8 暂不实施 |
 | MoonEP VM grouped-GEMM | global `[E+B]` weight/cu-seqlens contract，可按 plan remote-read | local training `[2B]` 不能冒充其 global contract | placement/storage 均不匹配 | 不作为统一 expert compute Adapter；继续服务 MoonEP 原有 global/inference use case |
 | 新 BF16 Triton two-segment op | 两个 base/stride；一个 BF16 returned dW + 一个 FP32 side output | 没有必要使用 | 完整匹配 | 仅 UltraEP 使用，不替代标准 one-segment Interface |
 
-CUTLASS 的 `.cpu()` 不是 GroupedLinear Interface 要求；修复应位于 CUTLASS Adapter。对于 UltraEP，forward/DGrad 的 operand dtype 相同，可以用 op-private device problem descriptors 描述两块 base；WGrad 的 BF16/FP32 outputs 不应强塞进一个 homogeneous typed kernel，两个 typed launches 仍可共享 counts/row-offset metadata，而且不需要完整 `[B+R]` 临时 dW。
+CUTLASS 的 `.cpu()` 不是 GroupedLinear Interface 要求，修复只位于 CUTLASS Adapter。固定构建的 GroupedGEMM 扩展已经公开 raw `gmm(..., use_cutlass=true)`：CUDA `int64` counts 由同一 stream 上的 device kernel 转换成 problem sizes、leading dimensions 与 base pointers。XTuner 因此直接调用 raw binding，并在 Adapter 内把 counts 转成 device `int64`；不再经过会按进程级 `GROUPED_GEMM_USE_CUTLASS` 选择 CPU/cuBLAS 的 Python wrapper，也不维护第二个全局 backend 开关。
+
+对于 UltraEP，forward/DGrad 的 operand dtype 相同，可以用 op-private device problem descriptors 描述两块 base；WGrad 的 BF16/FP32 outputs 不应强塞进一个 homogeneous typed kernel，两个 typed launches 仍可共享 counts/row-offset metadata，而且不需要完整 `[B+R]` 临时 dW。
 
 FP8 的 scales、quantized transposes、padded counts 同样不进入 caller Interface。MoonEP 走标准 one-segment FP8 Adapter；UltraEP 若以后支持 FP8，需要真正的 two-segment FP8 op，同时表达两块 data/scales、external stride 和 FP32 external WGrad，不能靠把当前 AdaptiveGEMM wrapper 外包一层实现。
 
-因此兼容性结论是：MoonEP 是“标准 one-segment GMM + call-local trainable alias”，Triton 已兼容，CUTLASS 只差 device-count 验证，TileWise FP8 主要差 weight-supply Adapter；UltraEP 则只有新的 BF16 two-segment op 完整兼容。统一的是 `GroupedLinear` caller 语义，不是假装所有低层 op 拥有相同 operands。
+因此兼容性结论是：MoonEP 是“标准 one-segment GMM + call-local trainable alias”，BF16 Triton、BF16 CUTLASS 与 TileWise FP8 均已兼容；UltraEP 则只有新的 BF16 two-segment op 完整兼容。统一的是 `GroupedLinear` caller 语义，不是假装所有低层 op 拥有相同 operands。
 
 ### 3.6 `UltraEPDispatcher` 对六阶段的映射
 

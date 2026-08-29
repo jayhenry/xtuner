@@ -47,8 +47,6 @@ def build_dispatcher(
             raise ValueError("MoonEP requires n_routed_experts divisible by ep_size")
         if transport_dtype != "bf16":
             raise ValueError("MoonEP activation and weight transport requires BF16")
-        if os.environ.get("XTUNER_USE_CUTLASS_GROUP_GEMM", "0") == "1":
-            raise ValueError("MoonEP requires the device-count Triton grouped GEMM backend")
         if moonep_runtime is None or layer_fqn is None or experts is None:
             raise ValueError("MoonEP runtime, layer_fqn, and experts are required")
         return moonep_runtime.dispatcher_for(

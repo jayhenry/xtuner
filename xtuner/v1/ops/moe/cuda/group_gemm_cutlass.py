@@ -3,14 +3,9 @@
 https://github.com/fanshiqing/grouped_gemm/blob/v1.1.4/grouped_gemm/ops.py
 Support torch compile."""
 
+import grouped_gemm_backend as backend
 import torch
 from torch import Tensor
-
-
-try:
-    from grouped_gemm import backend
-except ImportError:
-    backend = None
 
 
 @torch.library.custom_op("moe::gmm", mutates_args=())
@@ -21,7 +16,18 @@ def moe_grouped_gemm(
     trans_a: bool = False,
     trans_b: bool = True,
 ) -> Tensor:
-    return backend.gmm(a, b, batch_sizes, trans_a=trans_a, trans_b=trans_b)
+    output_shape: tuple[int, ...]
+    if trans_a:
+        output_shape = (batch_sizes.shape[0], a.shape[-1], b.shape[-1])
+    else:
+        output_shape = (a.shape[0], b.shape[1] if trans_b else b.shape[2])
+    output = torch.empty(output_shape, device=a.device, dtype=a.dtype)
+
+    # The pinned GroupedGEMM extension exposes its device-only CUTLASS
+    # problem builder through the raw binding. Calling it directly avoids the
+    # package wrapper's process-global backend switch and counts D2H copy.
+    backend.gmm(a, b, output, batch_sizes, trans_a, trans_b, -1, True)
+    return output
 
 
 @moe_grouped_gemm.register_fake
@@ -85,4 +91,5 @@ def cutlass_group_gemm(x, w, tokens_per_expert):
     if x.shape[0] == 0:
         # put x and w to the pytorch graph
         return torch.matmul(x, w[0].T)
-    return moe_grouped_gemm(x, w, tokens_per_expert.cpu(), trans_b=True)
+    device_counts = tokens_per_expert.to(device=x.device, dtype=torch.int64)
+    return moe_grouped_gemm(x, w, device_counts, trans_b=True)

@@ -690,3 +690,26 @@ flowchart LR
 ```
 
 这次没有新增 dispatcher state/entity；新增布尔 build policy 只决定 routed weight 的 FSDP representation。FP8 scales、kernel schedule 和混合 WGrad 策略均封装在 TileWise Adapter 内，`ExpertWeightLayout`、六阶段调用端和 MoonEP gradient completion 接口保持不变。单算子与 8 卡端到端验证均已通过，首版 FP8 接入可以进入提交。
+
+# 2026-08-29_EP扩展重构-04-CUTLASS设备counts
+
+完成 MoonEP 的 BF16 CUTLASS 接入。根因不是 CUTLASS 不支持动态 counts，而是 XTuner wrapper 先执行 `.cpu()`，第三方 Python wrapper 又用独立的进程级环境变量决定 cuBLAS/CUTLASS。固定构建提交的 raw extension 已支持 CUDA counts 和 device-only problem builder，因此 Adapter 直接选择该能力。
+
+## 开发与测试记录
+
+- `cutlass_group_gemm` 将 counts 在当前设备转为 `int64`，raw binding 以 `use_cutlass=true` 构造 FWD/DGrad/WGrad problem arguments；不再 D2H。
+- 删除 MoonEP factory 的 CUTLASS 拒绝分支；`GroupedLinear.forward(hidden, weight, counts)` 与 `ExpertWeightLayout` 均未增加字段。
+- 单卡 raw extension 最小复现覆盖 FWD、DGrad、WGrad 和 empty expert，与 BF16 PyTorch reference 最大误差均为 `0.0`。
+- 单卡 public op 覆盖 eager/fullgraph 及两组运行时 counts：分别 `1 passed`；fullgraph 使用单 Inductor worker，规避本机 32-worker pipe wait。
+- 8×H200、FSDP2×EP4、torch.compile、两步训练，CUTLASS MoonEP 与 CUTLASS DeepEP 的 loss、grad norm、选定 gradients 和 updated parameters：`1 passed`。
+
+```mermaid
+flowchart LR
+    A["MoonEP device int32 counts"] --> B["CUTLASS Adapter<br/>device int64"]
+    B --> C["Raw GroupedGEMM binding<br/>use_cutlass=true"]
+    C --> D["Device problem builder"]
+    D --> E["FWD / DGrad / WGrad"]
+    E --> F["Natural BF16 dW"]
+```
+
+本阶段复用了已有 custom op 和自然 autograd，只删除错误的 host conversion 与 capability gate；没有新增 runtime、schedule 或 binding 实体。MoonEP 现在可在相同 caller Interface 下选择 BF16 Triton、BF16 CUTLASS 或 TileWise FP8。
