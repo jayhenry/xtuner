@@ -326,6 +326,8 @@ runtime.close() -> None
 
 因此缩小后没有新增 `RuntimeConfig`、`LayerBinding` 或 invocation façade。`ep_group`、runtime 和 `_MoonEPInvocation` 虽然内部状态较多，却分别是 collective capability、model-scoped resource 和 call-local transaction 的正确 owner；继续传其引用比暴露内部字段有更高 Depth。
 
+MoonEP 已按该边界实现：runtime registration 只保存 `(layer_fqn, projection pair)`；Dispatcher 只保存 runtime/layer ID/gradient-slot cursor；`_MoonEPInvocation` 只保存 runtime/layer ID/call-local transaction。FSDP landing attribute 直接挂在两块 projection，不再挂在整个 `MoEBlock`。`validate_before_fsdp()` 短暂读取 config，`install_after_fsdp()` 只遍历 `fsdp_root` 且不保留它，engine 统一调用 `close_ep_runtime()`。
+
 #### Per-layer `GenericDispatcher` Adapter
 
 现有六阶段保持原名和原顺序：
@@ -380,7 +382,7 @@ UltraEP 的 grad-reduce join 必须位于 attention 前，而 router-dependent p
 
 ### 3.3 Router-owned counts
 
-当前 Router 已计算 histogram，但字段仍错拼为 `topkens_per_expert`，MoonEP 又在 `dispatch_preprocess` 对 `topk_ids` 做一次 `bincount`。统一方案直接改为：
+初版 Router 已计算 histogram，但字段曾错拼为 `topkens_per_expert`，MoonEP 又在 `dispatch_preprocess` 对 `topk_ids` 做一次 `bincount`。当前实现已统一为：
 
 ```python
 class RouterResults(TypedDict):
@@ -587,7 +589,7 @@ flowchart TD
 - `ultraep`：验证完整 config 后，只用 `num_experts/replica_slots_per_rank/ep_group` 创建 `UltraEPRuntime`；每层内部先创建 physical-count `DeepEPDispatcher`，再用只持有 runtime/layer ID 的 `UltraEPDispatcher` 包装。
 - 其他值：不创建 execution runtime，走现有 dispatcher factory。
 
-Capability validation 必须在任何 FSDP mutation/CUDA resource allocation 前集中完成。MoonEP FP8 gates 完成前仍拒绝 FP8；首版 UltraEP 继续明确拒绝 FP8 和其他尚未验证的组合，`R` 的公开范围必须与 stride-aware kernel 能力一致。
+Capability validation 必须在任何 FSDP mutation/CUDA resource allocation 前集中完成。MoonEP 已开放经过验证的 BF16 transport + TileWise FP8 compute；首版 UltraEP 继续明确拒绝 FP8 和其他尚未验证的组合，`R` 的公开范围必须与 stride-aware kernel 能力一致。
 
 UltraEP v1 的写实边界为：BF16、EP>1、expert TP1、DP1、bias-free、`intra_layer_micro_batch=1`，并禁用 MTP 与 activation recompute。同一 physical layer 只允许一个尚未完成 backward 的调用；第二个 independent graph 必须在 `prepare_layer_input` fail fast。统一调用端能表达更宽调度，但不代表 UltraEP v1 已支持它。
 

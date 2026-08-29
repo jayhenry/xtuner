@@ -339,7 +339,7 @@ class MoEDecoderLayer(nn.Module):
             transport_dtype="bf16",
             moonep_runtime=moonep_runtime,
             layer_fqn=layer_fqn,
-            experts=self.experts,
+            projections=(self.experts.fused_w1w3, self.experts.fused_w2),
         )
 
     def forward(

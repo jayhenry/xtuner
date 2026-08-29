@@ -190,7 +190,7 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
             # complete queued output copies. This is lifecycle-only, not a hot-path sync.
             torch.cuda.synchronize()
             if dispatcher == "moonep":
-                engine.model.destroy_moonep()
+                engine.model.close_ep_runtime()
             del engine
             # DeepEP owns a process-scoped C++ Buffer. Forcing cyclic GC here
             # can destruct it on only a subset of ranks; leave that resource
@@ -255,7 +255,7 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
         finally:
             torch.cuda.synchronize()
             if dispatcher == "moonep":
-                engine.model.destroy_moonep()
+                engine.model.close_ep_runtime()
             del engine
             torch.cuda.empty_cache()
             dist.barrier()
@@ -329,7 +329,7 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
             assert any(not torch.equal(before[name], parameter.to_local()) for name, parameter in routed.items())
         finally:
             torch.cuda.synchronize()
-            engine.model.destroy_moonep()
+            engine.model.close_ep_runtime()
             del engine
             torch.cuda.empty_cache()
             dist.barrier()
@@ -464,7 +464,7 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
                 )
             finally:
                 torch.cuda.synchronize()
-                engine.model.destroy_moonep()
+                engine.model.close_ep_runtime()
                 del engine
                 torch.cuda.empty_cache()
                 dist.barrier()
@@ -543,7 +543,7 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
         finally:
             torch.cuda.synchronize()
             if dispatcher == "moonep":
-                engine.model.destroy_moonep()
+                engine.model.close_ep_runtime()
             del engine
             torch.cuda.empty_cache()
             dist.barrier()
@@ -601,7 +601,7 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
                 )
         finally:
             torch.cuda.synchronize()
-            engine.model.destroy_moonep()
+            engine.model.close_ep_runtime()
             del engine
             torch.cuda.empty_cache()
             dist.barrier()
@@ -647,7 +647,7 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
         finally:
             torch.cuda.synchronize()
             if dispatcher == "moonep":
-                engine.model.destroy_moonep()
+                engine.model.close_ep_runtime()
             del engine
             torch.cuda.empty_cache()
             dist.barrier()
@@ -752,7 +752,7 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
             )
         finally:
             torch.cuda.synchronize()
-            engine.model.destroy_moonep()
+            engine.model.close_ep_runtime()
             del engine
             torch.cuda.empty_cache()
             dist.barrier()
@@ -788,7 +788,7 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
         finally:
             torch.cuda.synchronize()
             if dispatcher == "moonep":
-                engine.model.destroy_moonep()
+                engine.model.close_ep_runtime()
             del engine
             torch.cuda.empty_cache()
             dist.barrier()

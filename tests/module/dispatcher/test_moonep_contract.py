@@ -136,6 +136,7 @@ def test_runtime_meta_build_only_validates_the_optional_backend(monkeypatch) -> 
         num_experts=8,
         top_k=2,
         intra_layer_micro_batch=2,
+        staging_reference=False,
     )
 
     assert calls == [
@@ -168,4 +169,5 @@ def test_runtime_reports_optional_backend_source_on_capability_mismatch(monkeypa
             num_experts=8,
             top_k=2,
             intra_layer_micro_batch=1,
+            staging_reference=False,
         )

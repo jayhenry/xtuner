@@ -610,8 +610,8 @@ class BaseModel(nn.Module):
 
         return cal_grad_norm(grads, dtype=dtype)
 
-    def destroy_moonep(self) -> None:
-        """Release optional MoonEP resources at a coordinated boundary."""
+    def close_ep_runtime(self) -> None:
+        """Release optional dynamic-EP resources at a coordinated boundary."""
         return
 
     def to_hf_key_list(self, key: str) -> list[str]:

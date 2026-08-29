@@ -535,7 +535,7 @@ class TrainEngine:
         for future in self._pending_async_saves:
             future.result()
         self._pending_async_saves.clear()
-        self.model.destroy_moonep()
+        self.model.close_ep_runtime()
         self.model.destroy_async_hf_resources()
         self.destroy_async_checkpoint_pg()
         self._closed = True

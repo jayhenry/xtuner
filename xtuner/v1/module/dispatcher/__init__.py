@@ -5,6 +5,7 @@ from typing import Literal
 XTUNER_DISPATCHER_DEBUG = os.getenv("XTUNER_DISPATCHER_DEBUG", "0") == "1"
 
 import torch.distributed as dist
+from torch import nn
 
 from xtuner.v1.utils import get_logger, log_rank0
 
@@ -38,7 +39,7 @@ def build_dispatcher(
     *,
     moonep_runtime=None,
     layer_fqn: str | None = None,
-    experts=None,
+    projections: tuple[nn.Module, nn.Module] | None = None,
 ) -> DispacherInterface:
     if dispatcher == "moonep":
         if ep_group is None or ep_group.size() not in (2, 4, 8):
@@ -47,11 +48,11 @@ def build_dispatcher(
             raise ValueError("MoonEP requires n_routed_experts divisible by ep_size")
         if transport_dtype != "bf16":
             raise ValueError("MoonEP activation and weight transport requires BF16")
-        if moonep_runtime is None or layer_fqn is None or experts is None:
-            raise ValueError("MoonEP runtime, layer_fqn, and experts are required")
-        return moonep_runtime.dispatcher_for(
+        if moonep_runtime is None or layer_fqn is None or projections is None:
+            raise ValueError("MoonEP runtime, layer_fqn, and expert projections are required")
+        return moonep_runtime.bind_dispatcher(
             layer_fqn=layer_fqn,
-            experts=experts,
+            projections=projections,
         )  # type: ignore[return-value]
 
     if ep_group is None or ep_group.size() == 1:

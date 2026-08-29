@@ -220,7 +220,7 @@ class TestMoonEPPersistence(DeterministicDDPTestCase):
             # 红测阶段 close 尚不存在，仍需显式释放 collective 资源。
             if not getattr(engine, "_closed", False):
                 torch.cuda.synchronize()
-                engine.model.destroy_moonep()
+                engine.model.close_ep_runtime()
             dist.barrier()
 
     def test_rank_divergent_destructor_only_warns(self) -> None:

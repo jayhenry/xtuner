@@ -265,6 +265,7 @@ class MoE(BaseModel):
                 num_experts=config.n_routed_experts,
                 top_k=config.num_experts_per_tok,
                 intra_layer_micro_batch=config.intra_layer_micro_batch,
+                staging_reference=config.moonep_staging_reference,
                 num_sms=config.moonep_num_sms,
             )
 
@@ -641,8 +642,9 @@ class MoE(BaseModel):
                         d2h_stream=self.offload_stream,
                         block_idx=layer_idx - self.config.first_k_dense_replace,
                         group="text",
-                        custom_check_fn=lambda x: x.data_ptr()
-                        in [hidden_states.data_ptr() for hidden_states in hidden_states_list],
+                        custom_check_fn=lambda x: (
+                            x.data_ptr() in [hidden_states.data_ptr() for hidden_states in hidden_states_list]
+                        ),
                         prefetch=True,
                         reserve_pin_memory=True,
                     ):
@@ -1185,6 +1187,8 @@ class MoE(BaseModel):
     ) -> Self:
         if fsdp_config.hsdp_sharding_size is not None and self.config.expert_tp_size > 1:
             raise NotImplementedError("HSDP with ExpertTP is not supported")
+        if self._moonep_runtime is not None:
+            self._moonep_runtime.validate_before_fsdp(fsdp_config)
 
         self.fsdp_config = fsdp_config
         assert self.fsdp_config.ep_size == self.config.ep_size
@@ -1358,11 +1362,7 @@ class MoE(BaseModel):
         self._init_load_spec()
         self._to_empty_meta()
         if self._moonep_runtime is not None:
-            self._moonep_runtime.install_fsdp(
-                fully_sharded_model=self,
-                fsdp_config=fsdp_config,
-                staging_reference=self.config.moonep_staging_reference,
-            )
+            self._moonep_runtime.install_after_fsdp(fsdp_root=self)
         return self
 
     @property
@@ -1373,10 +1373,10 @@ class MoE(BaseModel):
         else:
             return MOE_NON_EP_COMPILE_CFG
 
-    def destroy_moonep(self) -> None:
-        """Release optional MoonEP execution resources before PG teardown."""
+    def close_ep_runtime(self) -> None:
+        """Release optional dynamic-EP resources before PG teardown."""
         if self._moonep_runtime is not None:
-            self._moonep_runtime.destroy()
+            self._moonep_runtime.close()
 
     @property
     def need_update_bias(self) -> bool:

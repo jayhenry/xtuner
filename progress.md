@@ -713,3 +713,29 @@ flowchart LR
 ```
 
 本阶段复用了已有 custom op 和自然 autograd，只删除错误的 host conversion 与 capability gate；没有新增 runtime、schedule 或 binding 实体。MoonEP 现在可在相同 caller Interface 下选择 BF16 Triton、BF16 CUTLASS 或 TileWise FP8。
+
+# 2026-08-29_EP扩展重构-05-引用范围与生命周期
+
+完成 MoonEP 控制面的引用收敛。runtime 只注册 layer FQN 与两块 routed projections；Dispatcher 与 invocation 不再捕获整个 `MoEBlock` 或彼此。FSDP validation、安装和关闭分别形成明确生命周期边界。
+
+## 开发与测试记录
+
+- `build_dispatcher` 将 `experts: MoEBlock` 缩为 `(fused_w1w3, fused_w2)`；runtime 以普通 tuple 保存 registration，没有新增 `LayerBinding`。
+- `_MoonEPInvocation` 从捕获 Dispatcher 改为只保存 runtime/layer ID/grad slot；generation 由稳定 layer ID 奇偶推导，不再重复存储。
+- FSDP landing 将绑定从 experts 容器下沉到实际拥有 weight 的 projection；安装只短暂遍历 `fsdp_root`，不保存 root。
+- lifecycle 对齐为 `bind_dispatcher -> validate_before_fsdp -> install_after_fsdp -> close`；engine/model 入口统一为 `close_ep_runtime()`。
+- CPU 六阶段、factory、meta-build 与显式失败路径：`9 passed`。
+- 8×H200、BF16 Triton、FSDP2×EP4、torch.compile、两步 MoonEP/DeepEP 训练与 projection-level landing/close：`1 passed`。
+
+```mermaid
+flowchart LR
+    A["Model assembly"] --> B["projection pair"]
+    B --> C["MoonEPRuntime<br/>layer registration"]
+    C --> D["Dispatcher<br/>runtime + layer ID"]
+    D --> E["Invocation<br/>runtime + layer ID + slot"]
+    F["FSDP config"] --> G["validate_before_fsdp<br/>call-scoped"]
+    H["FSDP root"] --> I["install_after_fsdp<br/>call-scoped traversal"]
+    I --> C
+```
+
+实体审计后保留 `MoonEPRuntime`、`MoonEPDispatcher` 与 `_MoonEPInvocation`：三者分别拥有模型资源、六阶段 Adapter 和单次 plan/events/reduction transaction。删除任一实体都会把对应状态散回 model 或 hooks；除此之外没有引入 config、binding、schedule façade。

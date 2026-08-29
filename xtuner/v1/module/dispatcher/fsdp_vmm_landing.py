@@ -21,8 +21,8 @@ from torch.distributed.tensor import DTensor
 _TARGET_TORCH_VERSION = "2.12.1+cu132"
 _BINDING_ATTR = "_xtuner_moonep_landing"
 _OWNER_ATTR = "_xtuner_moonep_fsdp_owner"
-_EXPERTS_ATTR = "_xtuner_moonep_experts"
-_EXPERT_PARAMS_ATTR = "_xtuner_moonep_fsdp_params"
+_PROJECTION_ATTR = "_xtuner_moonep_projection"
+_FSDP_PARAM_ATTR = "_xtuner_moonep_fsdp_param"
 
 
 def _init_direct_all_gather_outputs(
@@ -54,12 +54,12 @@ def _keep_direct_all_gather_storage(fsdp_param: FSDPParam) -> None:
 
 def install_fsdp_vmm_landing(
     *,
-    fully_sharded_model: nn.Module,
-    targets: Sequence[tuple[str, nn.Module, tuple[torch.Tensor, torch.Tensor]]],
+    fsdp_root: nn.Module,
+    targets: Sequence[tuple[str, tuple[nn.Module, nn.Module], tuple[torch.Tensor, torch.Tensor]]],
 ) -> tuple[FSDPParam, ...]:
     """Bind routed expert FSDPParams to their two-generation VMM landings.
 
-    Each target is ``(layer_fqn, experts, (w1w3_landing, w2_landing))``.
+    Each target is ``(layer_fqn, projections, landings)``.
     Matching uses the original module and parameter-name identities recorded
     by FSDP, never an FQN guess.
     """
@@ -69,7 +69,7 @@ def install_fsdp_vmm_landing(
         )
 
     by_identity: dict[tuple[int, str], tuple[FSDPParam, nn.Module]] = {}
-    for fsdp_owner in fully_sharded_model.modules():
+    for fsdp_owner in fsdp_root.modules():
         state = _get_module_fsdp_state(fsdp_owner)
         if state is None:
             continue
@@ -82,14 +82,13 @@ def install_fsdp_vmm_landing(
                     raise RuntimeError("MoonEP found duplicate FSDP parameter identity")
                 by_identity[key] = fsdp_param, fsdp_owner
 
-    selected: list[tuple[FSDPParam, nn.Module, nn.Module, torch.Tensor, str]] = []
-    expert_params: dict[nn.Module, list[FSDPParam]] = {}
-    for layer_fqn, experts, landings in targets:
-        if hasattr(experts, _EXPERT_PARAMS_ATTR):
-            raise RuntimeError(f"MoonEP direct landing is already installed for {layer_fqn}")
-        layer_params: list[FSDPParam] = []
-        for projection_name, landing in zip(("fused_w1w3", "fused_w2"), landings, strict=True):
-            projection = getattr(experts, projection_name)
+    selected: list[tuple[FSDPParam, nn.Module, nn.Module, torch.Tensor]] = []
+    for layer_fqn, projections, landings in targets:
+        for projection_name, projection, landing in zip(
+            ("fused_w1w3", "fused_w2"), projections, landings, strict=True
+        ):
+            if hasattr(projection, _FSDP_PARAM_ATTR):
+                raise RuntimeError(f"MoonEP direct landing is already installed for {layer_fqn}.{projection_name}")
             match = by_identity.get((id(projection), "weight"))
             if match is None:
                 raise RuntimeError(f"MoonEP could not find FSDPParam for {layer_fqn}.{projection_name}.weight")
@@ -119,19 +118,16 @@ def install_fsdp_vmm_landing(
                 for name in ("init_all_gather_outputs", "alloc_all_gather_outputs", "free_unsharded_param")
             ):
                 raise RuntimeError(f"MoonEP refuses an already customized FSDPParam: {layer_fqn}")
-            selected.append((fsdp_param, fsdp_owner, experts, landing, layer_fqn))
-            layer_params.append(fsdp_param)
-        expert_params[experts] = layer_params
+            selected.append((fsdp_param, fsdp_owner, projection, landing))
 
     if len({id(item[0]) for item in selected}) != len(selected):
         raise RuntimeError("MoonEP routed expert targets must map to distinct FSDPParams")
 
-    for experts, layer_params in expert_params.items():
-        setattr(experts, _EXPERT_PARAMS_ATTR, tuple(layer_params))
-    for fsdp_param, fsdp_owner, experts, landing, _ in selected:
+    for fsdp_param, fsdp_owner, projection, landing in selected:
+        setattr(projection, _FSDP_PARAM_ATTR, fsdp_param)
         setattr(fsdp_param, _BINDING_ATTR, landing)
         setattr(fsdp_param, _OWNER_ATTR, fsdp_owner)
-        setattr(fsdp_param, _EXPERTS_ATTR, experts)
+        setattr(fsdp_param, _PROJECTION_ATTR, projection)
         fsdp_param.init_all_gather_outputs = types.MethodType(  # type: ignore[method-assign]
             _init_direct_all_gather_outputs, fsdp_param
         )
@@ -144,14 +140,15 @@ def install_fsdp_vmm_landing(
     return tuple(item[0] for item in selected)
 
 
-def fsdp_current_unsharded_expert_weights(experts: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+def fsdp_current_unsharded_expert_weights(
+    projections: tuple[nn.Module, nn.Module],
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Read the already-unsharded BF16 expert views without starting an AG."""
-    fsdp_params = getattr(experts, _EXPERT_PARAMS_ATTR, None)
-    if fsdp_params is None:
-        raise RuntimeError("MoonEP direct FSDP landing is not installed for this expert module")
-
     current_weights: list[torch.Tensor] = []
-    for fsdp_param in fsdp_params:
+    for projection in projections:
+        fsdp_param = getattr(projection, _FSDP_PARAM_ATTR, None)
+        if fsdp_param is None:
+            raise RuntimeError("MoonEP direct FSDP landing is not installed for this expert projection")
         if fsdp_param.sharded_state is not ShardedState.UNSHARDED:
             raise RuntimeError("MoonEP expert weight was read outside its FSDP unsharded window")
         registered = getattr(fsdp_param._module_info.module, fsdp_param._module_info.param_name)
@@ -176,7 +173,7 @@ def uninstall_fsdp_vmm_landing(fsdp_params: tuple[FSDPParam, ...]) -> None:
         # Parameters before removing the VMM-backed unsharded Parameter.
         owner.reshard()
 
-    experts = {getattr(fsdp_param, _EXPERTS_ATTR) for fsdp_param in fsdp_params}
+    projections = {getattr(fsdp_param, _PROJECTION_ATTR) for fsdp_param in fsdp_params}
     for fsdp_param in fsdp_params:
         if fsdp_param.sharded_state is not ShardedState.SHARDED:
             raise RuntimeError("MoonEP failed to reshard a bound FSDP parameter")
@@ -186,10 +183,10 @@ def uninstall_fsdp_vmm_landing(fsdp_params: tuple[FSDPParam, ...]) -> None:
             del fsdp_param._unsharded_param
         for method_name in ("init_all_gather_outputs", "alloc_all_gather_outputs", "free_unsharded_param"):
             delattr(fsdp_param, method_name)
-        for attr_name in (_BINDING_ATTR, _OWNER_ATTR, _EXPERTS_ATTR):
+        for attr_name in (_BINDING_ATTR, _OWNER_ATTR, _PROJECTION_ATTR):
             delattr(fsdp_param, attr_name)
-    for expert_module in experts:
-        delattr(expert_module, _EXPERT_PARAMS_ATTR)
+    for projection in projections:
+        delattr(projection, _FSDP_PARAM_ATTR)
 
 
 __all__ = [

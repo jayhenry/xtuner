@@ -151,6 +151,7 @@ def test_staging_dispatcher_runs_the_public_six_stage_forward_seam(backend) -> N
         num_experts=4,
         top_k=2,
         intra_layer_micro_batch=1,
+        staging_reference=True,
     )
     experts = _Experts()
     dispatcher = build_dispatcher(
@@ -160,19 +161,18 @@ def test_staging_dispatcher_runs_the_public_six_stage_forward_seam(backend) -> N
         transport_dtype="bf16",
         moonep_runtime=runtime,
         layer_fqn="layers.0.experts",
-        experts=experts,
+        projections=(experts.fused_w1w3, experts.fused_w2),
     )
-    runtime.install_fsdp(
-        fully_sharded_model=experts,
-        fsdp_config=SimpleNamespace(
+    runtime.validate_before_fsdp(
+        SimpleNamespace(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.bfloat16,
             requires_grad=True,
             cpu_offload=False,
             reshard_after_forward=True,
-        ),
-        staging_reference=True,
+        )
     )
+    runtime.install_after_fsdp(fsdp_root=experts)
 
     hidden_states = torch.randn(3, 128, dtype=torch.bfloat16)
     topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int64)
@@ -237,6 +237,7 @@ def test_direct_install_failure_is_explicit_and_never_falls_back_to_staging(back
         num_experts=4,
         top_k=2,
         intra_layer_micro_batch=1,
+        staging_reference=False,
     )
     experts = _Experts()
     build_dispatcher(
@@ -246,20 +247,19 @@ def test_direct_install_failure_is_explicit_and_never_falls_back_to_staging(back
         transport_dtype="bf16",
         moonep_runtime=runtime,
         layer_fqn="layers.0.experts",
-        experts=experts,
+        projections=(experts.fused_w1w3, experts.fused_w2),
     )
 
-    with pytest.raises(RuntimeError, match="could not find FSDPParam"):
-        runtime.install_fsdp(
-            fully_sharded_model=experts,
-            fsdp_config=SimpleNamespace(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.bfloat16,
-                requires_grad=True,
-                cpu_offload=False,
-                reshard_after_forward=True,
-            ),
-            staging_reference=False,
+    runtime.validate_before_fsdp(
+        SimpleNamespace(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            requires_grad=True,
+            cpu_offload=False,
+            reshard_after_forward=True,
         )
+    )
+    with pytest.raises(RuntimeError, match="could not find FSDPParam"):
+        runtime.install_after_fsdp(fsdp_root=experts)
 
     assert _Workspace.allocated[-1].destroyed

@@ -10,7 +10,7 @@ model resources, ``_MoonEPInvocation`` owns one dispatch/combine pairing, and
 from __future__ import annotations
 
 import importlib
-from typing import Any, Literal
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -74,6 +74,7 @@ class MoonEPRuntime:
         num_experts: int,
         top_k: int,
         intra_layer_micro_batch: int,
+        staging_reference: bool,
         num_sms: int = 64,
     ) -> None:
         self._backend = require_moonep_backend()
@@ -86,6 +87,7 @@ class MoonEPRuntime:
         self._num_experts = num_experts
         self._top_k = top_k
         self._intra_layer_micro_batch = intra_layer_micro_batch
+        self._staging_reference = staging_reference
         self._num_sms = num_sms
 
         # This is deliberately the complete meta-build action.  The backend
@@ -107,41 +109,25 @@ class MoonEPRuntime:
         self._buffer: Any | None = None
         self._workspace: Any | None = None
         self._fsdp_params: tuple[Any, ...] = ()
-        self._staging_reference = False
-        self._dispatchers: list[Any] = []
+        self._layers: list[tuple[str, tuple[nn.Module, nn.Module]]] = []
         self._fixed_tokens_per_rank: int | None = None
-        self._destroyed = False
+        self._closed = False
 
-    def dispatcher_for(
+    def bind_dispatcher(
         self,
         *,
         layer_fqn: str,
-        experts: nn.Module,
+        projections: tuple[nn.Module, nn.Module],
     ) -> MoonEPDispatcher:
         """Register one physical routed layer in FSDP execution order."""
-        if any(dispatcher.layer_fqn == layer_fqn for dispatcher in self._dispatchers):
+        if any(registered_fqn == layer_fqn for registered_fqn, _ in self._layers):
             raise ValueError(f"duplicate MoonEP routed layer: {layer_fqn}")
-        generation: Literal[0, 1] = 0 if len(self._dispatchers) % 2 == 0 else 1
-        dispatcher = MoonEPDispatcher(
-            runtime=self,
-            layer_fqn=layer_fqn,
-            experts=experts,
-            generation=generation,
-        )
-        self._dispatchers.append(dispatcher)
-        return dispatcher
+        layer_id = len(self._layers)
+        self._layers.append((layer_fqn, projections))
+        return MoonEPDispatcher(runtime=self, layer_id=layer_id)
 
-    def install_fsdp(
-        self,
-        *,
-        fully_sharded_model: nn.Module,
-        fsdp_config: Any,
-        staging_reference: bool,
-    ) -> None:
-        """Allocate execution resources after native FSDP has been
-        installed."""
-        if self._workspace is not None:
-            raise RuntimeError("MoonEP FSDP resources are already installed")
+    def validate_before_fsdp(self, fsdp_config: Any) -> None:
+        """Validate the build-time FSDP policy without retaining its config."""
         if fsdp_config.param_dtype is not torch.bfloat16 or fsdp_config.reduce_dtype is not torch.bfloat16:
             raise ValueError("MoonEP requires BF16 FSDP param and reduce dtypes")
         if fsdp_config.cpu_offload:
@@ -150,9 +136,15 @@ class MoonEPRuntime:
             raise ValueError("MoonEP v1 requires trainable FSDP parameters")
         if not fsdp_config.reshard_after_forward:
             raise ValueError("MoonEP requires reshard_after_forward=True")
-        if not self._dispatchers:
+
+    def install_after_fsdp(self, *, fsdp_root: nn.Module) -> None:
+        """Allocate execution resources after native FSDP has been
+        installed."""
+        if self._workspace is not None:
+            raise RuntimeError("MoonEP FSDP resources are already installed")
+        if not self._layers:
             raise TypeError("MoonEP requires at least one physical routed-expert layer")
-        if staging_reference:
+        if self._staging_reference:
             log_rank0.warning(
                 "moonep_staging_reference=True copies complete BF16 home expert "
                 "weights after every FSDP AllGather; it is a numerical reference, "
@@ -170,27 +162,26 @@ class MoonEPRuntime:
             home_generations=2,
             gradient_slots=self._intra_layer_micro_batch,
         )
-        if not staging_reference:
+        if not self._staging_reference:
             try:
                 self._fsdp_params = install_fsdp_vmm_landing(
-                    fully_sharded_model=fully_sharded_model,
+                    fsdp_root=fsdp_root,
                     targets=tuple(
                         (
-                            dispatcher.layer_fqn,
-                            dispatcher._experts,
-                            workspace.landing(dispatcher._generation),
+                            layer_fqn,
+                            projections,
+                            workspace.landing(layer_id % 2),
                         )
-                        for dispatcher in self._dispatchers
+                        for layer_id, (layer_fqn, projections) in enumerate(self._layers)
                     ),
                 )
             except Exception:
                 workspace.destroy()
                 raise
-        self._staging_reference = staging_reference
         self._workspace = workspace
 
     def _validate_tokens_per_rank(self, tokens_per_rank: int) -> None:
-        if self._destroyed:
+        if self._closed:
             raise RuntimeError("MoonEP runtime was closed")
         if self._fixed_tokens_per_rank is None:
             self._fixed_tokens_per_rank = tokens_per_rank
@@ -218,9 +209,9 @@ class MoonEPRuntime:
             )
         return self._buffer
 
-    def destroy(self) -> None:
+    def close(self) -> None:
         """Release Buffer before VMM workspace at a coordinated boundary."""
-        if self._destroyed:
+        if self._closed:
             return
         if self._buffer is not None:
             self._buffer.destroy()
@@ -231,7 +222,8 @@ class MoonEPRuntime:
         if self._workspace is not None:
             self._workspace.destroy()
             self._workspace = None
-        self._destroyed = True
+        self._layers.clear()
+        self._closed = True
 
 
 class MoonEPPreDispatchResult(TypedDict):
@@ -267,9 +259,9 @@ class _MoonEPInvocation:
     """Own one fresh MoonEP plan and all of its device-side completion
     edges."""
 
-    def __init__(self, owner: MoonEPDispatcher, *, grad_slot: int) -> None:
-        self._owner = owner
-        self._runtime = owner._runtime
+    def __init__(self, runtime: MoonEPRuntime, *, layer_id: int, grad_slot: int) -> None:
+        self._runtime = runtime
+        self._layer_id = layer_id
         self._grad_slot = grad_slot
         self._plan: Any | None = None
         self._dispatch_done: Any | None = None
@@ -302,20 +294,23 @@ class _MoonEPInvocation:
 
     def _current_home_weights(self) -> ProjectionPair:
         """Return this layer's current FSDP views, staging only by request."""
+        layer_fqn, projections = self._runtime._layers[self._layer_id]
         if not self._runtime._staging_reference:
-            return fsdp_current_unsharded_expert_weights(self._owner._experts)
+            return fsdp_current_unsharded_expert_weights(projections)
 
         workspace = self._runtime._workspace
         assert workspace is not None
-        landings = workspace.landing(self._owner._generation)
+        landings = workspace.landing(self._layer_id % 2)
         sources: list[torch.Tensor] = []
         for linear, landing in zip(
-            (self._owner._experts.fused_w1w3, self._owner._experts.fused_w2),
+            projections,
             landings,
+            strict=True,
         ):
-            source = linear.weight.to_local() if isinstance(linear.weight, DTensor) else linear.weight
+            weight = cast(torch.Tensor, linear.weight)
+            source = weight.to_local() if isinstance(weight, DTensor) else weight
             if source.dtype is not torch.bfloat16 or source.numel() != landing.numel():
-                raise RuntimeError(f"{self._owner.layer_fqn} staging expected an unsharded BF16 expert weight")
+                raise RuntimeError(f"{layer_fqn} staging expected an unsharded BF16 expert weight")
             with torch.no_grad():
                 landing.copy_(source.view_as(landing))
             sources.append(source)
@@ -341,7 +336,7 @@ class _MoonEPInvocation:
             local_weights, gradient_targets, weights_ready = workspace.materialize(
                 buffer=buffer,
                 plan=self._plan,
-                generation=self._owner._generation,
+                generation=self._layer_id % 2,
                 grad_slot=self._grad_slot,
             )
             self._gradient_targets = gradient_targets
@@ -437,7 +432,7 @@ class _MoonEPInvocation:
             _, _, replay_done = workspace.materialize(
                 buffer=runtime._buffer,
                 plan=self._plan,
-                generation=self._owner._generation,
+                generation=self._layer_id % 2,
                 grad_slot=self._grad_slot,
             )
             dispatch_done.wait()
@@ -603,23 +598,15 @@ class MoonEPDispatcher(
         self,
         *,
         runtime: MoonEPRuntime,
-        layer_fqn: str,
-        experts: Any,
-        generation: Literal[0, 1],
+        layer_id: int,
     ) -> None:
         super().__init__(
             n_routed_experts=runtime._num_experts,
             process_group=runtime._ep_group,
         )
         self._runtime = runtime
-        self._layer_fqn = layer_fqn
-        self._experts = experts
-        self._generation = generation
+        self._layer_id = layer_id
         self._next_gradient_slot = 0
-
-    @property
-    def layer_fqn(self) -> str:
-        return self._layer_fqn
 
     @override
     def dispatch_preprocess(
@@ -652,7 +639,7 @@ class MoonEPDispatcher(
             raise NotImplementedError("MoonEP fixed-S training dispatch does not implement decoding")
         grad_slot = self._next_gradient_slot
         self._next_gradient_slot = (grad_slot + 1) % self._runtime._intra_layer_micro_batch
-        return _MoonEPInvocation(self, grad_slot=grad_slot).dispatch(
+        return _MoonEPInvocation(self._runtime, layer_id=self._layer_id, grad_slot=grad_slot).dispatch(
             hidden_states=pre_dispatched["hidden_states"],
             topk_ids=pre_dispatched["topk_ids"],
             tokens_per_expert=pre_dispatched["tokens_per_expert"],
