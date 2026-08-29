@@ -6,7 +6,9 @@
 2. per-layer Dispatcher Adapter 与已有六阶段；
 3. predecessor-only Dispatcher state 与 backend-private state；
 4. MLP-level expert weight layout 与 counts-based GroupedLinear；
-5. 单 microbatch、Domino、FSDP install 和 teardown 的主要调用端流程。
+5. 收窄后的 runtime / layer / autograd 参数边界；
+6. BF16 / FP8 单段算子与 UltraEP 双段算子的兼容边界；
+7. 单 microbatch、Domino、FSDP install 和 teardown 的主要调用端流程。
 
 省略了真实 backend import、stream 细节、错误文本和现有 Dispatcher 的具体通信代码。
 """
@@ -192,26 +194,55 @@ class _MoonEPInvocation:
 class MoonEPRuntime:
     """现有 model-scoped MoonEP runtime；直接实现 model 使用的 lifecycle。"""
 
-    def __init__(self, *, config: Any, ep_group: Any) -> None:
-        self.config = config
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        top_k: int,
+        max_inflight: int,
+        num_sms: int,
+        staging_reference: bool,
+        ep_group: Any,
+    ) -> None:
+        # Full MoEConfig belongs to the model-build validation Seam. The runtime
+        # retains only immutable facts needed by its resource/lifetime rules.
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.max_inflight = max_inflight
+        self.num_sms = num_sms
+        self.staging_reference = staging_reference
         self.ep_group = ep_group
+        self._layers: list[tuple[str, tuple[nn.Module, nn.Module]]] = []
         self._closed = False
-        # Resource-free: lazy import/API metadata validation only.
-        validate_moonep_python_contract(config, ep_group)
 
-    def bind_dispatcher(self, *, layer_fqn: str, experts: MoEBlock) -> GenericDispatcher:
-        binding = register_moonep_layer(self, layer_fqn, experts)
-        return MoonEPDispatcher(runtime=self, layer_binding=binding)
+    def bind_dispatcher(
+        self,
+        *,
+        layer_fqn: str,
+        projections: tuple[nn.Module, nn.Module],
+    ) -> GenericDispatcher:
+        if any(registered_fqn == layer_fqn for registered_fqn, _ in self._layers):
+            raise ValueError(f"duplicate MoonEP routed layer: {layer_fqn}")
+        layer_id = len(self._layers)
+        self._layers.append((layer_fqn, projections))
+        return MoonEPDispatcher(runtime=self, layer_id=layer_id)
 
-    def validate_before_fsdp(self, *, model: nn.Module, fsdp_config: Any) -> None:
-        validate_moonep_fsdp_config(model, fsdp_config)
+    def validate_before_fsdp(self, *, fsdp_config: Any) -> None:
+        validate_moonep_fsdp_config(fsdp_config)
 
-    def install_after_fsdp(self, *, model: nn.Module, fsdp_config: Any) -> None:
-        install_moonep_vmm_and_fsdp_landing(self, model, fsdp_config)
+    def install_after_fsdp(self, *, fsdp_root: nn.Module) -> None:
+        # The version-pinned FSDP2 Adapter needs a traversal root to locate owner
+        # states. It is call-scoped and is never retained by the runtime.
+        install_moonep_vmm_and_fsdp_landing(self, fsdp_root)
 
     def close(self) -> None:
         if not self._closed:
             destroy_moonep_buffers_vmm_and_landing(self)
+            self._layers.clear()
             self._closed = True
 
 
@@ -240,9 +271,7 @@ class _ExpertWeightAutograd(torch.autograd.Function):
         # Standard GMM allocated and returned these two local [2B] gradients.
         # MoonEP may stage them into its private symmetric reduction slot here;
         # that storage rule never enters GroupedLinear or the GMM op schema.
-        home_grads = ctx.invocation._complete_weight_gradients(
-            (grad_local_w1w3, grad_local_w2)
-        )
+        home_grads = ctx.invocation._complete_weight_gradients((grad_local_w1w3, grad_local_w2))
         return (
             home_grads[0].reshape(ctx.home_shapes[0]),
             home_grads[1].reshape(ctx.home_shapes[1]),
@@ -253,9 +282,9 @@ class _ExpertWeightAutograd(torch.autograd.Function):
 
 
 class MoonEPDispatcher(GenericDispatcher):
-    def __init__(self, *, runtime: MoonEPRuntime, layer_binding: object) -> None:
+    def __init__(self, *, runtime: MoonEPRuntime, layer_id: int) -> None:
         self.runtime = runtime
-        self.layer_binding = layer_binding
+        self.layer_id = layer_id
         self._next_reduction_slot = 0
 
     def dispatch_preprocess(
@@ -286,10 +315,10 @@ class MoonEPDispatcher(GenericDispatcher):
         state: StageState,
     ) -> StageState:
         reduction_slot = self._next_reduction_slot
-        self._next_reduction_slot = (reduction_slot + 1) % self.runtime.config.intra_layer_micro_batch
+        self._next_reduction_slot = (reduction_slot + 1) % self.runtime.max_inflight
         invocation = create_moonep_invocation(
             self.runtime,
-            self.layer_binding,
+            self.layer_id,
             reduction_slot=reduction_slot,
         )
         hidden_states, weights = invocation.dispatch(
@@ -379,17 +408,19 @@ class _UltraEPGradReduceJoin(torch.autograd.Function):
     def forward(
         ctx: Any,
         layer_input: Tensor,
-        dispatcher: UltraEPDispatcher,
+        runtime: UltraEPRuntime,
+        layer_id: int,
         virtual_layer_id: int,
     ) -> Tensor:
-        ctx.dispatcher = dispatcher
+        ctx.runtime = runtime
+        ctx.layer_id = layer_id
         ctx.virtual_layer_id = virtual_layer_id
         return layer_input
 
     @staticmethod
-    def backward(ctx: Any, grad_input: Tensor) -> tuple[Tensor, None, None]:
-        ctx.dispatcher._finish_grad_reduce(ctx.virtual_layer_id)
-        return grad_input, None, None
+    def backward(ctx: Any, grad_input: Tensor) -> tuple[Tensor, None, None, None]:
+        ctx.runtime._finish_grad_reduce(ctx.layer_id, ctx.virtual_layer_id)
+        return grad_input, None, None, None
 
 
 class _UltraEPGradReduceStart(torch.autograd.Function):
@@ -399,17 +430,19 @@ class _UltraEPGradReduceStart(torch.autograd.Function):
     def forward(
         ctx: Any,
         hidden_states: Tensor,
-        dispatcher: UltraEPDispatcher,
+        runtime: UltraEPRuntime,
+        layer_id: int,
         virtual_layer_id: int,
     ) -> Tensor:
-        ctx.dispatcher = dispatcher
+        ctx.runtime = runtime
+        ctx.layer_id = layer_id
         ctx.virtual_layer_id = virtual_layer_id
         return hidden_states
 
     @staticmethod
-    def backward(ctx: Any, grad_hidden: Tensor) -> tuple[Tensor, None, None]:
-        ctx.dispatcher._start_grad_reduce(ctx.virtual_layer_id)
-        return grad_hidden, None, None
+    def backward(ctx: Any, grad_hidden: Tensor) -> tuple[Tensor, None, None, None]:
+        ctx.runtime._start_grad_reduce(ctx.layer_id, ctx.virtual_layer_id)
+        return grad_hidden, None, None, None
 
 
 class _UltraEPWeightSyncForBackward(torch.autograd.Function):
@@ -419,33 +452,39 @@ class _UltraEPWeightSyncForBackward(torch.autograd.Function):
     def forward(
         ctx: Any,
         expert_output: Tensor,
-        dispatcher: UltraEPDispatcher,
+        runtime: UltraEPRuntime,
         virtual_layer_id: int,
     ) -> Tensor:
-        ctx.dispatcher = dispatcher
+        ctx.runtime = runtime
         ctx.virtual_layer_id = virtual_layer_id
         return expert_output
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None, None]:
-        ctx.dispatcher._replay_weights_for_backward(ctx.virtual_layer_id)
+        ctx.runtime._replay_weights_for_backward(ctx.virtual_layer_id)
         return grad_output, None, None
 
 
 class UltraEPRuntime:
     """External Manager、FP32 staging 与 FSDP lifecycle 的 model-scoped owner。"""
 
-    def __init__(self, *, config: Any, ep_group: Any) -> None:
-        self.config = config
+    def __init__(
+        self,
+        *,
+        num_experts: int,
+        replica_slots_per_rank: int,
+        ep_group: Any,
+    ) -> None:
+        # Validation consumes MoEConfig once. Runtime methods use only these
+        # scalars plus the projection pairs registered below.
+        self.num_experts = num_experts
+        self.replica_slots_per_rank = replica_slots_per_rank
         self.ep_group = ep_group
-        validate_ultraep_python_contract(config, ep_group)
-        self.num_experts = config.n_routed_experts
-        self.replica_slots_per_rank = config.ultraep_cfg.replica_slots_per_rank
         self.ep_size = ep_group.size()
         self._closed = False
-        self.manager: Any | None = None
-        self.master_grad_staging: tuple[Tensor, Tensor] | None = None
-        self.dispatchers: list[UltraEPDispatcher] = []
+        self._manager: Any | None = None
+        self._layers: list[tuple[str, tuple[nn.Module, nn.Module]]] = []
+        self._master_grad_staging: dict[int, ProjectionPair] = {}
         self._active_layer_calls: set[int] = set()
         self._grad_reduce_events: dict[int, object] = {}
 
@@ -455,8 +494,16 @@ class UltraEPRuntime:
         # interleaved with replica gaps and are not the logical range [0, E).
         return self.num_experts + self.ep_size * self.replica_slots_per_rank
 
-    def bind_dispatcher(self, *, layer_fqn: str, experts: MoEBlock) -> GenericDispatcher:
-        del layer_fqn
+    def bind_dispatcher(
+        self,
+        *,
+        layer_fqn: str,
+        projections: tuple[nn.Module, nn.Module],
+    ) -> GenericDispatcher:
+        if any(registered_fqn == layer_fqn for registered_fqn, _ in self._layers):
+            raise ValueError(f"duplicate UltraEP routed layer: {layer_fqn}")
+        layer_id = len(self._layers)
+        self._layers.append((layer_fqn, projections))
         inner = build_deepep_dispatcher(
             n_routed_experts=self.num_physical_experts,
             ep_group=self.ep_group,
@@ -464,50 +511,112 @@ class UltraEPRuntime:
         dispatcher = UltraEPDispatcher(
             runtime=self,
             # UltraEP virtual IDs encode this stable physical decoder ordinal.
-            layer_id=len(self.dispatchers),
-            experts=experts,
+            layer_id=layer_id,
             inner=inner,
         )
-        self.dispatchers.append(dispatcher)
         return dispatcher
 
-    def validate_before_fsdp(self, *, model: nn.Module, fsdp_config: Any) -> None:
-        validate_ultraep_fsdp_config(model, fsdp_config)
-        validate_two_segment_gmm_supports_configured_layout(self.config)
+    def validate_before_fsdp(self, *, fsdp_config: Any) -> None:
+        validate_ultraep_fsdp_config(fsdp_config)
+        validate_two_segment_gmm_supports_registered_projections([projections for _, projections in self._layers])
 
-    def install_after_fsdp(self, *, model: nn.Module, fsdp_config: Any) -> None:
-        del model, fsdp_config
-        self.manager = create_external_ultraep_manager(
-            config=self.config,
+    def install_after_fsdp(self, *, fsdp_root: nn.Module) -> None:
+        # Like MoonEP landing, storage binding may inspect FSDP-owned state from
+        # this traversal root. The runtime never retains the root itself.
+        self._manager = create_external_ultraep_manager(
+            num_experts=self.num_experts,
+            replica_slots_per_rank=self.replica_slots_per_rank,
             ep_group=self.ep_group,
             explicitly_destroy=True,
         )
-        self.master_grad_staging = allocate_ultraep_master_grad_staging(self.config)
-        for dispatcher in self.dispatchers:
-            bind_ultraep_layer_storage(
-                manager=self.manager,
-                master_grad_staging=self.master_grad_staging,
-                layer_id=dispatcher.layer_id,
-                experts=dispatcher.experts,
-                config=self.config,
+        for layer_id, (layer_fqn, projections) in enumerate(self._layers):
+            self._master_grad_staging[layer_id] = bind_ultraep_layer_storage(
+                manager=self._manager,
+                fsdp_root=fsdp_root,
+                layer_id=layer_id,
+                layer_fqn=layer_fqn,
+                projections=projections,
             )
 
-    def _allocate_virtual_layer_id(self, dispatcher: UltraEPDispatcher) -> int:
+    def _allocate_virtual_layer_id(self, layer_id: int) -> int:
         # A virtual placement ID does not isolate UltraEP v1's shared replica tensors.
-        if dispatcher.layer_id in self._active_layer_calls:
+        if layer_id in self._active_layer_calls:
             raise RuntimeError("UltraEP v1 permits one active call per physical layer")
-        manager = cast(Any, self.manager)
-        virtual_layer_id = manager.allocate_microbatch_slot(dispatcher.layer_id)
-        self._active_layer_calls.add(dispatcher.layer_id)
+        manager = cast(Any, self._manager)
+        virtual_layer_id = manager.allocate_microbatch_slot(layer_id)
+        self._active_layer_calls.add(layer_id)
         return virtual_layer_id
+
+    def _prepare_dispatch(
+        self,
+        layer_id: int,
+        virtual_layer_id: int,
+        logical_ids: Tensor,
+    ) -> tuple[Tensor, object]:
+        """Hide Manager placement, registered projections and weight sync。"""
+        manager = cast(Any, self._manager)
+        manager.update_placement_sparse(virtual_layer_id, logical_ids)
+        refresh_external_master_pointers(
+            manager,
+            layer_id,
+            self._layers[layer_id][1],
+        )
+        weight_sync_event = manager.weight_sync(virtual_layer_id, async_finish=True)
+        physical_ids = logical_ids.clone()
+        manager.reroute_sparse(virtual_layer_id, physical_ids)
+        return physical_ids, weight_sync_event
+
+    def _get_expert_weight_layout(
+        self,
+        layer_id: int,
+        virtual_layer_id: int,
+    ) -> ExpertWeightLayout:
+        external_weights, external_wgrad_outs = get_ultraep_call_storage(
+            manager=cast(Any, self._manager),
+            layer_id=layer_id,
+            virtual_layer_id=virtual_layer_id,
+        )
+        return ExpertWeightLayout(
+            external_weights=external_weights,
+            external_wgrad_outs=external_wgrad_outs,
+        )
+
+    def _replay_weights_for_backward(self, virtual_layer_id: int) -> None:
+        cast(Any, self._manager).weight_sync(virtual_layer_id, async_finish=False)
+
+    def _start_grad_reduce(self, layer_id: int, virtual_layer_id: int) -> None:
+        manager = cast(Any, self._manager)
+        stage_master_grads_to_fp32(
+            self._master_grad_staging[layer_id],
+            virtual_layer_id,
+            self._layers[layer_id][1],
+        )
+        self._grad_reduce_events[virtual_layer_id] = manager.grad_reduce(
+            virtual_layer_id,
+            async_finish=True,
+        )
+
+    def _finish_grad_reduce(self, layer_id: int, virtual_layer_id: int) -> None:
+        current_stream_wait_event(self._grad_reduce_events.pop(virtual_layer_id))
+        restore_fp32_master_grads_to_fsdp(
+            self._master_grad_staging[layer_id],
+            virtual_layer_id,
+            self._layers[layer_id][1],
+        )
+        self._release_virtual_layer_id(layer_id)
 
     def _release_virtual_layer_id(self, layer_id: int) -> None:
         self._active_layer_calls.remove(layer_id)
 
     def close(self) -> None:
         if not self._closed:
-            if self.manager is not None:
-                self.manager.destroy()
+            if self._manager is not None:
+                self._manager.destroy()
+                self._manager = None
+            self._layers.clear()
+            self._master_grad_staging.clear()
+            self._active_layer_calls.clear()
+            self._grad_reduce_events.clear()
             self._closed = True
 
 
@@ -519,17 +628,20 @@ class UltraEPDispatcher(GenericDispatcher):
         *,
         runtime: UltraEPRuntime,
         layer_id: int,
-        experts: MoEBlock,
         inner: GenericDispatcher,
     ) -> None:
         self.runtime = runtime
         self.layer_id = layer_id
-        self.experts = experts
         self.inner = inner
 
     def prepare_layer_input(self, layer_input: Tensor) -> tuple[Tensor, object | None]:
-        virtual_layer_id = self.runtime._allocate_virtual_layer_id(self)
-        joined_input = _UltraEPGradReduceJoin.apply(layer_input, self, virtual_layer_id)
+        virtual_layer_id = self.runtime._allocate_virtual_layer_id(self.layer_id)
+        joined_input = _UltraEPGradReduceJoin.apply(
+            layer_input,
+            self.runtime,
+            self.layer_id,
+            virtual_layer_id,
+        )
         return joined_input, virtual_layer_id
 
     def dispatch_preprocess(
@@ -545,18 +657,17 @@ class UltraEPDispatcher(GenericDispatcher):
         decoding: bool = False,
     ) -> StageState:
         virtual_layer_id = cast(int, layer_state)
-        manager = cast(Any, self.runtime.manager)
-        # Placement, weight materialization and reroute share one external state key.
-        manager.update_placement_sparse(virtual_layer_id, topk_ids)
         # Router counts remain the common phase-1 contract; UltraEP's real API
         # derives placement loads from IDs and therefore does not consume them.
-        refresh_external_master_pointers(manager, self.layer_id, self.experts)
-        weight_sync_event = manager.weight_sync(virtual_layer_id, async_finish=True)
-        physical_ids = topk_ids.clone()
-        manager.reroute_sparse(virtual_layer_id, physical_ids)
+        physical_ids, weight_sync_event = self.runtime._prepare_dispatch(
+            self.layer_id,
+            virtual_layer_id,
+            topk_ids,
+        )
         dispatch_input = _UltraEPGradReduceStart.apply(
             hidden_states,
-            self,
+            self.runtime,
+            self.layer_id,
             virtual_layer_id,
         )
         inner_pre = self.inner.dispatch_preprocess(
@@ -594,18 +705,13 @@ class UltraEPDispatcher(GenericDispatcher):
         inner_post = self.inner.dispatch_postprocess(state["inner"])
         # Device-side dependency only; do not synchronize the host.
         current_stream_wait_event(state["_weight_sync_event"])
-        external_weights, external_wgrad_outs = get_ultraep_call_storage(
-            manager=cast(Any, self.runtime.manager),
-            layer_id=self.layer_id,
-            virtual_layer_id=state["_virtual_layer_id"],
-        )
         return {
             "hidden_states": inner_post["hidden_states"],
             # DeepEP local order is fixed to [B master groups, R replica groups].
             "tokens_per_expert": inner_post["tokens_per_expert"],
-            "expert_weight_layout": ExpertWeightLayout(
-                external_weights=external_weights,
-                external_wgrad_outs=external_wgrad_outs,
+            "expert_weight_layout": self.runtime._get_expert_weight_layout(
+                self.layer_id,
+                state["_virtual_layer_id"],
             ),
             "inner": inner_post,
             "_virtual_layer_id": state["_virtual_layer_id"],
@@ -619,7 +725,7 @@ class UltraEPDispatcher(GenericDispatcher):
         virtual_layer_id = cast(int, state["_virtual_layer_id"])
         replay_edge = _UltraEPWeightSyncForBackward.apply(
             expert_output,
-            self,
+            self.runtime,
             virtual_layer_id,
         )
         inner_pre_combined = self.inner.combine_preprocess(
@@ -649,25 +755,6 @@ class UltraEPDispatcher(GenericDispatcher):
             self.runtime._release_virtual_layer_id(self.layer_id)
         return output
 
-    def _replay_weights_for_backward(self, virtual_layer_id: int) -> None:
-        manager = cast(Any, self.runtime.manager)
-        manager.weight_sync(virtual_layer_id, async_finish=False)
-
-    def _start_grad_reduce(self, virtual_layer_id: int) -> None:
-        manager = cast(Any, self.runtime.manager)
-        staging = cast(tuple[Tensor, Tensor], self.runtime.master_grad_staging)
-        stage_master_grads_to_fp32(staging, virtual_layer_id, self.experts)
-        self.runtime._grad_reduce_events[virtual_layer_id] = manager.grad_reduce(
-            virtual_layer_id,
-            async_finish=True,
-        )
-
-    def _finish_grad_reduce(self, virtual_layer_id: int) -> None:
-        current_stream_wait_event(self.runtime._grad_reduce_events.pop(virtual_layer_id))
-        staging = cast(tuple[Tensor, Tensor], self.runtime.master_grad_staging)
-        restore_fp32_master_grads_to_fsdp(staging, virtual_layer_id, self.experts)
-        self.runtime._release_virtual_layer_id(self.layer_id)
-
 
 # =============================================================================
 # 5. [CHANGED EXPERT COMPUTE] backend-neutral GroupedLinear Interface
@@ -675,12 +762,10 @@ class UltraEPDispatcher(GenericDispatcher):
 
 
 class GroupedLinear(nn.Module):
-    """BF16 parameter owner with one counts-based caller Interface.
+    """Trainable parameter owner with one counts-based caller Interface.
 
-    The selected one-segment Adapter owns its private schedule.  Only the real
-    UltraEP two-allocation case enters the two-segment Implementation below.
-    TileWise FP8 implements the same caller Interface but keeps quant/scales in
-    its own Module and rejects dynamic layouts during model validation.
+    This existing BF16 Module calls the standard one-segment op directly. Only
+    UltraEP's real two-allocation case enters the two-segment Implementation.
     """
 
     weight: nn.Parameter
@@ -705,8 +790,8 @@ class GroupedLinear(nn.Module):
             )
 
         if external_weight is None:
-            # Ordinary EP and MoonEP use exactly the selected Adapter's standard
-            # one-segment autograd path. MoonEP captures dW on its weight alias.
+            # Ordinary EP and MoonEP use the standard one-segment autograd path.
+            # MoonEP captures its natural dW on the differentiable weight alias.
             return group_gemm(hidden_states, trainable_weight, tokens_per_expert)
 
         # The only real two-allocation caller is UltraEP. Its external weight
@@ -717,6 +802,38 @@ class GroupedLinear(nn.Module):
             trainable_weight,
             external_weight,
             external_wgrad_out,
+            tokens_per_expert,
+        )
+
+
+class TileWiseFloat8GroupedLinear(nn.Module):
+    """Existing FP8 Module implementing the same caller Interface directly.
+
+    Ordinary EP may receive an FSDP-prequantized weight. MoonEP deliberately
+    supplies a BF16 local [2B] alias; this Adapter dynamically quantizes it and
+    natural autograd still returns BF16 dW to _ExpertWeightAutograd.
+    """
+
+    weight: nn.Parameter
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        tokens_per_expert: Tensor,
+        *,
+        trainable_weight: Tensor | None = None,
+        external_weight: Tensor | None = None,
+        external_wgrad_out: Tensor | None = None,
+    ) -> Tensor:
+        # UltraEP FP8 is rejected during model validation. Keeping its unsupported
+        # storage operands out of the op preserves the existing AdaptiveGEMM ABI.
+        if external_weight is not None or external_wgrad_out is not None:
+            raise RuntimeError("UltraEP FP8 is not supported")
+        if trainable_weight is None:
+            trainable_weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+        return tilewise_fp8_group_gemm(
+            hidden_states,
+            trainable_weight,
             tokens_per_expert,
         )
 
@@ -934,11 +1051,16 @@ class MoEDecoderLayer(nn.Module):
 
 class MoEConfig:
     dispatcher: DispatcherName
+    hidden_size: int
+    moe_intermediate_size: int
     n_routed_experts: int
-    training_dtype: Literal["bf16", "fp8"]
+    num_experts_per_tok: int
+    expert_compute_dtype: Literal["bf16", "fp8"]
     expert_tp_size: int
     data_parallel_size: int
     intra_layer_micro_batch: int
+    moonep_num_sms: int
+    moonep_staging_reference: bool
     mtp_config: Any | None
     moe_bias: bool
     ultraep_cfg: Any | None
@@ -950,29 +1072,27 @@ def build_ep_runtime(
     config: MoEConfig,
     ep_group: Any,
 ) -> MoonEPRuntime | UltraEPRuntime | None:
-    """One discriminator; UltraEP is not deepep + an orthogonal decoder overlay。"""
+    """Validate the full config once, then retain only runtime-owned facts。"""
     if config.dispatcher == "moonep":
-        return MoonEPRuntime(config=config, ep_group=ep_group)
+        validate_moonep_python_contract(config, ep_group)
+        return MoonEPRuntime(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            num_experts=config.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            max_inflight=config.intra_layer_micro_batch,
+            num_sms=config.moonep_num_sms,
+            staging_reference=config.moonep_staging_reference,
+            ep_group=ep_group,
+        )
     if config.dispatcher == "ultraep":
-        return UltraEPRuntime(config=config, ep_group=ep_group)
+        validate_ultraep_python_contract(config, ep_group)
+        return UltraEPRuntime(
+            num_experts=config.n_routed_experts,
+            replica_slots_per_rank=config.ultraep_cfg.replica_slots_per_rank,
+            ep_group=ep_group,
+        )
     return None
-
-
-def build_layer_dispatcher(
-    *,
-    config: MoEConfig,
-    ep_group: Any,
-    runtime: MoonEPRuntime | UltraEPRuntime | None,
-    layer_fqn: str,
-    experts: MoEBlock,
-) -> GenericDispatcher:
-    if runtime is not None:
-        return runtime.bind_dispatcher(layer_fqn=layer_fqn, experts=experts)
-    return build_existing_dispatcher(
-        dispatcher=config.dispatcher,
-        n_routed_experts=config.n_routed_experts,
-        ep_group=ep_group,
-    )
 
 
 class MoEModel(nn.Module):
@@ -986,24 +1106,32 @@ class MoEModel(nn.Module):
         # UltraEP v1 rejects MTP during resource-free runtime validation before this build.
         self.layers = build_decoder_layers(
             config=config,
-            dispatcher_builder=lambda layer_fqn, experts: build_layer_dispatcher(
-                config=config,
-                ep_group=ep_group,
-                runtime=self._ep_runtime,
-                layer_fqn=layer_fqn,
-                experts=experts,
+            # This assembly lambda is the last boundary that sees MoEBlock. It
+            # also keeps expert compute dtype out of dynamic transport runtimes.
+            dispatcher_builder=lambda layer_fqn, experts: (
+                self._ep_runtime.bind_dispatcher(
+                    layer_fqn=layer_fqn,
+                    projections=(experts.fused_w1w3, experts.fused_w2),
+                )
+                if self._ep_runtime is not None
+                else build_existing_dispatcher(
+                    dispatcher=config.dispatcher,
+                    n_routed_experts=config.n_routed_experts,
+                    ep_group=ep_group,
+                    transport_dtype=config.expert_compute_dtype,
+                )
             ),
         )
 
     def fully_shard(self, fsdp_config: Any) -> MoEModel:
         # Critical ordering: reject unsupported combinations before mutating parameters.
         if self._ep_runtime is not None:
-            self._ep_runtime.validate_before_fsdp(model=self, fsdp_config=fsdp_config)
+            self._ep_runtime.validate_before_fsdp(fsdp_config=fsdp_config)
 
         existing_fully_shard_model(self, fsdp_config)
 
         if self._ep_runtime is not None:
-            self._ep_runtime.install_after_fsdp(model=self, fsdp_config=fsdp_config)
+            self._ep_runtime.install_after_fsdp(fsdp_root=self)
         return self
 
     def close_ep_runtime(self) -> None:
@@ -1087,12 +1215,9 @@ class _TwoSegmentGroupedLinear(torch.autograd.Function):
 def validate_moonep_python_contract(config: Any, ep_group: Any) -> None: ...
 
 
-def register_moonep_layer(runtime: MoonEPRuntime, layer_fqn: str, experts: MoEBlock) -> object: ...
-
-
 def create_moonep_invocation(
     runtime: MoonEPRuntime,
-    layer_binding: object,
+    layer_id: int,
     *,
     reduction_slot: int,
 ) -> _MoonEPInvocation: ...
@@ -1105,13 +1230,12 @@ def materialize_moonep_local_tensors(
     ...
 
 
-def validate_moonep_fsdp_config(model: nn.Module, fsdp_config: Any) -> None: ...
+def validate_moonep_fsdp_config(fsdp_config: Any) -> None: ...
 
 
 def install_moonep_vmm_and_fsdp_landing(
     runtime: MoonEPRuntime,
-    model: nn.Module,
-    fsdp_config: Any,
+    fsdp_root: nn.Module,
 ) -> None: ...
 
 
@@ -1120,24 +1244,22 @@ def destroy_moonep_buffers_vmm_and_landing(runtime: MoonEPRuntime) -> None: ...
 
 def create_external_ultraep_manager(
     *,
-    config: Any,
+    num_experts: int,
+    replica_slots_per_rank: int,
     ep_group: Any,
     explicitly_destroy: bool,
 ) -> Any: ...
 
 
-def allocate_ultraep_master_grad_staging(config: MoEConfig) -> tuple[Tensor, Tensor]: ...
-
-
 def bind_ultraep_layer_storage(
     *,
     manager: Any,
-    master_grad_staging: tuple[Tensor, Tensor],
+    fsdp_root: nn.Module,
     layer_id: int,
-    experts: MoEBlock,
-    config: MoEConfig,
-) -> None:
-    """Register current layer storage; per-call views are fetched by virtual ID。"""
+    layer_fqn: str,
+    projections: tuple[nn.Module, nn.Module],
+) -> ProjectionPair:
+    """Register two projections and return this layer's FP32 master staging。"""
     ...
 
 
@@ -1151,20 +1273,24 @@ def get_ultraep_call_storage(
     ...
 
 
-def refresh_external_master_pointers(manager: Any, layer_id: int, experts: MoEBlock) -> None: ...
+def refresh_external_master_pointers(
+    manager: Any,
+    layer_id: int,
+    projections: tuple[nn.Module, nn.Module],
+) -> None: ...
 
 
 def stage_master_grads_to_fp32(
-    master_grad_staging: tuple[Tensor, Tensor],
+    master_grad_staging: ProjectionPair,
     virtual_layer_id: int,
-    experts: MoEBlock,
+    projections: tuple[nn.Module, nn.Module],
 ) -> None: ...
 
 
 def restore_fp32_master_grads_to_fsdp(
-    master_grad_staging: tuple[Tensor, Tensor],
+    master_grad_staging: ProjectionPair,
     virtual_layer_id: int,
-    experts: MoEBlock,
+    projections: tuple[nn.Module, nn.Module],
 ) -> None: ...
 
 
@@ -1175,7 +1301,7 @@ def validate_ultraep_python_contract(config: Any, ep_group: Any) -> None:
     unsupported = (
         ep_group.size() <= 1
         or config.ultraep_cfg is None
-        or config.training_dtype != "bf16"
+        or config.expert_compute_dtype != "bf16"
         or config.expert_tp_size != 1
         or config.data_parallel_size != 1
         or config.intra_layer_micro_batch != 1
@@ -1188,14 +1314,15 @@ def validate_ultraep_python_contract(config: Any, ep_group: Any) -> None:
         raise ValueError("UltraEP replica_slots_per_rank must be positive")
 
 
-def validate_ultraep_fsdp_config(model: nn.Module, fsdp_config: Any) -> None:
+def validate_ultraep_fsdp_config(fsdp_config: Any) -> None:
     """UltraEP v1 keeps the PR's deliberately narrow, proven capability boundary。"""
-    del model
     if fsdp_config.recompute_ratio > 0:
         raise ValueError("UltraEP v1 does not support activation recompute")
 
 
-def validate_two_segment_gmm_supports_configured_layout(config: Any) -> None: ...
+def validate_two_segment_gmm_supports_registered_projections(
+    projections: Sequence[tuple[nn.Module, nn.Module]],
+) -> None: ...
 
 
 def build_deepep_dispatcher(*, n_routed_experts: int, ep_group: Any) -> GenericDispatcher: ...
@@ -1211,6 +1338,19 @@ def group_gemm(
     Triton and CUTLASS keep their existing allocation-return contract. TileWise
     FP8 stays behind its own GroupedLinear Implementation because its raw op also
     consumes quantization scales.
+    """
+    ...
+
+
+def tilewise_fp8_group_gemm(
+    x: Tensor,
+    weight: Tensor,
+    tokens_per_expert: Tensor,
+) -> Tensor:
+    """Hide dynamic block quant/scales and return natural BF16 dW.
+
+    ``weight`` may be an ordinary prequantized FSDP value or MoonEP's BF16
+    local [2B] override. UltraEP external segments are rejected at build time.
     """
     ...
 
@@ -1243,6 +1383,7 @@ def build_existing_dispatcher(
     dispatcher: DispatcherName,
     n_routed_experts: int,
     ep_group: Any,
+    transport_dtype: Literal["bf16", "fp8"],
 ) -> GenericDispatcher: ...
 
 
@@ -1269,7 +1410,11 @@ def close_other_engine_resources(engine: TrainEngine) -> None: ...
 # - official R=2 strided replica views work, or config rejects them before FSDP mutation;
 # - UltraEP v1 rejects a second same-layer call before shared storage is overwritten;
 # - each backend only enables Domino/MTP/reentrant paths declared by its capability boundary;
+# - runtimes do not retain the full model/config, and close releases registered projections;
 # - ordinary and MoonEP BF16 GMM paths use the same three-argument Interface;
+# - MoonEP FP8 dynamically quantizes a BF16 local override and returns natural BF16 dW,
+#   or rejects the configuration before resource/FSDP mutation;
 # - ordinary FP8/CUTLASS paths still use their natural autograd WGrad;
+# - UltraEP v1 rejects FP8 rather than exposing quantization metadata to Dispatcher;
 # - DCP/HF state excludes all runtime/private-state tensors and cold-runtime restore works;
 # - explicit close permits rebuilding a different runtime in the same process.
