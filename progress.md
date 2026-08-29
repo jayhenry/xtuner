@@ -635,3 +635,32 @@ flowchart LR
 source counts 与 expert compute counts 继续使用同一字段名，但由阶段边界区分语义：Router result 描述当前 source batch 的 logical experts；phase-3 result 描述本 rank 实际执行的 physical groups。这样消除了重复计算，同时没有把 MoonEP 的 placement 语义泄漏给 Router。
 
 本提交只收敛计数所有权和入口接口，不改变 activation transport、expert weight layout 或 GMM。下一步删除 MoonEP 专用 `grad_weight_out` 路径，让标准 one-segment GMM 自然产生 dW。
+
+# 2026-08-29_EP扩展重构-02-标准GMM与权重布局
+
+完成 expert compute Seam 收敛：所有 dispatcher 的 phase-3 都返回 MLP 粒度 `ExpertWeightLayout`；普通路径使用空布局，MoonEP 只提供 call-local differentiable `[2B]` trainable weights。BF16 Triton one-segment GMM 删除 `grad_weight_out` 及 `k_grouped_gemm_out`，统一由 autograd 自然返回 dW。
+
+## 开发与测试记录
+
+- `MoEBlock` 不再读取 MoonEP 私有 `expert_tensors`，也不按 backend 分支；两块 fused projection 消费同一 layout。
+- `GroupedLinear.forward` 删除未参与计算的 `decoding` 和 direct-dW 参数，收敛为 device counts + trainable/external ownership。
+- MoonEP 仍使用现有 VMM gradient slots，但 staging 被收回 `_MoonEPInvocation`：自然 dW 在 gradient handoff 内 D2D copy 后进入原 duplicate reduce/FSDP edge。
+- CPU dispatcher/factory contract：`12 passed`。
+- GPU 真实 Triton eager/compile 与 public GroupedLinear override 梯度：`3 passed`。
+- 8×H200、真实 MoonEP BF16 FSDP2×EP4 forward/backward/optimizer：`1 passed`。
+- Ruff 定向检查：`All checks passed`。
+
+```mermaid
+flowchart LR
+    A["Dispatcher phase 3"] --> B["ExpertWeightLayout<br/>trainable pair"]
+    B --> C["MoEBlock<br/>two fused projections"]
+    C --> D["Selected standard GMM"]
+    D --> E["Natural BF16 dW allocation"]
+    E --> F["MoonEP private gradient handoff"]
+    F --> G["VMM reduction slot<br/>duplicate SUM"]
+    G --> H["FSDP ReduceScatter"]
+```
+
+普通/DeepEP 的 layout 是标准空值，Module Parameter 直接接收所选算子的自然 dW；MoonEP layout 替换的只是 trainable tensor leaf，GMM 不感知 VMM、plan、gradient slot 或 dispatcher 类型。external segment 字段只表达已定稿的 UltraEP ownership 边界，当前 one-segment Implementation 对非空 external segment 明确不实现。
+
+本阶段删除了一个 caller-visible 参数、一个 mutable custom op 和 `expert_tensors` 嵌套 carrier。下一步保持相同 `ExpertWeightLayout` 与 GMM 调用端，为 MoonEP 增加 BF16 transport + local dynamic FP8 compute。

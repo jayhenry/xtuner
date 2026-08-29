@@ -163,25 +163,22 @@ class GroupedLinear(nn.Module):
         self,
         x: torch.Tensor,
         tokens_per_expert: torch.Tensor,
-        decoding: bool = False,
         *,
-        weight_override: torch.Tensor | None = None,
-        grad_weight_out: torch.Tensor | None = None,
+        trainable_weight: torch.Tensor | None = None,
+        external_weight: torch.Tensor | None = None,
+        external_wgrad_out: torch.Tensor | None = None,
     ):
-        # MoonEP supplies a contiguous local [home B, duplicate B] VMM alias.
-        # Keeping this as a call-scoped override preserves the FSDP Parameter
-        # identity and avoids a module-wide ``.data`` swap.
-        if weight_override is None:
+        if external_weight is not None or external_wgrad_out is not None:
+            raise NotImplementedError("two-segment grouped linear is not implemented")
+
+        # A dynamic EP backend may supply a differentiable call-local alias.
+        # The selected one-segment op still returns its dW through autograd.
+        if trainable_weight is None:
             weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
             weight = weight.view(-1, self.local_out_features, self.local_in_features)
         else:
-            weight = weight_override
-        out = group_gemm(
-            x,
-            weight,
-            tokens_per_expert,
-            grad_weight_out=grad_weight_out,
-        )
+            weight = trainable_weight
+        out = group_gemm(x, weight, tokens_per_expert)
 
         if self.moe_bias:
             bias = self.bias.to_local() if isinstance(self.bias, DTensor) else self.bias

@@ -238,17 +238,6 @@ def _(A: Tensor, B: Tensor, size_per_group: torch.Tensor) -> Tensor:
     return C
 
 
-@torch.library.custom_op("moe::k_grouped_gemm_out", mutates_args={"out"})
-def k_grouped_gemm_out(A: Tensor, B: Tensor, size_per_group: torch.Tensor, out: Tensor) -> None:
-    """Write every grouped weight-gradient row into caller-owned storage."""
-    _launch_k_grouped_gemm(A, B, size_per_group, out)
-
-
-@k_grouped_gemm_out.register_fake
-def _(A: Tensor, B: Tensor, size_per_group: torch.Tensor, out: Tensor) -> None:
-    return None
-
-
 if __name__ == "__main__":
     from torch.profiler import ProfilerActivity, profile, record_function
     from utils import generate_random_list, row_max_normalization

@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from typing import (
     Generic,
     Literal,
+    NamedTuple,
     TypeAlias,
     TypeVar,
 )
@@ -15,6 +16,15 @@ from .expert_tp import ExpertTP
 
 
 HiddenStates: TypeAlias = torch.Tensor
+ProjectionPair: TypeAlias = tuple[torch.Tensor, torch.Tensor]
+
+
+class ExpertWeightLayout(NamedTuple):
+    """Call-local expert weight ownership at the dispatcher/MLP seam."""
+
+    trainable_weights: ProjectionPair | None = None
+    external_weights: ProjectionPair | None = None
+    external_wgrad_outs: ProjectionPair | None = None
 
 
 def _get_backward_pre_hook(backward_previous_event: torch.cuda.Event):
@@ -59,6 +69,7 @@ class PostDispatchResult(TypedDict):
     # TODO:
     hidden_states: torch.Tensor
     tokens_per_expert: torch.Tensor
+    expert_weight_layout: ExpertWeightLayout
 
 
 class PreCombineResult(TypedDict):
@@ -414,6 +425,7 @@ class NaiveDispatcher(
                 hidden_states=hidden_states,
                 row_ids_map=row_id_maps,
                 tokens_per_expert=tokens_per_expert,
+                expert_weight_layout=ExpertWeightLayout(),
             )
 
     @override

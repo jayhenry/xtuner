@@ -28,6 +28,7 @@ from xtuner.v1.module import (
 from xtuner.v1.module.dispatcher import (
     CombineResult,
     DispatchResult,
+    ExpertWeightLayout,
     PostDispatchResult,
     PreCombineResult,
     PreDispatchResult,
@@ -193,22 +194,30 @@ class MoEBlock(nn.Module):
         )
         self.moe_act = moe_act_fn_cfg.build()
 
-    def forward(self, x, tokens_per_expert, decoding, *, expert_tensors=None):
-        weights, grad_outputs = expert_tensors if expert_tensors is not None else ((None, None), (None, None))
+    def forward(
+        self,
+        x: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        *,
+        weight_layout: ExpertWeightLayout,
+    ) -> torch.Tensor:
+        trainable = weight_layout.trainable_weights or (None, None)
+        external = weight_layout.external_weights or (None, None)
+        external_wgrad_outs = weight_layout.external_wgrad_outs or (None, None)
         gate_up_out = self.fused_w1w3(
             x,
             tokens_per_expert,
-            decoding,
-            weight_override=weights[0],
-            grad_weight_out=grad_outputs[0],
+            trainable_weight=trainable[0],
+            external_weight=external[0],
+            external_wgrad_out=external_wgrad_outs[0],
         )
         out = self.moe_act(gate_up_out, split_dim=-1)
         res = self.fused_w2(
             out,
             tokens_per_expert,
-            decoding,
-            weight_override=weights[1],
-            grad_weight_out=grad_outputs[1],
+            trainable_weight=trainable[1],
+            external_weight=external[1],
+            external_wgrad_out=external_wgrad_outs[1],
         )
         return res
 
@@ -454,8 +463,7 @@ class MoEDecoderLayer(nn.Module):
         experts_out = self.experts(
             post_dispatched["hidden_states"],
             post_dispatched["tokens_per_expert"],
-            decoding=False,
-            expert_tensors=post_dispatched.get("expert_tensors"),
+            weight_layout=post_dispatched["expert_weight_layout"],
         )
         # ProberList.before_combine(
         #     self.layer_idx,
@@ -587,8 +595,7 @@ class MoEDecoderLayer(nn.Module):
             experts_out = self.experts(
                 post_dispatched["hidden_states"],
                 post_dispatched["tokens_per_expert"],
-                decoding=False,
-                expert_tensors=post_dispatched.get("expert_tensors"),
+                weight_layout=post_dispatched["expert_weight_layout"],
             )
 
             pre_combined = self.dispatcher.combine_preprocess(

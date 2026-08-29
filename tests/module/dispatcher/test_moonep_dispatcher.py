@@ -214,7 +214,8 @@ def test_staging_dispatcher_runs_the_public_six_stage_forward_seam(backend) -> N
     assert pre["tokens_per_expert"].dtype == torch.int32
     assert torch.equal(pre["tokens_per_expert"], source_counts.to(torch.int32))
     assert post["tokens_per_expert"].shape == (4,)
-    assert post["expert_tensors"][0][0].shape == (4, 256, 128)
+    assert post["expert_weight_layout"].trainable_weights is not None
+    assert post["expert_weight_layout"].trainable_weights[0].shape == (4, 256, 128)
     assert torch.equal(result["hidden_states"], hidden_states * 0.5)
     assert runtime._buffer.use_caller_stream is True
     assert runtime._buffer.num_sms == 64

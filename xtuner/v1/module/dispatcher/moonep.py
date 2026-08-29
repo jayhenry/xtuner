@@ -10,7 +10,7 @@ model resources, ``_MoonEPInvocation`` owns one dispatch/combine pairing, and
 from __future__ import annotations
 
 import importlib
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -21,7 +21,7 @@ from typing_extensions import TypedDict, override
 from xtuner.v1.ops.moe.cuda.route_weight import route_weight_rows_backward
 from xtuner.v1.utils import log_rank0
 
-from .base import GenericDispatcher
+from .base import ExpertWeightLayout, GenericDispatcher, PostDispatchResult, ProjectionPair
 from .fsdp_vmm_landing import (
     fsdp_current_unsharded_expert_weights,
     install_fsdp_vmm_landing,
@@ -234,10 +234,6 @@ class MoonEPRuntime:
         self._destroyed = True
 
 
-ProjectionPair: TypeAlias = tuple[torch.Tensor, torch.Tensor]
-ExpertTensorBundle: TypeAlias = tuple[ProjectionPair, ProjectionPair]
-
-
 class MoonEPPreDispatchResult(TypedDict):
     hidden_states: torch.Tensor
     topk_ids: torch.Tensor
@@ -251,10 +247,7 @@ class MoonEPDispatchResult(TypedDict):
     _moonep_invocation: _MoonEPInvocation
 
 
-class MoonEPPostDispatchResult(TypedDict):
-    hidden_states: torch.Tensor
-    tokens_per_expert: torch.Tensor
-    expert_tensors: ExpertTensorBundle
+class MoonEPPostDispatchResult(PostDispatchResult): ...
 
 
 class MoonEPPreCombineResult(TypedDict):
@@ -281,6 +274,7 @@ class _MoonEPInvocation:
         self._plan: Any | None = None
         self._dispatch_done: Any | None = None
         self._combine_done: Any | None = None
+        self._gradient_targets: ProjectionPair | None = None
 
     def dispatch(
         self,
@@ -344,12 +338,13 @@ class _MoonEPInvocation:
         # native FSDP gradient edge.
         with torch.profiler.record_function("MoonEP::prepare_experts"):
             home_weights = self._current_home_weights()
-            local_weights, grad_outputs, weights_ready = workspace.materialize(
+            local_weights, gradient_targets, weights_ready = workspace.materialize(
                 buffer=buffer,
                 plan=self._plan,
                 generation=self._owner._generation,
                 grad_slot=self._grad_slot,
             )
+            self._gradient_targets = gradient_targets
             # async_op=True leaves dispatch on MoonEP's comm stream. Its event
             # is a device dependency (never a host wait) that makes cu_seqlens
             # safe before deriving local grouped-GEMM counts.
@@ -367,7 +362,7 @@ class _MoonEPInvocation:
         return MoonEPPostDispatchResult(
             hidden_states=dispatched["hidden_states"],
             tokens_per_expert=local_counts,
-            expert_tensors=(differentiable_weights, grad_outputs),
+            expert_weight_layout=ExpertWeightLayout(trainable_weights=differentiable_weights),
         )
 
     def combine(self, expert_output: torch.Tensor, route_weights: torch.Tensor, *, async_op: bool) -> torch.Tensor:
@@ -383,6 +378,7 @@ class _MoonEPInvocation:
         self._plan = None
         self._dispatch_done = None
         self._combine_done = None
+        self._gradient_targets = None
 
     def _dispatch_backward(
         self,
@@ -433,14 +429,21 @@ class _MoonEPInvocation:
         """Return duplicated BF16 partials before FSDP ReduceScatter."""
         runtime = self._runtime
         assert self._plan is not None and runtime._buffer is not None and runtime._workspace is not None
+        assert self._gradient_targets is not None
         with torch.profiler.record_function("MoonEP::gradient_handoff"):
+            # Standard one-segment GMMs own their natural dW allocation. Stage
+            # that result into MoonEP's symmetric reduction slot privately;
+            # the grouped-linear and op interfaces remain backend-neutral.
+            for source, target in zip(local_grads, self._gradient_targets):
+                target.copy_(source)
             home_grads, done = runtime._workspace.complete_gradients(
                 buffer=runtime._buffer,
                 plan=self._plan,
-                local_grads=local_grads,
+                local_grads=self._gradient_targets,
                 grad_slot=self._grad_slot,
             )
             done.wait()
+        self._gradient_targets = None
         return home_grads
 
 

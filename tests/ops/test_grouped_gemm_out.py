@@ -6,7 +6,7 @@ from xtuner.v1.ops.moe.cuda.route_weight import route_weight_rows_backward
 
 
 @pytest.mark.parametrize("compile", [False, True])
-def test_grouped_gemm_backward_writes_the_supplied_bf16_target(compile: bool) -> None:
+def test_grouped_gemm_backward_returns_natural_bf16_weight_gradient(compile: bool) -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
 
@@ -14,7 +14,6 @@ def test_grouped_gemm_backward_writes_the_supplied_bf16_target(compile: bool) ->
     counts = torch.tensor([2, 0, 3, 1], device="cuda", dtype=torch.int32)
     x = torch.randn(6, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(4, 256, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    grad_weight_out = torch.full_like(weight, torch.nan)
     grad_output = torch.randn(6, 256, device="cuda", dtype=torch.bfloat16)
 
     x_ref = x.detach().clone().requires_grad_()
@@ -31,19 +30,13 @@ def test_grouped_gemm_backward_writes_the_supplied_bf16_target(compile: bool) ->
     grouped_gemm = triton_group_gemm
     if compile:
         grouped_gemm = torch.compile(grouped_gemm, fullgraph=True)
-    actual = grouped_gemm(
-        x,
-        weight,
-        counts,
-        grad_weight_out=grad_weight_out,
-    )
+    actual = grouped_gemm(x, weight, counts)
     actual.backward(grad_output)
 
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(x.grad, x_ref.grad, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(weight.grad, weight_ref.grad, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(grad_weight_out, weight_ref.grad, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(grad_weight_out[1], torch.zeros_like(grad_weight_out[1]), rtol=0, atol=0)
+    torch.testing.assert_close(weight.grad[1], torch.zeros_like(weight.grad[1]), rtol=0, atol=0)
 
 
 def test_fused_route_weight_backward_returns_bf16_rows_and_fp32_weights() -> None:
