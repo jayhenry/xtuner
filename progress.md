@@ -739,3 +739,26 @@ flowchart LR
 ```
 
 实体审计后保留 `MoonEPRuntime`、`MoonEPDispatcher` 与 `_MoonEPInvocation`：三者分别拥有模型资源、六阶段 Adapter 和单次 plan/events/reduction transaction。删除任一实体都会把对应状态散回 model 或 hooks；除此之外没有引入 config、binding、schedule façade。
+
+# 2026-08-29_EP扩展重构-06-Profiler门禁对齐
+
+最终验收发现旧 profiler 仍禁止全部 local-dW copy，与本轮已经定稿并实现的“标准 GMM 自然 dW + MoonEP 私有 symmetric-slot staging”契约冲突。定向 trace 实锤所有命中均为 `_ExpertWeightAutogradBackward` 内的 `MoonEP::gradient_handoff`，因此只调整测试门禁，不回退 production GMM Interface。
+
+## 诊断与测试记录
+
+- 完整 8×H200 forward suite 首次结果为 `16 passed, 1 failed`，唯一失败是旧的 `direct_dw_materializations == 0`。
+- 同一 profiler test 独立运行两次均稳定失败，形成约 26 秒的反馈环。
+- 临时定向 trace 显示每个 routed layer 的两块 projection 各有一次 `aten::copy_ <- MoonEP::gradient_handoff <- _ExpertWeightAutogradBackward`；没有 full-dW clone、zeros-like 或归因到其他阶段的 copy。
+- 新门禁要求标准 GMM 到 symmetric reduction slot 的 handoff copy 必须存在，同时继续禁止其他 full-dW materialization、完整 home-weight copy 和 MoonEP range 内 host sync。
+- 清理临时 trace 后，独立 8×H200 profiler test 为 `1 passed`。
+
+```mermaid
+flowchart LR
+    A["Standard GMM backward"] --> B["Natural local dW"]
+    B --> C["MoonEP::gradient_handoff"]
+    C --> D["One D2D staging copy"]
+    D --> E["Symmetric reduction slot"]
+    F["Other clone / zeros / copy"] --> G["Profiler rejection"]
+```
+
+该门禁现在验证的是新架构的真实性能边界：MoonEP 可以为复用标准 Triton、CUTLASS 和 FP8 Adapter 支付一次明确的私有 D2D staging，但不能产生第二份 full-dW 临时量或把该细节泄漏回 GroupedLinear/GMM Interface。

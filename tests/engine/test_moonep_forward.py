@@ -373,7 +373,7 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
             staging_reference: bool,
             *,
             mtp_micro2_sp4: bool = False,
-        ) -> tuple[int, int, list[str], int]:
+        ) -> tuple[int, int, int, list[str], int]:
             torch.manual_seed(20260805)
             engine = TrainEngine(
                 model_cfg=_tiny_config(
@@ -423,7 +423,8 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
                 full_home_shapes = {(2, 2048, 512), (2, 512, 1024)}
                 full_local_dw_shapes = {(4, 2048, 512), (4, 512, 1024)}
                 full_weight_copies = 0
-                full_dw_materializations = 0
+                full_dw_staging_copies = 0
+                unexpected_full_dw_materializations = 0
                 host_syncs: list[str] = []
                 for event in profiler.events():
                     tensor_shapes = {
@@ -436,7 +437,18 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
                     if event.name in {"aten::clone", "aten::copy_", "aten::zeros_like"} and (
                         tensor_shapes & full_local_dw_shapes
                     ):
-                        full_dw_materializations += 1
+                        ancestry = []
+                        parent = event.cpu_parent
+                        while parent is not None:
+                            ancestry.append(parent.name)
+                            parent = parent.cpu_parent
+                        # A standard GMM naturally allocates local dW. MoonEP
+                        # may copy that result once into its symmetric reduce
+                        # slot, but no other full-dW materialization is valid.
+                        if event.name == "aten::copy_" and "MoonEP::gradient_handoff" in ancestry:
+                            full_dw_staging_copies += 1
+                        else:
+                            unexpected_full_dw_materializations += 1
 
                     parent = event.cpu_parent
                     inside_gate = False
@@ -458,7 +470,8 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
                         host_syncs.append(f"{event.name} <- {' <- '.join(ancestry)}")
                 return (
                     full_weight_copies,
-                    full_dw_materializations,
+                    full_dw_staging_copies,
+                    unexpected_full_dw_materializations,
                     host_syncs,
                     torch.cuda.max_memory_allocated(),
                 )
@@ -469,17 +482,18 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
                 torch.cuda.empty_cache()
                 dist.barrier()
 
-        staging_copies, _, _, _ = profile_mode(True)
-        direct_copies, direct_dw_materializations, direct_host_syncs, _ = profile_mode(False)
+        staging_copies, _, _, _, _ = profile_mode(True)
+        direct_copies, direct_dw_staging, direct_dw_materializations, direct_host_syncs, _ = profile_mode(False)
         assert staging_copies > 0  # Calibrates the shape-based copy detector.
         assert direct_copies == 0
+        assert direct_dw_staging > 0
         assert direct_dw_materializations == 0
         assert direct_host_syncs == [], direct_host_syncs
-        combo_copies, combo_dw_materializations, combo_host_syncs, combo_peak_bytes = profile_mode(
-            False,
-            mtp_micro2_sp4=True,
+        combo_copies, combo_dw_staging, combo_dw_materializations, combo_host_syncs, combo_peak_bytes = profile_mode(
+            False, mtp_micro2_sp4=True
         )
         assert combo_copies == 0
+        assert combo_dw_staging > 0
         assert combo_dw_materializations == 0
         assert combo_host_syncs == [], combo_host_syncs
         # The fixed tiny fallback measured 0.185 GiB/rank on H200; leave ample
