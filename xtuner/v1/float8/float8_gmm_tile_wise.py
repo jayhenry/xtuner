@@ -13,11 +13,8 @@ from xtuner.v1.float8.distributed_utils import tensor_already_casted_to_fp8
 from xtuner.v1.float8.float8_tensor import Float8Tensor, ScalingGranularity
 from xtuner.v1.float8.float8_utils import EPS, to_fp8_saturated
 from xtuner.v1.float8.fsdp_utils import WeightWithDynamicTilewiseFloat8CastTensor
-from xtuner.v1.float8.triton_kernels import (
-    per_tile_quant,
-    trans_per_block_quant_expand_128x,
-    trans_per_tile_quant_expand_128x,
-)
+from xtuner.v1.float8.triton_kernels import per_tile_quant
+from xtuner.v1.ops.moe.cuda.triton_kernels import k_grouped_gemm
 from xtuner.v1.utils.interleaved_shard import InterleavedShard
 
 
@@ -27,10 +24,7 @@ from xtuner.v1.utils.interleaved_shard import InterleavedShard
 ADAPTIVEGEMM_INSTALLED = False
 
 try:
-    from adaptive_gemm import (
-        k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous,
-        m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous,
-    )
+    from adaptive_gemm import m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous
 
     ADAPTIVEGEMM_INSTALLED = True
 except ImportError:
@@ -87,8 +81,8 @@ class weight_to_per_block_float8_dynamic(torch.autograd.Function):
 class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w_fp8, tokens_per_expert):
-        seq, din = x.shape
-        ne, dout, din = w_fp8.shape
+        seq = x.shape[0]
+        dout = w_fp8.shape[1]
         ctx.zero_token_dispatch = seq == 0
         ctx.input_shape = x.shape
         ctx.weight_shape = w_fp8.shape
@@ -97,17 +91,11 @@ class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
             return x.new_empty((seq, dout))
 
         x_fp8, x_scale = per_tile_quant(x)
-        (
-            x_trans_quant_fp8,
-            x_trans_quant_scale,
-            _,
-        ) = trans_per_block_quant_expand_128x(x, tokens_per_expert, group_size=128, dtype=torch.float8_e4m3fn)
-
         out = m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(
             (x_fp8, x_scale), (w_fp8._data, w_fp8._scale), tokens_per_expert
         )
 
-        ctx.save_for_backward(x_trans_quant_fp8, x_trans_quant_scale, w_fp8, tokens_per_expert)
+        ctx.save_for_backward(x, w_fp8, tokens_per_expert)
         return out
 
     @staticmethod
@@ -118,14 +106,11 @@ class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
             return dx, dw, None
 
         (
-            x_trans_quant_fp8,
-            x_trans_quant_scale,
+            x,
             w_fp8,
             tokens_per_expert,
         ) = ctx.saved_tensors
 
-        ne, dout, din = w_fp8.shape
-        seq, dout = grad_output_hp.shape
         grad_out_fp8, grad_out_scale = per_tile_quant(grad_output_hp)
         dx = m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(
             (grad_out_fp8, grad_out_scale),
@@ -136,20 +121,10 @@ class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
             tokens_per_expert,
         )
 
-        (
-            grad_out_trans_fp8,
-            grad_out_trans_scale,
-            tokens_per_expert_expand,
-        ) = trans_per_tile_quant_expand_128x(grad_output_hp, tokens_per_expert)
-        dw = grad_output_hp.new_empty((ne, dout, din))
-        k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
-            grad_out_trans_fp8,
-            grad_out_trans_scale,
-            x_trans_quant_fp8,
-            x_trans_quant_scale,
-            dw,
-            tokens_per_expert_expand.int(),
-        )
+        # AdaptiveGEMM's FP8 WGrad launcher is not valid for all production
+        # projection shapes/SM counts. BF16 WGrad is also the numerically safer
+        # accumulation path and preserves the standard natural-dW contract.
+        dw = k_grouped_gemm(grad_output_hp.contiguous(), x, tokens_per_expert)
 
         return dx, dw, None
 
@@ -225,6 +200,7 @@ class TileWiseFloat8GroupedLinear(torch.nn.Module):
         parallel_style: Literal["column", "row"] | None = None,
         ep_tp_mesh: DeviceMesh | None = None,
         num_fused_projections: int = 1,
+        prequantize_weight_for_fsdp: bool = True,
     ) -> None:
         super().__init__()
 
@@ -246,6 +222,7 @@ class TileWiseFloat8GroupedLinear(torch.nn.Module):
         self.tp_size = expert_tp_mesh.size() if expert_tp_mesh is not None else 1
         self.tp_enabled = self.expert_tp_mesh is not None and self.tp_size > 1 and self.parallel_style is not None
         self.num_fused_projections = num_fused_projections
+        self.prequantize_weight_for_fsdp = prequantize_weight_for_fsdp
         if self.expert_tp_mesh is not None and self.expert_tp_mesh.size() > 1 and self.parallel_style is None:
             raise ValueError("parallel_style must be set when expert_tp_mesh size is greater than 1.")
         if self.num_routed_experts % self.ep_size != 0:
@@ -278,27 +255,33 @@ class TileWiseFloat8GroupedLinear(torch.nn.Module):
         # We have padded the dim0 of GroupedLinear's weight to make fsdp compatible with block-wise fp8.
         local_shape = (self.local_num_routed_experts * self.local_out_features, self.local_in_features)
         if ep_tp_mesh is not None and self.tp_enabled:
-            weight = WeightWithDynamicTilewiseFloat8CastTensor(
-                torch.empty(local_shape),
-                torch.float8_e4m3fn,
-                (num_routed_experts * out_features, in_features),
-            )
+            weight = torch.empty(local_shape)
+            if prequantize_weight_for_fsdp:
+                weight = WeightWithDynamicTilewiseFloat8CastTensor(
+                    weight,
+                    torch.float8_e4m3fn,
+                    (num_routed_experts * out_features, in_features),
+                )
             self.weight = nn.Parameter(
                 DTensor.from_local(weight, ep_tp_mesh, self._weight_placements(), run_check=False)
             )
         elif ep_mesh is not None and ep_mesh.size() > 1:
-            weight = WeightWithDynamicTilewiseFloat8CastTensor(
-                torch.empty(num_routed_experts * out_features, in_features),
-                torch.float8_e4m3fn,
-                (num_routed_experts * out_features, in_features),
-            )
+            weight = torch.empty(num_routed_experts * out_features, in_features)
+            if prequantize_weight_for_fsdp:
+                weight = WeightWithDynamicTilewiseFloat8CastTensor(
+                    weight,
+                    torch.float8_e4m3fn,
+                    (num_routed_experts * out_features, in_features),
+                )
             self.weight = nn.Parameter(distribute_tensor(weight, ep_mesh, [Shard(0)]))
         else:
-            weight = WeightWithDynamicTilewiseFloat8CastTensor(
-                torch.empty(local_shape),
-                torch.float8_e4m3fn,
-                (num_routed_experts * out_features, in_features),
-            )
+            weight = torch.empty(local_shape)
+            if prequantize_weight_for_fsdp:
+                weight = WeightWithDynamicTilewiseFloat8CastTensor(
+                    weight,
+                    torch.float8_e4m3fn,
+                    (num_routed_experts * out_features, in_features),
+                )
             self.weight = nn.Parameter(weight)
 
         self.pad_shape: Optional[Tuple[int, int]] = None
@@ -355,24 +338,31 @@ class TileWiseFloat8GroupedLinear(torch.nn.Module):
         external_weight: torch.Tensor | None = None,
         external_wgrad_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if trainable_weight is not None:
-            raise NotImplementedError("FP8 grouped linear does not support a trainable weight override yet")
         if external_weight is not None or external_wgrad_out is not None:
             raise NotImplementedError("FP8 two-segment grouped linear is not implemented")
+        # AdaptiveGEMM owns an int64 device-count contract; other grouped-GEMM
+        # adapters may consume int32. Keep this conversion local to the op.
+        tokens_per_expert = tokens_per_expert.to(torch.long)
 
-        weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
-
-        self._check_shape(weight)
-
-        if tensor_already_casted_to_fp8(weight):
-            # If we use fsdp, the weight is already casted to fp8.
-            # FSDP padding only extends flattened dim0; trim it before restoring
-            # the local (expert, out, in) grouped-GEMM layout.
-            weight_fp8 = slice_weight.apply(weight, self.ori_local_shape) if self.is_padded else weight
-            weight_fp8 = view_weight.apply(weight_fp8, self.ori_local_shape)
+        if trainable_weight is None:
+            weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+            self._check_shape(weight)
+            if tensor_already_casted_to_fp8(weight):
+                # FSDP padding only extends flattened dim0; trim it before
+                # restoring the local grouped-GEMM layout.
+                weight_fp8 = slice_weight.apply(weight, self.ori_local_shape) if self.is_padded else weight
+                weight_fp8 = view_weight.apply(weight_fp8, self.ori_local_shape)
+            else:
+                weight = weight.view(*self.ori_local_shape)
+                weight_fp8 = weight_to_per_block_float8_dynamic.apply(weight, torch.float8_e4m3fn, 128)
         else:
-            weight = weight.view(*self.ori_local_shape)
-            weight_fp8 = weight_to_per_block_float8_dynamic.apply(weight, torch.float8_e4m3fn, 128)
+            # MoonEP supplies a BF16 differentiable local [2B] alias. Quantize
+            # it per invocation; backward remains an identity to BF16 dW.
+            weight_fp8 = weight_to_per_block_float8_dynamic.apply(
+                trainable_weight,
+                torch.float8_e4m3fn,
+                128,
+            )
 
         orig_shape = input.shape
         num_tokens = input.numel() // input.shape[-1]
@@ -387,6 +377,8 @@ class TileWiseFloat8GroupedLinear(torch.nn.Module):
 
     def pad_for_fsdp(self, padded_out_features: int) -> None:
         """Pad the weight to make it compatible with fsdp."""
+        if not self.prequantize_weight_for_fsdp:
+            return
         assert padded_out_features >= self.weight.shape[0], (
             f"Expected padded_out_features {padded_out_features} >= self.weight.shape[0] {self.weight.shape[0]}."
         )

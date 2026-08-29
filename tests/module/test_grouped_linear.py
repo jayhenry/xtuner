@@ -9,6 +9,7 @@ import torch
 
 from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 from xtuner.v1.float8.float8_gmm_tile_wise import ADAPTIVEGEMM_INSTALLED, TileWiseFloat8GroupedLinear
+from xtuner.v1.float8.fsdp_utils import WeightWithDynamicTilewiseFloat8CastTensor
 from xtuner.v1.module.grouped_linear.moe_group_linear import GroupedLinear, build_grouped_linear
 
 
@@ -44,6 +45,20 @@ class TestGroupedLinearFactory:
 
         assert type(layer) is expected_type
 
+    @pytest.mark.skipif(not ADAPTIVEGEMM_INSTALLED, reason="requires adaptive_gemm")
+    def test_moonep_fp8_build_policy_keeps_bf16_weight_transport(self) -> None:
+        layer = build_grouped_linear(
+            in_features=128,
+            out_features=128,
+            num_routed_experts=2,
+            float8_cfg=Float8Config(scaling_granularity_grouped_gemm=ScalingGranularity.TILEWISE),
+            prequantize_weight_for_fsdp=False,
+        )
+
+        assert isinstance(layer, TileWiseFloat8GroupedLinear)
+        assert not isinstance(layer.weight, WeightWithDynamicTilewiseFloat8CastTensor)
+        assert layer.prequantize_weight_for_fsdp is False
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_grouped_linear_returns_natural_gradient_for_call_local_weight() -> None:
@@ -71,3 +86,53 @@ def test_grouped_linear_returns_natural_gradient_for_call_local_weight() -> None
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(hidden_states.grad, hidden_states_ref.grad, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(override.grad, override_ref.grad, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not ADAPTIVEGEMM_INSTALLED, reason="requires H100+ and adaptive_gemm"
+)
+def test_fp8_grouped_linear_dynamically_quantizes_call_local_bf16_weight() -> None:
+    layer = (
+        TileWiseFloat8GroupedLinear(
+            in_features=512,
+            out_features=2048,
+            num_routed_experts=3,
+            prequantize_weight_for_fsdp=False,
+        )
+        .cuda()
+        .bfloat16()
+    )
+    original_parameter = layer.weight
+    override = torch.randn(3, 2048, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    hidden_states = torch.randn(4, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    counts = torch.tensor([2, 0, 2], device="cuda", dtype=torch.int32)
+    override_ref = override.detach().clone().requires_grad_()
+    hidden_states_ref = hidden_states.detach().clone().requires_grad_()
+
+    output = layer(hidden_states, counts, trainable_weight=override)
+    expected = torch.cat(
+        (
+            hidden_states_ref[:2] @ override_ref[0].T,
+            hidden_states_ref[2:] @ override_ref[2].T,
+        )
+    )
+    grad_output = torch.randn_like(output)
+    output.backward(grad_output)
+    expected.backward(grad_output)
+
+    assert layer.weight is original_parameter
+    assert original_parameter.grad is None
+    assert override.grad is not None and override.grad.dtype is torch.bfloat16
+    for actual, reference in (
+        (output, expected),
+        (hidden_states.grad, hidden_states_ref.grad),
+        (override.grad, override_ref.grad),
+    ):
+        assert actual is not None and reference is not None
+        cosine = torch.nn.functional.cosine_similarity(actual.float().flatten(), reference.float().flatten(), dim=0)
+        relative_l2 = torch.linalg.vector_norm(actual.float() - reference.float()) / torch.linalg.vector_norm(
+            reference.float()
+        )
+        assert cosine > 0.99
+        assert relative_l2 < 0.1
+    torch.testing.assert_close(override.grad[1], torch.zeros_like(override.grad[1]), rtol=0, atol=0)

@@ -120,6 +120,8 @@ class Float8Handler:
 
         for module in model.modules():
             if isinstance(module, (TileWiseFloat8Linear, TileWiseFloat8GroupedLinear, TensorWiseFloat8Linear)):
+                if isinstance(module, TileWiseFloat8GroupedLinear) and not module.prequantize_weight_for_fsdp:
+                    continue
                 # make fsdp compatible with block-wise fp8
                 # use size(-1) to support hsdp
                 if isinstance(module.weight, DTensor):
@@ -181,6 +183,8 @@ class Float8Handler:
         SHARD_DIM = 0
         for module in model.modules():
             if isinstance(module, (TileWiseFloat8Linear, TileWiseFloat8GroupedLinear)):
+                if isinstance(module, TileWiseFloat8GroupedLinear) and not module.prequantize_weight_for_fsdp:
+                    continue
                 assert isinstance(module.weight, DTensor), (
                     "`build_reduce_mesh_mapping` should be called after apply fully_shard to the model."
                 )

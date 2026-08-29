@@ -664,3 +664,29 @@ flowchart LR
 普通/DeepEP 的 layout 是标准空值，Module Parameter 直接接收所选算子的自然 dW；MoonEP layout 替换的只是 trainable tensor leaf，GMM 不感知 VMM、plan、gradient slot 或 dispatcher 类型。external segment 字段只表达已定稿的 UltraEP ownership 边界，当前 one-segment Implementation 对非空 external segment 明确不实现。
 
 本阶段删除了一个 caller-visible 参数、一个 mutable custom op 和 `expert_tensors` 嵌套 carrier。下一步保持相同 `ExpertWeightLayout` 与 GMM 调用端，为 MoonEP 增加 BF16 transport + local dynamic FP8 compute。
+
+# 2026-08-29_EP扩展重构-03-MoonEP混合FP8计算
+
+完成 MoonEP 首版 FP8 接入：Dispatcher/FSDP 继续运输 BF16 activation 与 weight，TileWise Adapter 对 call-local `[2B]` weight 动态 block-quant，FWD/DGrad 使用 AdaptiveGEMM，WGrad 使用 XTuner BF16 Triton 并自然返回 dW。expert compute 与 transport dtype 已从 factory 接口分离。
+
+## 开发与测试记录
+
+- MoonEP routed grouped weights 保持普通 FSDP Parameter，不安装 FP8 pre-all-gather tensor subclass；其他 FP8 grouped/dense modules 保留原 fast path。
+- MoonEP 固定容量 `hidden_nvsh` 的有效前缀由 device counts 描述；phase 3 清零未覆盖尾部并补入最后一个 padding count，使全部标准 GMM 满足 `sum(counts) == M`，无 D2H。
+- 单卡最小复现实锤 AdaptiveGEMM FP8 WGrad 在 H200 默认 SM 数、真实 `512→2048` projection 上非法 launch；同输入将内部 SM 降至 64 可运行。为避免进程级全局副作用，改用已有 BF16 Triton WGrad。
+- Dispatcher factory、MoonEP/DeepEP/TorchAll2All/AGRS 与 GroupedLinear public API 矩阵：`10 passed, 1 skipped`。
+- 单卡 H200、真实 `512→2048` dynamic-quant override、empty expert、output/DGrad/WGrad 数值：`1 passed`。
+- 8×H200、torch.compile、BF16 FSDP2×EP4、MoonEP FP8 两步 forward/backward/optimizer，与 DeepEP FP8 的 loss/grad norm 对照：`1 passed`。
+
+```mermaid
+flowchart LR
+    A["FSDP BF16 landing"] --> B["MoonEP local [2B]"]
+    B --> C["Dynamic block quant"]
+    C --> D["AdaptiveGEMM<br/>FP8 FWD / DGrad"]
+    B --> E["Triton<br/>BF16 WGrad"]
+    D --> E
+    E --> F["Natural BF16 dW"]
+    F --> G["Duplicate SUM<br/>FSDP edge"]
+```
+
+这次没有新增 dispatcher state/entity；新增布尔 build policy 只决定 routed weight 的 FSDP representation。FP8 scales、kernel schedule 和混合 WGrad 策略均封装在 TileWise Adapter 内，`ExpertWeightLayout`、六阶段调用端和 MoonEP gradient completion 接口保持不变。单算子与 8 卡端到端验证均已通过，首版 FP8 接入可以进入提交。

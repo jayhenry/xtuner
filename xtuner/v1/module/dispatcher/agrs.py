@@ -1,4 +1,4 @@
-from typing import Literal, TypeAlias, cast
+from typing import TypeAlias, cast
 
 import torch
 import torch.distributed as dist
@@ -236,14 +236,10 @@ class MoEAGRSDispatcher(
         *,
         n_routed_experts: int,
         process_group: torch.distributed.ProcessGroup,
-        training_dtype: Literal["fp8", "bf16"] = "bf16",
-        generate_dtype: Literal["fp8", "bf16"] = "bf16",
     ):
         super().__init__(
             n_routed_experts=n_routed_experts,
             process_group=process_group,
-            training_dtype=training_dtype,
-            generate_dtype=generate_dtype,
         )
         assert self._process_group is not None, (
             "Process group must be provided for `DeepEPDispatcher`. "

@@ -200,6 +200,7 @@ def build_grouped_linear(
     float8_cfg: Float8Config | None = None,
     ep_tp_mesh: DeviceMesh | None = None,
     num_fused_projections: int = 1,
+    prequantize_weight_for_fsdp: bool = True,
 ):
     """Build a grouped linear layer with optional float8 support."""
     if float8_cfg is None or float8_cfg.scaling_granularity_grouped_gemm is None:
@@ -225,6 +226,7 @@ def build_grouped_linear(
             parallel_style=parallel_style,
             ep_tp_mesh=ep_tp_mesh,
             num_fused_projections=num_fused_projections,
+            prequantize_weight_for_fsdp=prequantize_weight_for_fsdp,
         )
     else:
         raise NotImplementedError(

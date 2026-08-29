@@ -351,6 +351,24 @@ class _MoonEPInvocation:
             assert self._dispatch_done is not None
             self._dispatch_done.wait()
             local_counts = workspace.local_token_counts(dispatched["cu_seqlens"])
+            # MoonEP returns a fixed-capacity buffer while standard grouped
+            # GEMM requires counts to cover every row. Assign the zeroed tail
+            # to the final physical group so every backend sees one contract.
+            covered_rows = local_counts.sum()
+            row_is_covered = (
+                torch.arange(
+                    dispatched["hidden_states"].shape[0],
+                    device=dispatched["hidden_states"].device,
+                )
+                < covered_rows
+            )
+            hidden_states = dispatched["hidden_states"] * row_is_covered.unsqueeze(-1)
+            local_counts = torch.cat(
+                (
+                    local_counts[:-1],
+                    local_counts[-1:] + dispatched["hidden_states"].shape[0] - covered_rows,
+                )
+            )
             weights_ready.wait()
         differentiable_weights = _ExpertWeightAutograd.apply(
             home_weights[0],
@@ -360,7 +378,7 @@ class _MoonEPInvocation:
             self,
         )
         return MoonEPPostDispatchResult(
-            hidden_states=dispatched["hidden_states"],
+            hidden_states=hidden_states,
             tokens_per_expert=local_counts,
             expert_weight_layout=ExpertWeightLayout(trainable_weights=differentiable_weights),
         )
@@ -592,8 +610,6 @@ class MoonEPDispatcher(
         super().__init__(
             n_routed_experts=runtime._num_experts,
             process_group=runtime._ep_group,
-            training_dtype="bf16",
-            generate_dtype="bf16",
         )
         self._runtime = runtime
         self._layer_fqn = layer_fqn

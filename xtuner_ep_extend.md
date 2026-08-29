@@ -115,10 +115,10 @@ hook 必须挂在 local `[2B]` weight edge，而不是 home Parameter 的 post-a
 
 #### 2.2.1 MoonEP 接入 FP8
 
-结论是：**GMM 侧已经容易接入，但当前端到端实现仍不能直接打开 FP8，改造量为中等。** 标准 allocation-return WGrad 已消除 direct-output kernel 的限制；现有 TileWise FP8 AdaptiveGEMM 也直接消费 device counts，并自然返回 BF16 dW。当前阻塞是：
+实现结论是：**MoonEP 保持 BF16 transport，在 expert Adapter 内执行 FP8 FWD/DGrad 与 BF16 WGrad。** 标准 allocation-return WGrad 已消除 direct-output kernel 的限制；FP8 compute 不再改变 Dispatcher 或 FSDP ownership。接入必须处理以下边界：
 
-1. 当前 Dispatcher factory 明确拒绝 MoonEP 的非 BF16 training/generation dtype。
-2. 当前 `TileWiseFloat8GroupedLinear.forward` 不接收 call-local weight override。
+1. Dispatcher factory 只声明 transport dtype，不能再用 training/generation dtype 代替 expert compute policy。
+2. `TileWiseFloat8GroupedLinear.forward` 必须接收 call-local BF16 weight override。
 3. `WeightWithDynamicTilewiseFloat8CastTensor.fsdp_pre_all_gather()` 将参数转换成 FP8 data + FP32 scales；MoonEP direct landing、VMM mapping 和 duplicated-weight prefetch 当前按每个 projection 一块 BF16 tensor 建模，而 landing Adapter 也明确拒绝带 `fsdp_post_all_gather` 的参数扩展。
 4. FP8 weight padding、block scales 和 replay 生命周期目前由 Float8 FSDP path 拥有，不能只把一个 `Float8Tensor` 塞进 BF16 VMM alias 就宣称兼容。
 
@@ -128,9 +128,11 @@ hook 必须挂在 local `[2B]` weight edge，而不是 home Parameter 的 post-a
 flowchart LR
     A["FSDP BF16 direct landing"] --> B["MoonEP BF16 prefetch<br/>local [2B] alias"]
     B --> C["TileWise FP8 Adapter<br/>dynamic block quant + scales"]
-    C --> D["AdaptiveGEMM FP8 FWD / DGrad / WGrad"]
-    D --> E["Natural BF16 local dW [2B]"]
-    E --> F["_ExpertWeightAutograd<br/>duplicate SUM -> FSDP"]
+    C --> D["AdaptiveGEMM<br/>FP8 FWD / DGrad"]
+    C --> E["XTuner Triton<br/>BF16 WGrad"]
+    D --> E
+    E --> F["Natural BF16 local dW [2B]"]
+    F --> G["_ExpertWeightAutograd<br/>duplicate SUM -> FSDP"]
 ```
 
 对应改造只有三个显式位置：
@@ -139,9 +141,13 @@ flowchart LR
 - `TileWiseFloat8GroupedLinear` 对齐 `GroupedLinear.forward(..., trainable_weight=...)`；收到普通预量化 weight 时保持现有 fast path，收到 MoonEP BF16 override 时在 Adapter 内调用现有 differentiable block quantization，再进 AdaptiveGEMM。
 - model/Float8 build policy 对 MoonEP routed experts 保留 FSDP-owned trainable weight 与 BF16 AllGather/direct landing，不安装“FSDP AllGather 输出 FP8 data + scales”的参数子类；shared experts 和非 MoonEP FP8 路径不受影响。
 
-这样 quantization scales、padded counts 和 AdaptiveGEMM metadata 都留在 FP8 Adapter 内，标准 FP8 WGrad 穿过 quantization 的 identity backward 后仍是 BF16，与 MoonEP 的 completion contract 一致。当前 FP8 GMM autograd 会保存 forward 量化出的 weight data/scales，普通 DGrad 使用该 call-local snapshot；只有 checkpoint/reentrant forward replay 才在 MoonEP 恢复对应 BF16 weights 后重新量化。代价是每次 expert forward 的 local weight quantization，以及每个 live invocation 的 FP8 snapshot/scales；必须用 profiler 同时判断时间和显存。只有该开销无法接受时，才进入第二阶段：为 MoonEP VMM 增加 FP8 data/scale 双平面 direct landing 与成对 prefetch。第二阶段更省量化开销，但会同时改动 FSDP storage Adapter、MoonEP public capability、VMM layout 和 replay，不应作为首版前置条件。
+这样 quantization scales、padded counts 和 AdaptiveGEMM metadata 都留在 FP8 Adapter 内。当前 AdaptiveGEMM FP8 WGrad launcher 在 H200 默认 SM 数及真实 `O=2048, I=512` 投影上会产生非法 launch；全局降低 `num_sms` 会影响 dense/其他 GMM，因此不作为集成方案。Adapter 保存原 BF16 activation，FWD/DGrad 使用 AdaptiveGEMM，WGrad 使用项目已有 Triton allocation-return kernel，直接得到自然 BF16 dW，与 MoonEP completion contract 一致。DGrad 仍读取 forward 保存的 FP8 weight data/scales；checkpoint/reentrant replay 必须在恢复对应 BF16 weights 后重新量化。
 
-FP8 支持必须覆盖 block-128 shape/padding、empty expert、Domino/replay、compile、BF16 dW completion、optimizer parity 和相同 workload 性能；在这些验证完成前配置仍 fail fast，不能静默退回 BF16 compute。
+MoonEP 的 `hidden_nvsh` 是固定容量张量，`cu_seqlens` 只覆盖有效的物理前缀，而标准 GMM 要求 `sum(counts) == M`。phase 3 因此把未覆盖尾部 activation 清零，并把尾部长度计入最后一个 physical group 的 padding count；尾部 forward 为零、WGrad 也因 activation 为零不产生贡献。整个适配只使用 device tensor 运算，不做 `.item()`/`.cpu()`，Triton、AdaptiveGEMM 与后续 CUTLASS 都得到相同标准 counts contract。
+
+代价是每次 expert forward 的 local weight quantization、一个固定容量尾部 mask，以及每个 live invocation 的 FP8 snapshot/scales；必须用 profiler 同时判断时间和显存。只有该开销无法接受时，才进入第二阶段：为 MoonEP VMM 增加 FP8 data/scale 双平面 direct landing 与成对 prefetch。第二阶段会同时改动 FSDP storage Adapter、MoonEP public capability、VMM layout 和 replay，不应作为首版前置条件。
+
+FP8 支持必须覆盖 block-128 shape/padding、empty expert、Domino/replay、compile、BF16 dW completion、optimizer parity 和相同 workload 性能。BF16 WGrad 是明确的混合精度策略，不是 silent fallback；FWD 与 DGrad 必须实际进入 FP8 kernel。
 
 本设计明确重开 ADR-0018 与 ADR-0020 中“MoonEP 必须 direct-output WGrad”的部分；slot/ring capacity、device counts 和 no-host-sync 约束继续有效。FP8 目前只是设计目标，因此尚不重开现有 BF16-only capability boundary。
 
@@ -496,7 +502,7 @@ UltraEP 则不同：同一次逻辑 GMM 横跨 trainable `[B]` 和 external `[R]
 | --- | --- | --- | --- | --- |
 | XTuner BF16 Triton allocation-return | device counts；contiguous `[G,O,I]`；自然 BF16 dW | 直接兼容 `[2B]` alias | 不能表达两块 weight/两种 dW ownership | MoonEP 默认；复用 launcher 新增 UltraEP two-segment FWD/DGrad/WGrad |
 | XTuner BF16 CUTLASS | 自然 dW；当前 wrapper 对 counts `.cpu()`；单 base allocation | 数学与 autograd 兼容，但当前 host sync 不合格 | 现有 op 不兼容 | 先让 batch-size/problem arguments 全程 device-resident；UltraEP 需私有 multi-base problem descriptors，WGrad 建议按 BF16 master/FP32 external 分两次 typed launch |
-| TileWise FP8 AdaptiveGEMM | device counts；weight data+block scales；自然 BF16 dW；当前 Module 无 override | GMM 兼容；按 2.2.1 增加 BF16 override + dynamic quant 后可接入 | 不支持 strided external scales 或 FP32 external dW | MoonEP 属中等改造；UltraEP FP8 暂不实施 |
+| TileWise FP8 AdaptiveGEMM + Triton WGrad | device counts；weight data+block scales；FP8 FWD/DGrad；自然 BF16 dW | BF16 override + dynamic quant 已匹配 `[2B]`；固定容量尾部由 Dispatcher 归一化 | 不支持 strided external scales 或 FP32 external dW | MoonEP 首版组合；规避 Adaptive FP8 WGrad 的真实 shape/SM launch 缺陷；UltraEP FP8 暂不实施 |
 | MoonEP VM grouped-GEMM | global `[E+B]` weight/cu-seqlens contract，可按 plan remote-read | local training `[2B]` 不能冒充其 global contract | placement/storage 均不匹配 | 不作为统一 expert compute Adapter；继续服务 MoonEP 原有 global/inference use case |
 | 新 BF16 Triton two-segment op | 两个 base/stride；一个 BF16 returned dW + 一个 FP32 side output | 没有必要使用 | 完整匹配 | 仅 UltraEP 使用，不替代标准 one-segment Interface |
 
@@ -730,8 +736,8 @@ UltraEP external Manager 由 `UltraEPRuntime` 以 explicit-destroy 模式创建�
 
 ### 7.4 MoonEP FP8
 
-- 对同一 BF16 local `[2B]` override，比较 TileWise FP8 Adapter 与当前普通 FP8 public path 的 output、DGrad 和 BF16 WGrad；覆盖 empty group、`M=0`、block-128 padding 和 compile。
-- 真实 BF16 FSDP landing × MoonEP dispatch × FP8 expert compute 执行 forward/backward/optimizer step，与 DeepEP FP8 reference 比较 loss、input/router/expert gradients 和 updated shards。
+- 对同一 BF16 local `[2B]` override，以 BF16 数学结果检查 TileWise FP8 Adapter 的 output、DGrad 和 BF16 WGrad；覆盖真实 `512→2048` projection、empty group、`M=0`、block-128 padding 和 compile。
+- 真实 BF16 FSDP landing × MoonEP dispatch × FP8 expert compute 执行 forward/backward/optimizer step。DeepEP 从 FP32 shard 预量化、MoonEP 从 BF16 landing 后量化，二者只比较 loss/全局 grad norm；逐张量 dW correctness 由相同 BF16 operands 的单算子测试负责，不能把不同量化入口描述成 bitwise reference。
 - 普通 backward 必须读取该 invocation 保存的 FP8 weight/scales；checkpoint/reentrant forward replay 必须先恢复对应 generation/plan 的 BF16 local weights再重新量化。Domino 两个 invocation 的 snapshot 与 dW 分别进入自己的 completion transaction。
 - profiler 单独记录 local `[2B]` weight quantization、GMM 和 MoonEP communication；不得出现 scales D2H、Module-wide weight snapshot 或静默 BF16 compute fallback。
 - 第二阶段 FP8 data/scale VMM 只有在首版 dynamic quantization 未通过性能 gate 时才启动，不能用尚未实现的优化路径替代首版 correctness tests。

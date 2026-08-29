@@ -8,6 +8,8 @@ from xtuner._testing import DeterministicDDPTestCase
 from xtuner.v1.config import AdamWConfig, FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.engine.train_engine import TrainEngine
+from xtuner.v1.float8 import Float8Config
+from xtuner.v1.float8.config import ScalingGranularity
 from xtuner.v1.loss import CELossConfig
 from xtuner.v1.model.base import ModelItem
 from xtuner.v1.model.moe.glm52 import Glm52MoEConfig
@@ -29,6 +31,7 @@ def _tiny_config(
     mtp_config: MTPConfig | None = None,
     n_shared_experts: int = 1,
     with_shared_expert_gate: bool = False,
+    fp8: bool = False,
 ) -> MoEConfig:
     common = dict(
         vocab_size=256,
@@ -53,6 +56,14 @@ def _tiny_config(
         router_compute_dtype=router_compute_dtype,
         moonep_staging_reference=False if staging_reference is None else staging_reference,
         balancing_loss_cfg=None,
+        float8_cfg=(
+            Float8Config(
+                scaling_granularity_gemm=ScalingGranularity.TILEWISE,
+                scaling_granularity_grouped_gemm=ScalingGranularity.TILEWISE,
+            )
+            if fp8
+            else None
+        ),
         mtp_config=mtp_config,
         compile_cfg=(
             {"xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEBlock.forward": {"fullgraph": True}}
@@ -213,6 +224,7 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
         dispatcher: str,
         *,
         staging_reference: bool | None = None,
+        fp8: bool = False,
     ) -> tuple[list[float], list[torch.Tensor], list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
         torch.manual_seed(20260805)
         engine = TrainEngine(
@@ -221,6 +233,7 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
                 dispatcher,
                 compile=True,
                 staging_reference=staging_reference,
+                fp8=fp8,
             ),
             optim_cfg=AdamWConfig(foreach=False),
             fsdp_cfg=FSDPConfig(ep_size=4, recompute_ratio=0.0, torch_compile=True),
@@ -231,7 +244,8 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
         gradients = []
         try:
             for _ in range(2):
-                step = engine.train_step([self._training_item()])
+                item = self._model_training_item(engine, sequence_length=128) if fp8 else self._training_item()
+                step = engine.train_step([item])
                 losses.append(step["total_loss"])
                 grad_norms.append(engine.clip_grad_norm(do_clip=False).detach().clone())
                 gradients.append(self._selected_training_tensors(engine, gradients=True))
@@ -327,6 +341,24 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
         repeated = self._train_two_steps("moonep")
         self._assert_training_runs_close(actual, expected)
         self._assert_training_runs_close(repeated, actual)
+
+    def test_qwen_fp8_two_step_loss_and_grad_norm_match_deepep(self) -> None:
+        self.create_pg("cuda")
+        expected = self._train_two_steps("deepep", fp8=True)
+        actual = self._train_two_steps("moonep", fp8=True)
+
+        actual_losses, actual_norms, actual_gradients, actual_parameters = actual
+        expected_losses, expected_norms, _, _ = expected
+        torch.testing.assert_close(
+            torch.tensor(actual_losses, device="cuda"),
+            torch.tensor(expected_losses, device="cuda"),
+            rtol=1e-2,
+            atol=2e-3,
+        )
+        for actual_norm, expected_norm in zip(actual_norms, expected_norms):
+            torch.testing.assert_close(actual_norm, expected_norm, rtol=1e-2, atol=2e-3)
+        assert all(torch.isfinite(value).all() for step in actual_gradients for value in step.values())
+        assert all(torch.isfinite(value).all() for value in actual_parameters.values())
 
     def test_qwen_direct_landing_matches_staging_training(self) -> None:
         self.create_pg("cuda")

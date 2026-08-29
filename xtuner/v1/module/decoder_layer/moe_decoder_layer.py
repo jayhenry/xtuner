@@ -161,6 +161,7 @@ class MoEBlock(nn.Module):
         float8_cfg: Float8Config | None = None,
         moe_act_fn_cfg: MoEActFnConfig,
         ep_tp_mesh: DeviceMesh | None = None,
+        prequantize_weight_for_fsdp: bool = True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -180,6 +181,7 @@ class MoEBlock(nn.Module):
             float8_cfg=float8_cfg,
             ep_tp_mesh=ep_tp_mesh,
             num_fused_projections=2,
+            prequantize_weight_for_fsdp=prequantize_weight_for_fsdp,
         )
         self.fused_w2 = build_grouped_linear(
             self.intermediate_size,
@@ -191,6 +193,7 @@ class MoEBlock(nn.Module):
             parallel_style="row",
             float8_cfg=float8_cfg,
             ep_tp_mesh=ep_tp_mesh,
+            prequantize_weight_for_fsdp=prequantize_weight_for_fsdp,
         )
         self.moe_act = moe_act_fn_cfg.build()
 
@@ -316,6 +319,7 @@ class MoEDecoderLayer(nn.Module):
             float8_cfg=float8_cfg,
             moe_act_fn_cfg=moe_act_fn_cfg,
             ep_tp_mesh=ep_tp_mesh,
+            prequantize_weight_for_fsdp=dispatcher != "moonep",
         )
         # TODO: (yehaochen) Maybe should be replaced by build_dispatcher
         process_group = ep_mesh.get_group() if ep_mesh is not None else None
@@ -330,8 +334,9 @@ class MoEDecoderLayer(nn.Module):
             ep_group=process_group,
             tp_group=tp_group,
             ep_tp_group=ep_tp_group,
-            training_dtype="fp8" if float8_cfg is not None else "bf16",
-            generate_dtype=generate_config.dtype if generate_config is not None else "bf16",
+            # Expert compute may be FP8; activation and MoonEP weight transport
+            # stay BF16 and are configured independently.
+            transport_dtype="bf16",
             moonep_runtime=moonep_runtime,
             layer_fqn=layer_fqn,
             experts=self.experts,
