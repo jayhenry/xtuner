@@ -2,7 +2,7 @@
 
 ## 总结
 
-MoonEP 与 UltraEP 都在保持 logical routing 和 FSDP 参数所有权不变的前提下，动态改变 expert 的物理执行位置。本方案不保留现有 Python/op 接口兼容：六阶段 Dispatcher 收敛为“只消费前一阶段 state”的管线，expert compute 收敛为一个 MLP 粒度的 weight-layout value，Group GEMM 收敛为一个 **two-segment grouped linear** Interface。
+MoonEP 与 UltraEP 都在保持 logical routing 和 FSDP 参数所有权不变的前提下，动态改变 expert 的物理执行位置。本方案不保留现有 Python 接口兼容：六阶段 Dispatcher 收敛为“只消费前一阶段 state”的管线，expert compute 收敛为一个 MLP 粒度的 weight-layout value。`GroupedLinear` 的 caller Interface 只暴露 logical counts 与可选 weight ownership；BF16 Triton、CUTLASS 和 TileWise FP8 各自的 schedule、scale 与 problem descriptor 留在 Adapter 内部。本轮只设计 CUDA 路径，不考虑 NPU。
 
 这三层分别负责调度、存储所有权和 tensor compute：
 
@@ -11,8 +11,8 @@ flowchart TD
     A["Model-scoped concrete runtime<br/>资源、FSDP integration、close"]
     B["Per-layer GenericDispatcher Adapter<br/>input hook + 六阶段 state pipeline"]
     C["dispatch_postprocess state<br/>local activations/counts + ExpertWeightLayout"]
-    D["MoEBlock<br/>call-local GroupedGemmSchedule"]
-    E["Two-segment grouped linear<br/>trainable + optional external"]
+    D["MoEBlock<br/>fused_w1w3 -> activation -> fused_w2"]
+    E["GroupedLinear Adapter<br/>counts + trainable/optional external"]
 
     A --> B
     B --> C --> D
@@ -27,8 +27,8 @@ flowchart TD
 4. `dispatch_postprocess` 交付一个 call-local `ExpertWeightLayout`：普通路径使用 Module 的 trainable weights，MoonEP 替换 trainable segment，UltraEP 在 trainable master 后追加 runtime-owned external segment。
 5. `MoonEPDispatcher` 保留自己的 Buffer、VMM、plan、`_MoonEPInvocation` 和三个 autograd Function；该 private state 从 phase-2 state 传到后续阶段。
 6. Router 是 logical `tokens_per_expert[E]` 的唯一生产者；Dispatcher 输出的 counts 只描述本 rank 的物理执行 groups。
-7. `MoEBlock` 为每个 microbatch 构造一次只读 device `GroupedGemmSchedule`，两块 fused projections 及其 DGrad/WGrad 共享它；不得缓存到 Module 或 Dispatcher。
-8. Grouped-linear backward 由一个 mutable-output op 直接写两段 WGrad；删除 allocation-return WGrad op、single/direct/dual 三套 wrapper、完整 `[B+R]` 临时 dW 与 BF16→FP32 copy。
+7. `MoEBlock` 只把同一份 device `tokens_per_expert` 交给两块 fused projections；不新增公共 `GroupedGemmSchedule`。各算子 Adapter 私有地构造并保存自身 forward/backward metadata。
+8. 普通 EP 与 MoonEP 的 one-segment 路径都使用已有标准 GMM 的自然 autograd/WGrad；MoonEP 在 differentiable local-weight edge 捕获 `[2B]` dW 并私有地完成 duplicate SUM。只有 UltraEP 使用 stride-aware two-segment mutable-output Implementation，避免完整 `[B+R]` 临时 dW 与 BF16→FP32 copy。
 9. MoonEP 与 UltraEP 各自使用 concrete model-scoped runtime，共用同形 lifecycle，但不新增只含抽象声明的基类；runtime 在 process group 销毁前显式关闭。
 
 ## 1. 目标与非目标
@@ -41,8 +41,8 @@ flowchart TD
 - 用同一调用端表达 backend 已声明支持的 in-flight 宽度；支持并发的 backend 必须隔离 state，不支持的 backend 必须在进入不安全调度前 fail fast。
 - 保持 FSDP 是 master parameters、optimizer state 和 checkpoint 的唯一 owner。
 - 保持 `torch.compile` 的 tensor compute path；runtime/plan/event 等 Python control state 不传入 compiled expert graph。
-- 用一个新的 canonical grouped-linear Interface 取代旧 public API；普通、MoonEP 和 UltraEP 只在 weight ownership/layout 上不同。
-- 用同一份 device schedule 驱动 FC1/FC2 forward、DGrad 和 WGrad，避免重复的 cumsum/padding/group-to-tile metadata 构造。
+- 用一个 backend-neutral `GroupedLinear.forward` 表达普通、MoonEP 和 UltraEP；不同算子只在内部 operands、metadata 与 capability 上不同。
+- 让 FP8 与 BF16 Triton/CUTLASS 都能复用普通 one-segment 调用，不让某个 kernel 的 tile schedule 成为公共 Interface。
 
 ### 1.2 非目标
 
@@ -52,6 +52,7 @@ flowchart TD
 - 不把两套 backward 机制压成一个可选方法很多的 `PlacementProtocol`。
 - 不改变 router 的 top-k 数学语义，不让 replica 成为新模型参数。
 - 不公开任意 allocation 数量或 arbitrary group-to-pointer table；当前三条真实路径最多只有 trainable/external 两段。
+- 不统一 BF16、FP8 与 CUTLASS 的低层 op schema；量化 scales、tile map 和 device problem arguments 都是各 Adapter 的 Implementation 细节。
 - 不将整个 expert MLP 融成 opaque custom op；保留 `fused_w1w3 -> activation -> fused_w2` 的模块边界。
 - 不在本设计中放宽未经真实训练验证的 dtype、TP、DP、MTP 或 recompute 支持范围。
 
@@ -89,9 +90,23 @@ MoonEP 是完整 execution backend，而不只是 activation dispatcher：
 
 - FSDP 仍拥有 home expert parameters；direct landing 将 FSDP AllGather 输出直接落入 MoonEP VMM workspace。
 - MoonEP plan 同时决定 activation dispatch、global duplicated weight view、local contiguous `[2B]` expert view 和 combine。
-- 当前 rank 的 expert compute 读取本 invocation 对应的 `[2B]` weights，并将 WGrad 直接写入该 invocation 独占的 gradient slot。
-- backward 使用同一 plan 重放 activation 与 weight routing；duplicated BF16 WGrad 先做 exact SUM 回 home rows，再交给 FSDP。
-- model-scoped runtime 共享 Buffer/VMM 资源；每次调用独占 plan、events 和 gradient slot。
+- `[2B]` local weights 是既有 `_ExpertWeightAutograd` 的 differentiable outputs；expert compute 对它调用普通 one-segment GMM，不传 MoonEP 专用 WGrad target。
+- 标准 GMM backward 自然分配并返回两个 local `[2B]` dW；`_ExpertWeightAutograd.backward` 正好在这个 edge 获得它们，作用等价于一个成对的 local-weight grad hook。
+- hook/Function 使用同一 plan 完成 duplicated BF16 WGrad exact SUM，再把 home `[B]` gradients 返回给 FSDP。若 MoonEP Buffer 的 one-sided reduce 需要 symmetric VMM，普通 dW 只在这里被 stage 到 invocation 独占的 reduction slot；该 slot 不进入 GMM Interface。
+- model-scoped runtime 共享 Buffer/VMM 资源；每次调用独占 plan、events 和 reduction slot。
+
+```mermaid
+flowchart LR
+    A["Standard GMM backward"] --> B["Natural local dW [2B]"]
+    B --> C["_ExpertWeightAutograd.backward<br/>local-weight grad hook"]
+    C --> D["MoonEP-private staging<br/>only if symmetric VMM is required"]
+    D --> E["Duplicate exact SUM<br/>home dW [B]"]
+    E --> F["FSDP AccumulateGrad / post-backward"]
+```
+
+hook 必须挂在 local `[2B]` weight edge，而不是 home Parameter 的 post-accumulate edge：前者仍保留 physical duplicate layout，并保证 completion 在 home gradient 进入 FSDP 前完成。直接复用既有 `_ExpertWeightAutograd` 比分别 `register_hook` 两块 projection 更合适，因为它把两块 WGrad 作为同一个 completion transaction；若实现改用 `Tensor.register_hook`，语义边界也必须相同。
+
+这只撤销初版 MoonEP 的 **direct WGrad target** 约束，不改变 FSDP weight **direct landing**。代价是标准 GMM 的 local `[2B]` dW allocation，以及当前 one-sided reduce 实现需要时的一次私有 D2D staging；收益是 MoonEP 不再绑定某个专用 GMM backward schema，BF16 Triton 与 CUTLASS 都可复用同一标准接口。
 
 因此 MoonEP 的 placement 不能被降格为一个只返回 physical IDs 的接口：plan 还同时控制 weight alias、activation transport 和 backward replay。
 
@@ -341,7 +356,7 @@ state = {
 }
 ```
 
-不再按 projection 携带四个 optional tensors。MoonEP 与 UltraEP 在 `fused_w1w3` 和 `fused_w2` 上总是成对改变存储模式，因此 value contract 收敛到 MLP 粒度：
+不再按 projection 展开 optional tensors。MoonEP 与 UltraEP 在 `fused_w1w3` 和 `fused_w2` 上总是成对改变存储模式，因此 value contract 收敛到 MLP 粒度的三个 ownership fields：
 
 ```python
 ProjectionPair = tuple[Tensor, Tensor]  # (fused_w1w3, fused_w2)
@@ -349,8 +364,6 @@ ProjectionPair = tuple[Tensor, Tensor]  # (fused_w1w3, fused_w2)
 class ExpertWeightLayout(NamedTuple):
     # None means use the two FSDP-owned Module weights.
     trainable_weights: ProjectionPair | None = None
-    # dW is written here and the same tensors are returned to autograd.
-    trainable_wgrad_outs: ProjectionPair | None = None
     # Runtime-owned weights are consumed by forward/DGrad but are not Parameters.
     external_weights: ProjectionPair | None = None
     # External dW is a side output and is never returned to autograd.
@@ -361,61 +374,74 @@ class ExpertWeightLayout(NamedTuple):
 
 | Backend | trainable segment | trainable dW | external segment | external dW |
 | --- | --- | --- | --- | --- |
-| 普通/DeepEP | Module `[B]` | wrapper 分配 BF16 target，mutable op 写入后返回 autograd/FSDP | 无 | 无 |
-| MoonEP | invocation local `[2B]` VMM view | invocation BF16 grad slot，同时返回 autograd | 无 | 无 |
-| UltraEP | Module master `[B]` | wrapper 分配 BF16 target，mutable op 写入后返回 autograd/FSDP | official strided replica `[R]` | manager FP32 strided buffer |
+| 普通/DeepEP | Module `[B]` | selected Adapter 的自然 autograd 返回 dW | 无 | 无 |
+| MoonEP | invocation local differentiable `[2B]` VMM view | 标准 GMM 自然返回；local-weight hook 私有归并后返回 home `[B]` | 无 | 无 |
+| UltraEP | Module master `[B]` | two-segment wrapper 内部分配 BF16 dW 并返回 autograd/FSDP | official strided replica `[R]` | manager FP32 strided buffer |
 
 `ExpertWeightLayout()` 是普通路径的标准值，不再用整个 `execution=None` 切回旧 API。`MoEBlock` 不判断 backend 名称；它只解析 trainable/external ownership，然后对两块 projection 调用同一 grouped-linear Interface。
 
 layout 的 `None`/tuple 结构在建模后对该 Dispatcher 是静态的，`torch.compile` 只对普通、MoonEP 或 UltraEP 的固定 pytree 做 specialization；每次调用只替换 tensor leaves。plan、Manager、event 和 `virtual_layer_id` 不进入 compiled `MoEBlock`。
 
-### 3.5 Two-segment grouped linear
+### 3.5 Backend-neutral `GroupedLinear` 与 BF16 two-segment Implementation
 
-`MoEBlock.forward` 先从 local counts 构造一份 call-local `_GroupedGemmSchedule`：
+已提交版本把 BF16 Triton 的 `M_TILE=128`、padding offsets 和 M-tile-to-group map 放进 `_GroupedGemmSchedule`，再要求所有 `GroupedLinear` 消费它。这个 Seam 不成立：
+
+- BF16 Triton 当前需要 128-row padding 与 tile map；
+- TileWise FP8 还需要 activation/weight scales，forward tile 由 AdaptiveGEMM 选择，WGrad 又消费 padded K counts；
+- CUTLASS 需要由 counts 构造 device problem arguments。
+
+把这些字段取并集只会形成一个大而浅的 carrier。删除 `_GroupedGemmSchedule` 后，caller 仍只需传原本就有的 device counts，复杂度不会散回 Decoder 或 Dispatcher，因此它没有通过 deletion test。
+
+唯一 caller Interface 是 `GroupedLinear.forward`：
 
 ```python
-schedule = build_grouped_gemm_schedule(
+def forward(
+    hidden_states,
     tokens_per_expert,
-    num_rows=hidden.shape[0],
-)
-gate_up = fused_w1w3(hidden, schedule, ...)
-output = fused_w2(activation(gate_up), schedule, ...)
-```
-
-schedule 只含 device tensors：`counts`、`group_starts/ends`、padding offsets 和 M-tile-to-group map。当前 kernels 在 FC1 forward、FC2 forward、两次 DGrad 和两次 WGrad 中重复构造 cumsum/padding/repeat-interleave metadata；这些 metadata 只依赖该 microbatch 的 counts，应构造一次并由两个 autograd nodes 共享。schedule 不缓存在 `self`，否则 Domino 的后一 microbatch 会覆盖前一个反向仍需要的 state。
-
-M-tile 尺寸是 Triton Implementation 常量，不进入 public Interface；当前 forward/DGrad 共用 `M_TILE=128`。如果以后 autotune 真实选出多个 M-tile 尺寸，schedule 应为每个实际尺寸保留一份 tile map，而不是退回每个 projection/gradient op 重建全部 metadata。
-
-唯一 public compute Interface 为：
-
-```python
-grouped_linear(
-    x,
-    schedule,
-    trainable_weight,
-    trainable_wgrad_out=None,
+    *,
+    trainable_weight=None,
     external_weight=None,
     external_wgrad_out=None,
-)
+): ...
 ```
 
-- group 顺序固定为 `[trainable groups, external groups]`，分界由 `trainable_weight.shape[0]` 推导。
-- 每个 weight/target Tensor 自带 shape、storage offset 和 stride；Interface 不暴露 `trans_b`、`primary/secondary` 或 explicit expert stride。
-- Python autograd wrapper 为缺省 trainable dW 分配 target，然后统一调用 mutable `grouped_linear_backward_out`。custom-op schema 必须将 `trainable_dw_out` 和 `external_dw_out` 都声明为 `mutates_args`，使 AOTAutograd/functionalization 看到真实 side effect。MoonEP 传入已有 BF16 target；UltraEP 的 external target 可为独立 stride 的 FP32 view。
-- backward op 返回 DGrad，并在一次 WGrad launch 中写两个 target。trainable dW 返回 autograd；external dW 只是 side effect。
-- zero-token group 必须写零；`M == 0` 也必须清空所有 WGrad rows。
+- `tokens_per_expert` 是唯一跨 Adapter 的分组事实；FC1/FC2 读取同一个 Tensor，但不共享 backend-specific metadata。
+- 删除现有未被计算使用的 `decoding` 参数；generation capability 属于 Dispatcher/model validation，不应泄漏到 grouped linear。
+- `trainable_weight=None` 表示使用 Module Parameter；MoonEP 传 differentiable `[2B]` VMM alias。
+- 无 external segment 时，`GroupedLinear` 调用 build 时选定的标准 one-segment Adapter。普通 BF16/FP8/CUTLASS 与 MoonEP 都走各自已有的自然 autograd fast path；GMM 不知道当前 weight 是否来自 MoonEP。
+- 有 external segment 时，使用 BF16 two-segment Implementation。group 顺序固定为 `[trainable groups, external groups]`，分界由两个 weight 的 shape 推导。
+- `external_weight` 与 `external_wgrad_out` 成对出现；external weight 不是 Parameter，其 dW 只写显式 target。
+
+`MoEBlock` 的调用不包含 backend 分支：
+
+```python
+gate_up = fused_w1w3(hidden, tokens_per_expert, ...)
+output = fused_w2(activation(gate_up), tokens_per_expert, ...)
+```
+
+Tensor 自身的 shape、storage offset 和 stride 是唯一 storage contract；Interface 不暴露 `trans_b`、`primary/secondary` 或 explicit expert stride。two-segment backward 为缺省 trainable dW 分配 target，并用一个 mutable-output op 同时写 trainable 与 external WGrad；schema 必须准确声明两个 mutated outputs。trainable dW 返回 autograd，UltraEP external FP32 dW 只是 side effect。zero-token group 和 `M == 0` 必须覆盖写零。
 
 静态/config 边界必须保证：
 
 - 两段 weights 均为 `[G, O, I]`，device/input dtype 与 `(O, I)` 一致；`stride(2) == 1`、`stride(1) == I`，但 `stride(0)` 可大于 `O*I`。
-- direct WGrad target 与对应 weight 具有相同 logical shape，但 dtype 和 expert stride 可独立；UltraEP 因此可直写 FP32 interleaved storage。
+- external WGrad target 与对应 weight 具有相同 logical shape，但 dtype 和 expert stride 可独立；UltraEP 因此可直写 FP32 interleaved storage。
 - `len(counts) == G_trainable + G_external`、`sum(counts) == M`。这是 device contract，热路径不为验证它做 `.item()`/`.cpu()`。
 - training 中 `external_weight` 与 `external_wgrad_out` 必须成对出现，external weight 不是 Parameter、不向 autograd 返回 dW。
 - runtime-owned weight 在 forward 与 DGrad 两个消费点都必须有效；backward replay ordering 仍由 Dispatcher/runtime 拥有，GMM 不持有 Manager 或 plan。
 
-这是一个公共 Interface，内部仍可为 one-segment 和 two-segment 保留不同 Triton fast path。当前不公开 `Tensor[]` 或 device pointer table：删除它们不会让三个真实调用者变复杂，因此它们还是 hypothetical Seam。
+普通 allocation-return WGrad op 保留。它同时服务普通 EP、MoonEP、FP8 和 CUTLASS；删除它反而会强迫所有 one-segment caller 采用只为 UltraEP 引入的 side-output contract。two-segment autograd 只服务确有第二块 allocation 的 UltraEP，不再增加一层 caller-facing `grouped_linear()` helper。
 
-TileWise FP8、CUTLASS 和 NPU 也改为这一 canonical `GroupedLinear.forward`，不保留旧签名。它们在普通 `ExpertWeightLayout()` 下只消费 trainable one-segment；建模时的 capability validation 保证 external/direct-output layout 只选择已实现该能力的 kernel Adapter。这是 Implementation 选择，不再是 Decoder 中的旧/新 Interface 分支。
+各 Adapter 的能力如下：
+
+| Adapter | 标准 one-segment + natural dW | counts/metadata | MoonEP local `[2B]` alias | UltraEP strided external + FP32 dW |
+| --- | --- | --- | --- | --- |
+| BF16 Triton | 支持 | device counts；私有 Triton tile metadata | 支持，不需改 op schema | 新 two-segment op 支持 |
+| BF16 CUTLASS | 支持 | 应直接用 device counts 构造 problem arguments | 接口上可复用；需完成真实训练验证 | 现有 op 不支持，需 multi-base pointer/stride 扩展 |
+| TileWise FP8 AdaptiveGEMM | 支持 | 私有 quant/scales/tile metadata | MoonEP v1 为 BF16-only | 现有 Module 不支持 |
+
+CUTLASS 当前 XTuner wrapper 的 `.cpu()` 不是 Interface 要求；本地 GroupedGEMM CUTLASS Implementation 已有 CUDA `batch_sizes` argument builder。应让 Adapter 显式选择该 device-count path，删除 route-dependent D2H，而不是把 host schedule 提升为 caller contract。MoonEP 不再要求 direct-output capability，因此 CUTLASS 的剩余 gate 只是标准 `[2B]` forward/backward、compile、empty-expert 与 profiler 验证。
+
+因此答案是：旧的 schedule-based Interface **不能**诚实兼容这些算子；改为 counts-based `GroupedLinear` Interface 后，MoonEP 也只是“标准 GMM + 非标准 weight alias 的 autograd consumer”。只有 UltraEP 的 external FP32 WGrad 按真实能力进入专用 two-segment op。统一的是 caller 语义，不是假装所有低层 op 拥有相同 operands。
 
 ### 3.6 `UltraEPDispatcher` 对六阶段的映射
 
@@ -455,7 +481,7 @@ MoonEP 现有 Deep Modules 保留：
 
 1. 使用 Dispatcher 默认恒等的 `prepare_layer_input()`，不提前创建 state。
 2. `dispatch_preprocess` 直接消费 Router 的 `tokens_per_expert`，删除第二次 `bincount`。
-3. `dispatch` 按静态 gradient ring ordinal 创建 fresh `_MoonEPInvocation`，并放入 phase-2 state。
+3. `dispatch` 按静态 reduction-staging ring ordinal 创建 fresh `_MoonEPInvocation`，并放入 phase-2 state。
 4. `dispatch_postprocess` 将原 `expert_tensors` 嵌套 tuple 改为 MLP 粒度 `ExpertWeightLayout`。
 5. Decoder 不再 `.get("expert_tensors")`，private invocation 随线性 state 向后转移。
 6. model/engine 通过通用 `close_ep_runtime()` lifecycle，而不是 concrete `destroy_moonep()`。
@@ -504,7 +530,7 @@ flowchart TD
     B --> C["dispatcher.dispatch_preprocess"]
     C --> D["dispatcher.dispatch"]
     D --> E["dispatcher.dispatch_postprocess"]
-    E --> F["experts(weight layout)<br/>build call-local schedule"]
+    E --> F["experts(weight layout)<br/>Adapter consumes device counts"]
     F --> G["dispatcher.combine_preprocess"]
     G --> H["dispatcher.combine"]
     H --> I["shared experts overlap"]
@@ -512,7 +538,7 @@ flowchart TD
     J --> K["residual + public logical router results"]
 ```
 
-Decoder 只用一个局部 `state` 变量线性推进，不读取 backend-private keys，也不按 backend 分支。expert call 为该 microbatch 构造的 schedule/layout 由它自己的 autograd graph 捕获。
+Decoder 只用一个局部 `state` 变量线性推进，不读取 backend-private keys，也不按 backend 分支。expert call 的 counts、layout 与 UltraEP external WGrad target 由该 microbatch 自己的 autograd graph 捕获；MoonEP reduction slot 和任何算子 metadata 都不缓存到 Dispatcher 或共享 Module state。
 
 ### 4.2 Domino/microbatch
 
@@ -524,11 +550,11 @@ Decoder 只用一个局部 `state` 变量线性推进，不读取 backend-privat
 4. 计算 shared experts。
 5. 对每个 `states[i]` 调用 `combine_postprocess` 并汇总。
 
-这保留现有 overlap：`D0` 可覆盖 `A1/Dpre1`，`D1` 可覆盖 `E0/Cpre0`，`C0` 可覆盖 `E1/Cpre1`，`C0/C1` 可覆盖 shared experts。`GroupedGemmSchedule` 在 `E_i` 内用该 state 的 local counts 现场构造，不预建 `schedule_list`，也不放入 Dispatcher。
+这保留现有 overlap：`D0` 可覆盖 `A1/Dpre1`，`D1` 可覆盖 `E0/Cpre0`，`C0` 可覆盖 `E1/Cpre1`，`C0/C1` 可覆盖 shared experts。`E_i` 只消费该 state 的 local counts；Triton/CUTLASS/FP8 metadata 都由所选 Adapter 私有构造，不能形成跨 microbatch 的 `schedule_list` 或 `self.last_*` cache。
 
 每个 state 携带自己的 backend-private state 和 `ExpertWeightLayout`，但 storage policy 由 backend 决定：
 
-- MoonEP v1 只在同一个 active training graph 内支持已配置宽度的 Domino，按确定性 ordinal 使用静态 gradient ring；第二个 independent graph 不属于 v1 client contract，应由 Trainer/PP scheduler 的配置边界拒绝。热路径不新增动态 completion tracker、event query 或 host guard。
+- MoonEP v1 只在同一个 active training graph 内支持已配置宽度的 Domino，按确定性 ordinal 使用静态 reduction-staging ring；第二个 independent graph 不属于 v1 client contract，应由 Trainer/PP scheduler 的配置边界拒绝。热路径不新增动态 completion tracker、event query 或 host guard。
 - UltraEP v1 的 replica weight/grad storage 是共享的，因此只允许 microbatch1 和每个 physical layer 一个 active call。virtual placement slot 本身不能证明 tensor storage 隔离。
 - 普通/DeepEP 继续沿用各自已声明的调度能力。
 
@@ -547,7 +573,7 @@ Decoder 只用一个局部 `state` 变量线性推进，不读取 backend-privat
 | --- | --- | --- |
 | Logical master parameters | FSDP Module | 是 |
 | Master gradients after backend completion | FSDP | 是 |
-| MoonEP VMM weights/grad slots | MoonEPRuntime | 否 |
+| MoonEP VMM weights/reduction slots | MoonEPRuntime | 否 |
 | UltraEP replica weights/grad buffers | UltraEPRuntime | 否 |
 | Placement/plan/events | call-local Dispatcher state + backend runtime | 否 |
 | Router logits/weights/IDs | current forward graph | 正常 autograd/public semantics |
@@ -587,18 +613,20 @@ UltraEP external Manager 由 `UltraEPRuntime` 以 explicit-destroy 模式创建�
 | `dispatcher/ultraep.py` | 新增包装 `DeepEPDispatcher` 的 Adapter；直接用 `virtual_layer_id` 和 call-local state，不新增 invocation class |
 | `ultraep/runtime.py` | concrete model-scoped manager owner、FP32 staging、layer registration、explicit close；无 Provider/全局 registry/公共基类 |
 | `decoder_layer/moe_decoder_layer.py` | 用单个 state/列表直接调用 input hook + 六阶段；保持 Domino 五段 launch order |
-| `grouped_linear/moe_group_linear.py` | 删除旧/extended 双 API；唯一 `forward` 消费 schedule 与 trainable/external ownership |
-| `ops/moe/protocol.py` | `GroupGemmProtocol` 改为 two-segment grouped-linear Interface，不暴露 transpose/stride/backend 名 |
-| Triton GMM ops/kernels | 新增 call-local schedule builder、stride-aware forward 与 mutable backward-out；删除 allocation-return WGrad 和 dual wrapper |
+| `grouped_linear/moe_group_linear.py` | 唯一 `forward` 消费 device counts 与 trainable/external ownership；one-segment 走 selected Adapter，two-segment 走专用 Implementation |
+| `float8/float8_gmm_tile_wise.py` | 对齐 `GroupedLinear.forward` caller Interface；普通路径保持自己的 quant/scales/autograd，建模时拒绝 dynamic layout |
+| `ops/moe/protocol.py` | one-segment 保持标准 `GroupGemmProtocol(x, weight, counts)`，由 autograd 自然返回 dW |
+| BF16 Triton GMM ops/kernels | 删除只为 MoonEP 增加的 one-segment direct-out schema；保留标准 allocation-return，并新增 UltraEP stride-aware two-segment forward/DGrad/mutable WGrad |
+| BF16 CUTLASS Adapter | 删除 counts `.cpu()`；显式选择本地 GroupedGEMM 的 CUDA problem-argument path；MoonEP 标准路径与 UltraEP two-segment capability 分别验证 |
 | MoE model/factory | 单 discriminator；runtime build/bind/validate/install/close |
 | `TrainEngine.close()` | 通用 `close_ep_runtime()`，保持 save/barrier/process-group 顺序 |
 
 建议按以下顺序实施，以保持每一步可验证：
 
 1. 先恢复 Router-owned counts，再将六阶段签名改为 predecessor-only state pipeline；普通/DeepEP contract tests 先绿。
-2. 实现 `_GroupedGemmSchedule` 与 one-segment grouped-linear forward/backward-out，让普通 BF16 路径先切换到唯一新 Interface。
-3. 扩展同一 op 的 external segment，完成 arbitrary expert stride、mixed-dtype direct WGrad 和 zero-group coverage；删除旧 WGrad allocation op。
-4. 将 MoonEP private invocation 放入线性 state，用 trainable override/direct target 连通新 GMM，回归 Domino 与 FSDP completion。
+2. 先让 BF16 Triton/CUTLASS 与 TileWise FP8 通过 counts-based `GroupedLinear.forward` 的普通 public behavior tests；不改它们各自的低层 operands。
+3. 将 MoonEP private invocation 放入线性 state；用 differentiable trainable override 接入同一个标准 GMM，并在既有 `_ExpertWeightAutograd` 中完成 private staging、duplicate SUM 与 FSDP handoff。
+4. 新增 BF16 two-segment op，完成 arbitrary expert stride、mixed-dtype external WGrad 和 zero-group coverage；保留普通 allocation-return WGrad。
 5. 实现 model-scoped `UltraEPRuntime` 与包装 DeepEP 的 `UltraEPDispatcher`，用 external segment 直读/直写 official storage。
 6. 删除 Decoder UltraEP branches、Provider/global registry、`ProjectionExecution`、旧 GMM wrappers 和专用 expert Protocol。
 
@@ -611,8 +639,9 @@ UltraEP external Manager 由 `UltraEPRuntime` 以 explicit-destroy 模式创建�
 1. 参数化普通、DeepEP、MoonEP、UltraEP 的完整 Dispatcher 六阶段；验证 public logical IDs 不变，physical IDs 不出 Dispatcher。
 2. Router 生成规范 `tokens_per_expert[E]` 并传给所有 Dispatcher；MoonEP 不再重复扫描 IDs。
 3. 每个六阶段只接收前一 state，参数化同步/异步路径，确认 phase 1 写入的 flags 不会在后续阶段分叉。
-4. `ExpertWeightLayout()`、MoonEP trainable override/direct-dW 与 UltraEP trainable+external 三条路径都通过唯一 `GroupedLinear.forward`。
-5. 同一 microbatch 的 FC1/FC2 实际共享 schedule tensors；两个 live microbatches 则拥有不同 schedule 与 direct WGrad targets。测试 public output/gradient，不 mock 内部 schedule builder。
+4. `ExpertWeightLayout()`、MoonEP trainable override 与 UltraEP trainable+external 三条路径都通过唯一 `GroupedLinear.forward`；MoonEP 调用与普通路径具有相同三参数 GMM schema。
+5. 参数化 BF16 Triton/CUTLASS 与 TileWise FP8 的普通 `GroupedLinear` output/gradient；测试不依赖任何 Adapter 私有 schedule/scales/problem descriptor。
+6. 两个 live MoonEP microbatches 的自然 dW 必须进入各自 invocation 的 completion；counts、reduction slot 或 external target 不能通过 Module/Dispatcher cache 相互覆盖。
 
 ### 7.2 UltraEP correctness
 
@@ -632,8 +661,8 @@ UltraEP external Manager 由 `UltraEPRuntime` 以 explicit-destroy 模式创建�
 ### 7.4 Lifecycle、compile 与性能
 
 - 显式 close 后在同一 process group 中重建不同 shape 的 runtime，不命中 stale global manager。
-- `MODEL_COMPILE=1` 下只让 `ExpertWeightLayout` 的 tensor leaves 与 call-local device schedule 进入 expert graph；plan/runtime/event 留在 eager control plane。
-- 用 profiler 确认每个 microbatch 只构造一次 grouped-GEMM schedule，且无 counts `.cpu()`/`.item()`、weight `cat()`/`.contiguous()` 或完整 physical dW 临时量。
+- `MODEL_COMPILE=1` 下只让 `ExpertWeightLayout` 的 tensor leaves 与 device counts 进入 expert graph；plan/runtime/event 留在 eager control plane。
+- 用 profiler 确认各 Adapter 没有 counts `.cpu()`/`.item()` 或 weight `cat()`/`.contiguous()`。MoonEP 允许标准 GMM 的一个 local `[2B]` dW allocation，以及 one-sided reduce 需要时到 private symmetric slot 的一次 D2D staging；UltraEP 仍不允许完整 `[B+R]` 临时 dW 或 BF16→FP32 full copy。
 - 测试 no-grad、reentrant original/replay 与 capacity exhaustion 的 backend-specific state cleanup；不把 MoonEP 静态 ring 描述为动态 lease/release，也不依赖 Dispatcher `last_*` fields。
 - 分别记录 DeepEP、MoonEP、UltraEP 的 dispatch、weight materialization、expert compute、combine 和 backward completion ranges；性能 gate 绑定当前 commit 和同一 workload。
 
@@ -643,22 +672,25 @@ UltraEP external Manager 由 `UltraEPRuntime` 以 explicit-destroy 模式创建�
 | --- | --- | --- |
 | `RoutedExpertInvocation` | Decoder 用一个 state 变量直接推进六阶段，没有复杂度在别处重现 | 对六阶段逐一浅转发，删除 |
 | `ExpertBatch` | 直接读取 post result 的三个既有 key | 重复 value carrier，删除 |
-| `EPExecutionRuntime` ABC | model annotation 变成两个 concrete runtime 的 union | 只有声明、没有共享 Implementation，删除 |
 | `UltraEPLayerBinding` | `UltraEPDispatcher` 直接持有 `layer_id` 与 experts | 三字段 carrier，删除并内联 |
 | `UltraEPManagerAdapter` | model-scoped ownership/staging/teardown 合入 runtime，phase calls 留在 `UltraEPDispatcher` | 额外 forwarding layer 没有 Depth；合并后 Locality 更清楚 |
 | `_UltraEPInvocation` | `virtual_layer_id`、pre result 与 runtime event table 已覆盖全部状态 | 重复 external Manager 的索引模型，删除 |
 | `iter_ultraep_dispatchers(model)` | runtime 遍历自己在 bind 时登记的 Dispatcher | 重复扫描 model，删除 |
-| `ProjectionExecution` | 两 projection 的 storage mode 本来成对一致；删除后由 MLP-level layout 表达 | projection 粒度四 optional 字段是浅层 carrier，删除 |
-| `ExpertWeightLayout` | 四组 paired tensors/None 及 ownership 约束会散回 Dispatcher、MoEBlock 与 GMM | 以 trainable/external 稳定语义隐藏三条路径，Depth 和 Locality 高，保留 |
-| `_GroupedGemmSchedule` | FC1/FC2 forward、DGrad、WGrad 六处重建 device metadata | call-local 只读 value，有真实 Leverage，保留；禁止缓存到 `self` |
-| `grouped_linear` + backward-out op | single/direct/dual autograd、stride、zero-row 逻辑重新分散 | 一个 Deep Interface 隐藏 one/two-segment Implementation，保留 |
-| allocation-return `k_grouped_gemm` | wrapper 先分配 output 再调 mutable op 即可 | 重复 WGrad Implementation，删除 |
+| `ProjectionExecution` | 两 projection 的 storage mode 本来成对一致；删除后由 MLP-level layout 表达 | projection 粒度 optional 字段是浅层 carrier，删除 |
+| `ExpertWeightLayout` | 三组 paired tensors/None 及 ownership 约束会散回 Dispatcher、MoEBlock 与 GMM | 以 trainable/external 稳定语义隐藏三条路径，Depth 和 Locality 高，保留 |
+| `_GroupedGemmSchedule` | caller 继续传已有 device counts；各 Adapter 构造自己真正需要的 metadata | BF16 Triton-shaped carrier，删除 |
+| caller-facing `grouped_linear()` helper | `GroupedLinear.forward` 内直接选择 one/two-segment Implementation | 只有一个 caller 的浅转发，删除 |
+| two-segment autograd + mutable backward-out op | stride、mixed-dtype external WGrad、zero-row 逻辑会散回两个 projections | UltraEP 的 Deep Implementation，保留 |
+| allocation-return `k_grouped_gemm` | 普通 EP、MoonEP、FP8 和 CUTLASS 都需自然 autograd dW | 与 mutable entry 共用 launcher，不是重复 Implementation，保留 |
+| one-segment `grad_weight_out` | MoonEP 从 local-weight edge 捕获自然 dW；UltraEP 使用 two-segment op | 没有 caller，删除 |
 | concrete MoonEP/UltraEP runtimes | 初始化、FSDP integration、resource ownership 与 close 散入 model/engine | 小 Interface 隐藏多条规则，Depth、Leverage、Locality 都高，保留 |
-| `_MoonEPInvocation` | plan、events、gradient slot、replay/completion 散回六阶段 | 既有领域 Module，保留 |
+| `_MoonEPInvocation` | plan、events、reduction slot、replay/completion 散回六阶段 | 既有领域 Module，保留 |
 | MoonEP/UltraEP Dispatcher | transport、placement 与 ordering 分支回到 Decoder | 真实 Adapter 与稳定 Seam，保留 |
 | 三个 UltraEP autograd Function | 三个不同 backward graph edge 无处表达 | 每个隐藏必要 ordering Implementation，保留 |
 | global Manager registry | 单模型调用端不需要增加任何替代逻辑 | 没通过 deletion test，应删除 |
 | common `PlacementProtocol` | 两个 backend 仍需大量 type checks/optional methods | hypothetical Seam，不应新增 |
+
+删减后不再有 `GroupedGemmPlan/Schedule`、capability object、backend enum、projection execution 或通用 invocation façade。`StageState` 与 `ProjectionPair` 只是 type alias，不拥有状态或 lifecycle。GMM 侧唯一新增的 value contract 是 `ExpertWeightLayout`，唯一新增的行为 Implementation 是 UltraEP 确实需要的 two-segment autograd/op；其余都复用已有 one-segment Adapters。
 
 ## 9. 被拒绝的方案
 
@@ -698,6 +730,6 @@ UltraEP external Manager 由 `UltraEPRuntime` 以 explicit-destroy 模式创建�
 
 最终接入形态是：每个动态 backend 用一个 concrete model-scoped runtime 管资源，每个 routed-expert layer 用一个 Dispatcher Adapter 复用六阶段；六阶段只转移当前 call-local state，phase 3/4 之间保留独立 `MoEBlock` compile Seam。
 
-MoonEP 用 trainable `[2B]` segment 替换 Module weights，UltraEP 在 trainable `[B]` masters 后追加 official strided `[R]` external segment；二者都通过 MLP 粒度 `ExpertWeightLayout` 进入同一 two-segment grouped-linear Module。每个 microbatch 只构造一份 device schedule，两块 fused projections 和反向共享；mutable backward-out 将 BF16/FP32 WGrad 直接写入各自 owner 的 storage。
+MoonEP 用 differentiable trainable `[2B]` segment 替换 Module weights，标准 GMM 的自然 dW 由既有 local-weight autograd bridge 捕获并在 runtime 内归并；UltraEP 在 trainable `[B]` masters 后追加 official strided `[R]` external segment。二者都通过 MLP 粒度 `ExpertWeightLayout` 进入同一个 counts-based `GroupedLinear` caller Interface；只有 UltraEP 进入 two-segment mutable backward-out，将 external FP32 WGrad 直接写入 runtime-owned storage。
 
-该方案删除 `ProjectionExecution`、旧/extended 双 `GroupedLinear` API、single/direct/dual GMM wrappers 和 allocation-return WGrad op，不新增 routed-expert invocation façade。共享的只是真正稳定的 Interface：Router logical counts、predecessor-only 六阶段、trainable/external weight ownership、FSDP-owned master state，以及 backend completion 必须先于 FSDP 的边界。
+该方案删除 `ProjectionExecution`、`_GroupedGemmSchedule`、caller-facing `grouped_linear()` helper 和旧 dual wrapper，不新增 routed-expert invocation façade，也不强迫已有算子接受 Triton metadata。共享的只是真正稳定的 Interface：Router logical counts、predecessor-only 六阶段、trainable/external weight ownership、FSDP-owned master state，以及 backend completion 必须先于 FSDP 的边界。

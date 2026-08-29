@@ -5,7 +5,7 @@
 1. concrete model-scoped runtimes；
 2. per-layer Dispatcher Adapter 与已有六阶段；
 3. predecessor-only Dispatcher state 与 backend-private state；
-4. MLP-level expert weight layout 与 two-segment grouped linear；
+4. MLP-level expert weight layout 与 counts-based GroupedLinear；
 5. 单 microbatch、Domino、FSDP install 和 teardown 的主要调用端流程。
 
 省略了真实 backend import、stream 细节、错误文本和现有 Dispatcher 的具体通信代码。
@@ -46,12 +46,11 @@ ProjectionPair: TypeAlias = tuple[Tensor, Tensor]  # (fused_w1w3, fused_w2)
 class ExpertWeightLayout(NamedTuple):
     """MLP-level tensor value; no runtime/plan/event crosses the compile Seam.
 
-    The trainable segment must return dW to autograd.  The optional external
+    Trainable weights always use natural autograd WGrad.  The optional external
     segment is runtime-owned and receives dW only through explicit output tensors.
     """
 
     trainable_weights: ProjectionPair | None = None
-    trainable_wgrad_outs: ProjectionPair | None = None
     external_weights: ProjectionPair | None = None
     external_wgrad_outs: ProjectionPair | None = None
 
@@ -139,7 +138,7 @@ class GenericDispatcher(ABC):
 
 
 class _MoonEPInvocation:
-    """MoonEP per-call plan/events/gradient slot；真实逻辑复用当前实现。"""
+    """MoonEP per-call plan/events/reduction slot；真实逻辑复用当前实现。"""
 
     def dispatch(
         self,
@@ -156,17 +155,20 @@ class _MoonEPInvocation:
         self,
     ) -> tuple[Tensor, Tensor, ExpertWeightLayout]:
         """返回 dispatched hidden、local [2B] counts 和 MLP-level layout。"""
-        hidden_states, local_counts, weights, grad_outputs = materialize_moonep_local_tensors(self)
+        hidden_states, local_counts, weights = materialize_moonep_local_tensors(self)
         return (
             hidden_states,
             local_counts,
             ExpertWeightLayout(
-                # These aliases are differentiable _ExpertWeightAutograd outputs,
-                # so their direct dW must also be returned along that autograd edge.
+                # These are differentiable _ExpertWeightAutograd outputs.  The
+                # selected standard GMM returns their dW through natural autograd.
                 trainable_weights=weights,
-                trainable_wgrad_outs=grad_outputs,
             ),
         )
+
+    def _complete_weight_gradients(self, local_grads: ProjectionPair) -> ProjectionPair:
+        """Stage natural dW if needed, reduce duplicates, and return home dW。"""
+        raise NotImplementedError
 
     def combine_preprocess(self, expert_output: Tensor, *, async_op: bool) -> Tensor:
         raise NotImplementedError
@@ -213,11 +215,48 @@ class MoonEPRuntime:
             self._closed = True
 
 
+class _ExpertWeightAutograd(torch.autograd.Function):
+    """既有 MoonEP weight bridge；作用等价于成对的 local-weight grad hook。"""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        home_w1w3: Tensor,
+        home_w2: Tensor,
+        local_w1w3: Tensor,
+        local_w2: Tensor,
+        invocation: _MoonEPInvocation,
+    ) -> ProjectionPair:
+        ctx.invocation = invocation
+        ctx.home_shapes = home_w1w3.shape, home_w2.shape
+        return local_w1w3.view_as(local_w1w3), local_w2.view_as(local_w2)
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_local_w1w3: Tensor,
+        grad_local_w2: Tensor,
+    ) -> tuple[Tensor, Tensor, None, None, None]:
+        # Standard GMM allocated and returned these two local [2B] gradients.
+        # MoonEP may stage them into its private symmetric reduction slot here;
+        # that storage rule never enters GroupedLinear or the GMM op schema.
+        home_grads = ctx.invocation._complete_weight_gradients(
+            (grad_local_w1w3, grad_local_w2)
+        )
+        return (
+            home_grads[0].reshape(ctx.home_shapes[0]),
+            home_grads[1].reshape(ctx.home_shapes[1]),
+            None,
+            None,
+            None,
+        )
+
+
 class MoonEPDispatcher(GenericDispatcher):
     def __init__(self, *, runtime: MoonEPRuntime, layer_binding: object) -> None:
         self.runtime = runtime
         self.layer_binding = layer_binding
-        self._next_gradient_slot = 0
+        self._next_reduction_slot = 0
 
     def dispatch_preprocess(
         self,
@@ -246,12 +285,12 @@ class MoonEPDispatcher(GenericDispatcher):
         self,
         state: StageState,
     ) -> StageState:
-        grad_slot = self._next_gradient_slot
-        self._next_gradient_slot = (grad_slot + 1) % self.runtime.config.intra_layer_micro_batch
+        reduction_slot = self._next_reduction_slot
+        self._next_reduction_slot = (reduction_slot + 1) % self.runtime.config.intra_layer_micro_batch
         invocation = create_moonep_invocation(
             self.runtime,
             self.layer_binding,
-            grad_slot=grad_slot,
+            reduction_slot=reduction_slot,
         )
         hidden_states, weights = invocation.dispatch(
             state["hidden_states"],
@@ -631,26 +670,18 @@ class UltraEPDispatcher(GenericDispatcher):
 
 
 # =============================================================================
-# 5. [CHANGED EXPERT COMPUTE] one/two-segment grouped-linear Interface
+# 5. [CHANGED EXPERT COMPUTE] backend-neutral GroupedLinear Interface
 # =============================================================================
 
 
-class _GroupedGemmSchedule(NamedTuple):
-    """Per-call, read-only device metadata shared by both fused projections."""
-
-    counts: Tensor
-    group_starts: Tensor
-    group_ends: Tensor
-    padded_group_starts: Tensor
-    group_by_m_tile: Tensor
-    padded_rows: Tensor
-
-
-GROUPED_GEMM_M_TILE = 128  # Triton Implementation constant, not a public layout field.
-
-
 class GroupedLinear(nn.Module):
-    """Parameter owner with one canonical forward Interface."""
+    """BF16 parameter owner with one counts-based caller Interface.
+
+    The selected one-segment Adapter owns its private schedule.  Only the real
+    UltraEP two-allocation case enters the two-segment Implementation below.
+    TileWise FP8 implements the same caller Interface but keeps quant/scales in
+    its own Module and rejects dynamic layouts during model validation.
+    """
 
     weight: nn.Parameter
     local_out_features: int
@@ -659,10 +690,9 @@ class GroupedLinear(nn.Module):
     def forward(
         self,
         hidden_states: Tensor,
-        schedule: _GroupedGemmSchedule,
+        tokens_per_expert: Tensor,
         *,
         trainable_weight: Tensor | None = None,
-        trainable_wgrad_out: Tensor | None = None,
         external_weight: Tensor | None = None,
         external_wgrad_out: Tensor | None = None,
     ) -> Tensor:
@@ -674,13 +704,20 @@ class GroupedLinear(nn.Module):
                 self.local_in_features,
             )
 
-        return grouped_linear(
+        if external_weight is None:
+            # Ordinary EP and MoonEP use exactly the selected Adapter's standard
+            # one-segment autograd path. MoonEP captures dW on its weight alias.
+            return group_gemm(hidden_states, trainable_weight, tokens_per_expert)
+
+        # The only real two-allocation caller is UltraEP. Its external weight
+        # and WGrad tensors may have different expert strides and dtypes.
+        assert external_wgrad_out is not None
+        return _TwoSegmentGroupedLinear.apply(
             hidden_states,
-            schedule,
             trainable_weight,
-            trainable_wgrad_out=trainable_wgrad_out,
-            external_weight=external_weight,
-            external_wgrad_out=external_wgrad_out,
+            external_weight,
+            external_wgrad_out,
+            tokens_per_expert,
         )
 
 
@@ -689,8 +726,8 @@ class MoEBlock(nn.Module):
 
     def __init__(
         self,
-        fused_w1w3: GroupedLinear,
-        fused_w2: GroupedLinear,
+        fused_w1w3: nn.Module,  # BF16 or existing TileWise FP8 Adapter
+        fused_w2: nn.Module,
         moe_act: nn.Module,
     ) -> None:
         super().__init__()
@@ -705,17 +742,8 @@ class MoEBlock(nn.Module):
         *,
         weight_layout: ExpertWeightLayout,
     ) -> Tensor:
-        # Critical for Domino: this value is owned by this call/autograd graph.
-        # Never cache it on MoEBlock, GroupedLinear, or Dispatcher.
-        schedule = build_grouped_gemm_schedule(
-            tokens_per_expert,
-            num_rows=hidden_states.shape[0],
-        )
-
         trainable_w1w3 = None if weight_layout.trainable_weights is None else weight_layout.trainable_weights[0]
         trainable_w2 = None if weight_layout.trainable_weights is None else weight_layout.trainable_weights[1]
-        trainable_dw1w3 = None if weight_layout.trainable_wgrad_outs is None else weight_layout.trainable_wgrad_outs[0]
-        trainable_dw2 = None if weight_layout.trainable_wgrad_outs is None else weight_layout.trainable_wgrad_outs[1]
         external_w1w3 = None if weight_layout.external_weights is None else weight_layout.external_weights[0]
         external_w2 = None if weight_layout.external_weights is None else weight_layout.external_weights[1]
         external_dw1w3 = None if weight_layout.external_wgrad_outs is None else weight_layout.external_wgrad_outs[0]
@@ -723,17 +751,15 @@ class MoEBlock(nn.Module):
 
         gate_up = self.fused_w1w3(
             hidden_states,
-            schedule,
+            tokens_per_expert,
             trainable_weight=trainable_w1w3,
-            trainable_wgrad_out=trainable_dw1w3,
             external_weight=external_w1w3,
             external_wgrad_out=external_dw1w3,
         )
         return self.fused_w2(
             self.moe_act(gate_up),
-            schedule,
+            tokens_per_expert,
             trainable_weight=trainable_w2,
-            trainable_wgrad_out=trainable_dw2,
             external_weight=external_w2,
             external_wgrad_out=external_dw2,
         )
@@ -839,8 +865,8 @@ class MoEDecoderLayer(nn.Module):
         for index, state in enumerate(states):
             state = self.dispatcher.dispatch(state)
             state = self.dispatcher.dispatch_postprocess(state)
-            # The schedule and weight layout are captured by this microbatch's
-            # autograd graph; neither is cached on the shared Dispatcher/Module.
+            # Counts and weight layout belong to this microbatch's autograd
+            # graph; backend metadata and MoonEP reduction slots stay private.
             expert_output = self.experts(
                 state["hidden_states"],
                 state["tokens_per_expert"],
@@ -1003,128 +1029,54 @@ def trainer_normal_teardown(trainer: Any) -> None:
 
 
 # =============================================================================
-# 8. [KERNEL CONTRACT] one schedule + two ownership segments
+# 8. [KERNEL CONTRACT] BF16 two-segment Implementation
 # =============================================================================
 
 
-def build_grouped_gemm_schedule(
-    tokens_per_expert: Tensor,
-    num_rows: int,
-) -> _GroupedGemmSchedule:
-    """Build device metadata once; no ``cpu()``, ``item()`` or Module cache."""
-    counts = tokens_per_expert.to(torch.int32).contiguous()
-    group_ends = counts.cumsum(0)
-    group_starts = group_ends - counts
-    padded_counts = ((counts + GROUPED_GEMM_M_TILE - 1) // GROUPED_GEMM_M_TILE) * GROUPED_GEMM_M_TILE
-    padded_ends = padded_counts.cumsum(0)
-    padded_group_starts = padded_ends - padded_counts
-    tiles_per_group = padded_counts // GROUPED_GEMM_M_TILE
-    # Fixed-capacity output avoids a host read of sum(tiles_per_group).
-    group_by_m_tile = counts.new_empty(num_rows // GROUPED_GEMM_M_TILE + counts.shape[0])
-    device_repeat_interleave_out(
-        torch.arange(counts.shape[0], device=counts.device, dtype=torch.int32),
-        tiles_per_group,
-        group_by_m_tile,
-    )
-    return _GroupedGemmSchedule(
-        counts=counts,
-        group_starts=group_starts,
-        group_ends=group_ends,
-        padded_group_starts=padded_group_starts,
-        group_by_m_tile=group_by_m_tile,
-        padded_rows=padded_ends[-1:],
-    )
-
-
 class _TwoSegmentGroupedLinear(torch.autograd.Function):
-    """Autograd Adapter around fixed-schema stride-aware custom ops."""
+    """UltraEP autograd Adapter around stride-aware BF16 custom ops.
+
+    Counts are the Interface. Triton tile metadata is private to the two ops;
+    CUTLASS and FP8 never need to understand it.
+    """
 
     @staticmethod
     def forward(
         ctx: Any,
         x: Tensor,
         trainable_weight: Tensor,
-        trainable_wgrad_out: Tensor | None,
-        external_weight: Tensor | None,
-        external_wgrad_out: Tensor | None,
-        *schedule_tensors: Tensor,
+        external_weight: Tensor,
+        external_wgrad_out: Tensor,
+        tokens_per_expert: Tensor,
     ) -> Tensor:
-        schedule = _GroupedGemmSchedule(*schedule_tensors)
-        if external_weight is None:
-            # Private zero-group canonicalization keeps the custom-op schema fixed;
-            # the caller never passes sentinel tensors.
-            external_weight = trainable_weight.new_empty((0, trainable_weight.shape[1], trainable_weight.shape[2]))
-            external_wgrad_out = torch.empty_like(external_weight)
-
         # Runtime-owned replicas may be replayed before DGrad.  Keeping this as a
         # plain ctx attribute avoids a saved-tensor version check on refreshed data.
         ctx.external_weight = external_weight
         ctx.external_wgrad_out = external_wgrad_out
-        ctx.trainable_wgrad_out = trainable_wgrad_out
-        ctx.save_for_backward(x, trainable_weight, *schedule_tensors)
-        return grouped_linear_forward_op(
+        ctx.save_for_backward(x, trainable_weight, tokens_per_expert)
+        return two_segment_group_gemm_forward_op(
             x,
             trainable_weight,
             external_weight,
-            schedule.counts,
-            schedule.group_starts,
-            schedule.group_ends,
-            schedule.padded_group_starts,
-            schedule.group_by_m_tile,
-            schedule.padded_rows,
+            tokens_per_expert,
         )
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor | None, ...]:
-        x, trainable_weight, *schedule_tensors = ctx.saved_tensors
-        schedule = _GroupedGemmSchedule(*schedule_tensors)
-        trainable_dw = ctx.trainable_wgrad_out
-        if trainable_dw is None:
-            trainable_dw = torch.empty_like(trainable_weight)
+        x, trainable_weight, tokens_per_expert = ctx.saved_tensors
+        trainable_dw = torch.empty_like(trainable_weight)
 
-        external_dw = ctx.external_wgrad_out
-        assert external_dw is not None  # production validation enforces paired storage
-        dx = grouped_linear_backward_out_op(
+        dx = two_segment_group_gemm_backward_out_op(
             grad_output,
             x,
             trainable_weight,
             ctx.external_weight,
             trainable_dw,
-            external_dw,
-            schedule.counts,
-            schedule.group_starts,
-            schedule.group_ends,
-            schedule.padded_group_starts,
-            schedule.group_by_m_tile,
-            schedule.padded_rows,
+            ctx.external_wgrad_out,
+            tokens_per_expert,
         )
         # external_weight is runtime-owned: its dW is only the explicit side output.
-        return dx, trainable_dw, None, None, None, *(None for _ in schedule_tensors)
-
-
-def grouped_linear(
-    x: Tensor,
-    schedule: _GroupedGemmSchedule,
-    trainable_weight: Tensor,
-    *,
-    trainable_wgrad_out: Tensor | None = None,
-    external_weight: Tensor | None = None,
-    external_wgrad_out: Tensor | None = None,
-) -> Tensor:
-    """The only caller-facing grouped-linear Interface.
-
-    Groups are ordered ``[trainable, external]``.  Every tensor carries its own
-    storage offset/strides; no backend name, transpose flag or explicit expert
-    stride enters this Interface.
-    """
-    return _TwoSegmentGroupedLinear.apply(
-        x,
-        trainable_weight,
-        trainable_wgrad_out,
-        external_weight,
-        external_wgrad_out,
-        *schedule,
-    )
+        return dx, trainable_dw, None, None, None
 
 
 # =============================================================================
@@ -1142,13 +1094,15 @@ def create_moonep_invocation(
     runtime: MoonEPRuntime,
     layer_binding: object,
     *,
-    grad_slot: int,
+    reduction_slot: int,
 ) -> _MoonEPInvocation: ...
 
 
 def materialize_moonep_local_tensors(
     invocation: _MoonEPInvocation,
-) -> tuple[Tensor, Tensor, tuple[Tensor, Tensor], tuple[Tensor, Tensor]]: ...
+) -> tuple[Tensor, Tensor, ProjectionPair]:
+    """Return local activations/counts and weights wrapped by _ExpertWeightAutograd。"""
+    ...
 
 
 def validate_moonep_fsdp_config(model: nn.Module, fsdp_config: Any) -> None: ...
@@ -1247,29 +1201,31 @@ def validate_two_segment_gmm_supports_configured_layout(config: Any) -> None: ..
 def build_deepep_dispatcher(*, n_routed_experts: int, ep_group: Any) -> GenericDispatcher: ...
 
 
-def device_repeat_interleave_out(
-    group_ids: Tensor,
-    repeats: Tensor,
-    out: Tensor,
-) -> None: ...
+def group_gemm(
+    x: Tensor,
+    weight: Tensor,
+    tokens_per_expert: Tensor,
+) -> Tensor:
+    """Selected standard one-segment Adapter with natural autograd WGrad.
+
+    Triton and CUTLASS keep their existing allocation-return contract. TileWise
+    FP8 stays behind its own GroupedLinear Implementation because its raw op also
+    consumes quantization scales.
+    """
+    ...
 
 
-def grouped_linear_forward_op(
+def two_segment_group_gemm_forward_op(
     x: Tensor,
     trainable_weight: Tensor,
     external_weight: Tensor,
     counts: Tensor,
-    group_starts: Tensor,
-    group_ends: Tensor,
-    padded_group_starts: Tensor,
-    group_by_m_tile: Tensor,
-    padded_rows: Tensor,
 ) -> Tensor:
-    """Fixed-schema, stride-aware one/two-segment forward custom op。"""
+    """Stride-aware BF16 forward; all tile metadata is op-private。"""
     ...
 
 
-def grouped_linear_backward_out_op(
+def two_segment_group_gemm_backward_out_op(
     grad_output: Tensor,
     x: Tensor,
     trainable_weight: Tensor,
@@ -1277,11 +1233,6 @@ def grouped_linear_backward_out_op(
     trainable_dw_out: Tensor,
     external_dw_out: Tensor,
     counts: Tensor,
-    group_starts: Tensor,
-    group_ends: Tensor,
-    padded_group_starts: Tensor,
-    group_by_m_tile: Tensor,
-    padded_rows: Tensor,
 ) -> Tensor:
     """Return DGrad and cover both WGrad targets declared in ``mutates_args``。"""
     ...
@@ -1318,6 +1269,7 @@ def close_other_engine_resources(engine: TrainEngine) -> None: ...
 # - official R=2 strided replica views work, or config rejects them before FSDP mutation;
 # - UltraEP v1 rejects a second same-layer call before shared storage is overwritten;
 # - each backend only enables Domino/MTP/reentrant paths declared by its capability boundary;
-# - ordinary FP8/CUTLASS/NPU paths still call their original three-argument Interface;
+# - ordinary and MoonEP BF16 GMM paths use the same three-argument Interface;
+# - ordinary FP8/CUTLASS paths still use their natural autograd WGrad;
 # - DCP/HF state excludes all runtime/private-state tensors and cold-runtime restore works;
 # - explicit close permits rebuilding a different runtime in the same process.
