@@ -609,6 +609,7 @@ class MoonEPDispatcher(
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
         async_op: bool = False,
     ) -> MoonEPPreDispatchResult:
         del topk_weights, async_op
@@ -616,11 +617,7 @@ class MoonEPDispatcher(
         return MoonEPPreDispatchResult(
             hidden_states=hidden_states,
             topk_ids=topk_ids.to(dtype=torch.int32).contiguous(),
-            # Keep the upstream dispatcher contract. The count stays entirely
-            # on device and is consumed by MoonEP's route planner.
-            tokens_per_expert=torch.bincount(
-                topk_ids.flatten(), minlength=self._runtime._num_experts
-            ).to(dtype=torch.int32),
+            tokens_per_expert=tokens_per_expert.to(dtype=torch.int32).contiguous(),
         )
 
     @override

@@ -136,6 +136,9 @@ class GenericDispatcher(
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        # Source-logical counts are owned by Router. Post-dispatch counts have
+        # a different meaning: local physical groups consumed by expert GMM.
+        tokens_per_expert: torch.Tensor,
         async_op: bool = False,
     ) -> PreDispatch: ...
 
@@ -259,8 +262,10 @@ class NaiveDispatcher(
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
         async_op: bool = False,
     ) -> NaivePreDispatchResult:
+        del tokens_per_expert
         if async_op:
             if self._expert_tp is None:
                 raise NotImplementedError("Naive dispatcher async_op=True requires ExpertTP.")

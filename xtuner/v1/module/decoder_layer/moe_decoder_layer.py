@@ -433,6 +433,7 @@ class MoEDecoderLayer(nn.Module):
             hidden_states=hidden_states.view(-1, hidden_states.shape[-1]),
             topk_ids=router_results["topk_ids"],
             topk_weights=router_results["topk_weights"],
+            tokens_per_expert=router_results["tokens_per_expert"],
         )
         dispatched = self.dispatcher.dispatch(
             pre_dispatched=pre_dispatched,
@@ -555,6 +556,7 @@ class MoEDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 topk_ids=router_results["topk_ids"],
                 topk_weights=router_results["topk_weights"],
+                tokens_per_expert=router_results["tokens_per_expert"],
                 async_op=True,
             )
             pre_dispatched_list.append(pre_dispatched)

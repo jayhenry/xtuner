@@ -185,6 +185,7 @@ def test_staging_dispatcher_runs_the_public_six_stage_forward_seam(backend) -> N
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=route_weights,
+            tokens_per_expert=source_counts,
         )
         dispatched = dispatcher.dispatch(pre_dispatched=pre, topk_weights=route_weights)
         post = dispatcher.dispatch_postprocess(pre_dispatched=pre, dispatched=dispatched)
@@ -223,6 +224,7 @@ def test_staging_dispatcher_runs_the_public_six_stage_forward_seam(backend) -> N
             hidden_states=torch.randn(4, 128, dtype=torch.bfloat16),
             topk_ids=torch.zeros(4, 2, dtype=torch.int64),
             topk_weights=torch.full((4, 2), 0.5),
+            tokens_per_expert=torch.tensor([8, 0, 0, 0]),
         )
 
 

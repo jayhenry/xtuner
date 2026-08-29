@@ -66,6 +66,7 @@ class TestNoETorchAll2AllDispatcher(DistributedTestBase):
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
+            tokens_per_expert=torch.bincount(topk_ids.flatten(), minlength=16),
         )
         dispatched = dispatcher.dispatch(
             pre_dispatched=pre_dispatched,

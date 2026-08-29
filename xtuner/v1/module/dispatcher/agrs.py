@@ -259,8 +259,10 @@ class MoEAGRSDispatcher(
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,  # noqa: ARG002 — kept for interface compatibility; not used here
+        tokens_per_expert: torch.Tensor,
         async_op: bool = False,
     ) -> MoEAGRSPreDispatchResult:
+        del tokens_per_expert
         if async_op:
             forward_finished_event = cast(torch.cuda.Event, torch.cuda.Event())
             forward_finished_event.record()

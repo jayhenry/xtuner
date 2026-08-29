@@ -609,3 +609,29 @@ sequenceDiagram
 - 正式 dtype/ownership 流程保持 `FP32 FSDP shard -> BF16 AG/direct landing/compute/dW/duplicate return/ReduceScatter -> FP32 shard grad -> FP32 optimizer update`；DCP 仍只观察 FSDP-owned Parameter 与 optimizer identity。
 - 首版只声明 BF16、TP1、node-local EP2/4/8（性能验收 EP4）、FSDP2、训练及已覆盖的 MTP/Domino/SP；TP、FP8、跨节点、`no_sync`、PP、decoding 和 XTuner 自管 expert+DCP 适配仍为待办。
 - 结论：Issue 08 的数值、性能、回归和无 host sync 门禁全部通过，MoonEP 接入达到第一版 Definition of Done。
+
+# 2026-08-29_EP扩展重构-01-Router计数单一所有权
+
+完成动态 EP 重构的第一步：Router 现在是 source-logical `tokens_per_expert[E]` 的唯一生产者，六阶段 `dispatch_preprocess` 将其作为必传输入。MoonEP 只做 dtype/layout 归一化后交给 route planner，不再重复统计；其他 dispatcher 保留各自 received/local counts 算法。
+
+## 开发与测试记录
+
+- 将错拼字段 `topkens_per_expert` 直接改为 `tokens_per_expert`，未保留兼容别名。
+- Greedy/NoAux 两类 Router 改用整数 `bincount`，避免先转 float 再做 histogram。
+- 更新全部 dispatcher public API 调用点和测试调用点；新增 Router public result 行为测试。
+- 同一组定向回归基线为 `11 passed`；新增行为用例后改造结果为 `12 passed`。
+- Ruff 对生产代码及本次核心 MoonEP 测试：`All checks passed`。历史 dispatcher 测试文件仍有与本次无关的既存 import lint，未扩大修改范围。
+
+```mermaid
+flowchart LR
+    A["Router<br/>logical top-k IDs"] --> B["bincount once<br/>tokens_per_expert E"]
+    B --> C["dispatch_preprocess<br/>source-logical metadata"]
+    C --> D["MoonEP planner<br/>contiguous int32"]
+    C --> E["Other dispatchers<br/>own received-count algorithms"]
+    D --> F["dispatch_postprocess<br/>local physical counts"]
+    E --> F
+```
+
+source counts 与 expert compute counts 继续使用同一字段名，但由阶段边界区分语义：Router result 描述当前 source batch 的 logical experts；phase-3 result 描述本 rank 实际执行的 physical groups。这样消除了重复计算，同时没有把 MoonEP 的 placement 语义泄漏给 Router。
+
+本提交只收敛计数所有权和入口接口，不改变 activation transport、expert weight layout 或 GMM。下一步删除 MoonEP 专用 `grad_weight_out` 路径，让标准 one-segment GMM 自然产生 dW。

@@ -9,7 +9,7 @@ import torch
 from xtuner.v1.model.moe.moe import MoEConfig
 from xtuner.v1.module.attention import MHAConfig
 from xtuner.v1.module.dispatcher import NaiveDispatcher
-from xtuner.v1.module.router import GreedyRouterConfig
+from xtuner.v1.module.router import GreedyRouter, GreedyRouterConfig
 
 
 def _moe_config(**overrides) -> MoEConfig:
@@ -84,10 +84,26 @@ def test_existing_dispatcher_keeps_public_preprocess_behavior() -> None:
         hidden_states=hidden_states,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
+        tokens_per_expert=torch.bincount(topk_ids.flatten(), minlength=4),
     )
 
     assert result["hidden_states"] is hidden_states
     assert result["topk_ids"] is topk_ids
+
+
+def test_router_owns_logical_tokens_per_expert() -> None:
+    router = GreedyRouter(
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+    )
+    result = router(torch.tensor([[4.0, 3.0, 2.0, 1.0], [1.0, 2.0, 3.0, 4.0]]))
+
+    assert set(result) == {"logits", "router_weights", "topk_weights", "topk_ids", "tokens_per_expert"}
+    torch.testing.assert_close(
+        result["tokens_per_expert"],
+        torch.bincount(result["topk_ids"].flatten(), minlength=4),
+    )
 
 
 def test_runtime_meta_build_only_validates_the_optional_backend(monkeypatch) -> None:
