@@ -205,12 +205,14 @@ class MoEBlock(nn.Module):
         weight_layout: ExpertWeightLayout,
     ) -> torch.Tensor:
         trainable = weight_layout.trainable_weights or (None, None)
+        trainable_wgrad_outs = weight_layout.trainable_wgrad_outs or (None, None)
         external = weight_layout.external_weights or (None, None)
         external_wgrad_outs = weight_layout.external_wgrad_outs or (None, None)
         gate_up_out = self.fused_w1w3(
             x,
             tokens_per_expert,
             trainable_weight=trainable[0],
+            trainable_wgrad_out=trainable_wgrad_outs[0],
             external_weight=external[0],
             external_wgrad_out=external_wgrad_outs[0],
         )
@@ -219,6 +221,7 @@ class MoEBlock(nn.Module):
             out,
             tokens_per_expert,
             trainable_weight=trainable[1],
+            trainable_wgrad_out=trainable_wgrad_outs[1],
             external_weight=external[1],
             external_wgrad_out=external_wgrad_outs[1],
         )

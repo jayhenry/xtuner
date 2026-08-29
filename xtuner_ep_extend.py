@@ -48,11 +48,13 @@ ProjectionPair: TypeAlias = tuple[Tensor, Tensor]  # (fused_w1w3, fused_w2)
 class ExpertWeightLayout(NamedTuple):
     """MLP-level tensor value; no runtime/plan/event crosses the compile Seam.
 
-    Trainable weights always use natural autograd WGrad.  The optional external
-    segment is runtime-owned and receives dW only through explicit output tensors.
+    Ordinary trainable weights use natural autograd WGrad. MoonEP supplies leaf
+    Parameters plus direct-output WGrad targets. The optional external segment is
+    runtime-owned and receives dW only through explicit output tensors.
     """
 
     trainable_weights: ProjectionPair | None = None
+    trainable_wgrad_outs: ProjectionPair | None = None
     external_weights: ProjectionPair | None = None
     external_wgrad_outs: ProjectionPair | None = None
 
@@ -142,6 +144,10 @@ class GenericDispatcher(ABC):
 class _MoonEPInvocation:
     """MoonEP per-call plan/events/reduction slot；真实逻辑复用当前实现。"""
 
+    _home_parameters: tuple[nn.Parameter, nn.Parameter] | None
+    _local_gradient_parameters: list[nn.Parameter | None]
+    _fallback_gradient_targets: ProjectionPair | None
+
     def dispatch(
         self,
         hidden_states: Tensor,
@@ -157,20 +163,58 @@ class _MoonEPInvocation:
         self,
     ) -> tuple[Tensor, Tensor, ExpertWeightLayout]:
         """返回 dispatched hidden、local [2B] counts 和 MLP-level layout。"""
-        hidden_states, local_counts, weights = materialize_moonep_local_tensors(self)
+        hidden_states, local_counts, weights, wgrad_targets, home_parameters = materialize_moonep_local_tensors(self)
+        local_parameters = (nn.Parameter(weights[0]), nn.Parameter(weights[1]))
+        self._home_parameters = home_parameters
+        self._local_gradient_parameters = [None, None]
+        for projection, parameter in enumerate(local_parameters):
+            parameter.register_post_accumulate_grad_hook(
+                lambda completed, projection=projection: self._record_parameter_gradient(projection, completed)
+            )
         return (
             hidden_states,
             local_counts,
             ExpertWeightLayout(
-                # These are differentiable _ExpertWeightAutograd outputs.  The
-                # selected standard GMM returns their dW through natural autograd.
-                trainable_weights=weights,
+                trainable_weights=local_parameters,
+                # The invocation deliberately does not retain these forward Tensor
+                # aliases. AccumulateGrad can then steal their VMM storage.
+                trainable_wgrad_outs=wgrad_targets,
             ),
         )
 
     def _complete_weight_gradients(self, local_grads: ProjectionPair) -> ProjectionPair:
-        """Stage natural dW if needed, reduce duplicates, and return home dW。"""
-        raise NotImplementedError
+        """Consume no-copy or copy-path dW, then reduce duplicated experts。"""
+        # _CombineAutograd.backward replays weights first and stores fresh Tensor
+        # aliases to the same VMM targets. Those aliases do not affect the forward
+        # target's reference count at AccumulateGrad.
+        assert self._fallback_gradient_targets is not None
+        reduction_grads = tuple(
+            source if source.data_ptr() == target.data_ptr() else target
+            for source, target in zip(local_grads, self._fallback_gradient_targets, strict=True)
+        )
+        # In the fallback, AccumulateGrad already copied target -> Parameter.grad;
+        # target itself is complete, so there is no second full-gradient copy.
+        return complete_moonep_duplicate_gradients(self, cast(ProjectionPair, reduction_grads))
+
+    def _record_parameter_gradient(self, projection: int, parameter: nn.Parameter) -> None:
+        """Pair both projection hooks and hand one completed transaction to FSDP。"""
+        assert parameter.grad is not None
+        self._local_gradient_parameters[projection] = parameter
+        if any(item is None for item in self._local_gradient_parameters):
+            return
+
+        local_parameters = (
+            cast(nn.Parameter, self._local_gradient_parameters[0]),
+            cast(nn.Parameter, self._local_gradient_parameters[1]),
+        )
+        local_grads = (cast(Tensor, local_parameters[0].grad), cast(Tensor, local_parameters[1].grad))
+        home_grads = self._complete_weight_gradients(local_grads)
+        assert self._home_parameters is not None
+        accumulate_fsdp_unsharded_expert_gradients(self._home_parameters, home_grads)
+        for local_parameter in local_parameters:
+            local_parameter.grad = None
+        self._home_parameters = None
+        self._local_gradient_parameters = [None, None]
 
     def combine_preprocess(self, expert_output: Tensor, *, async_op: bool) -> Tensor:
         raise NotImplementedError
@@ -244,41 +288,6 @@ class MoonEPRuntime:
             destroy_moonep_buffers_vmm_and_landing(self)
             self._layers.clear()
             self._closed = True
-
-
-class _ExpertWeightAutograd(torch.autograd.Function):
-    """既有 MoonEP weight bridge；作用等价于成对的 local-weight grad hook。"""
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        home_w1w3: Tensor,
-        home_w2: Tensor,
-        local_w1w3: Tensor,
-        local_w2: Tensor,
-        invocation: _MoonEPInvocation,
-    ) -> ProjectionPair:
-        ctx.invocation = invocation
-        ctx.home_shapes = home_w1w3.shape, home_w2.shape
-        return local_w1w3.view_as(local_w1w3), local_w2.view_as(local_w2)
-
-    @staticmethod
-    def backward(
-        ctx: Any,
-        grad_local_w1w3: Tensor,
-        grad_local_w2: Tensor,
-    ) -> tuple[Tensor, Tensor, None, None, None]:
-        # Standard GMM allocated and returned these two local [2B] gradients.
-        # MoonEP may stage them into its private symmetric reduction slot here;
-        # that storage rule never enters GroupedLinear or the GMM op schema.
-        home_grads = ctx.invocation._complete_weight_gradients((grad_local_w1w3, grad_local_w2))
-        return (
-            home_grads[0].reshape(ctx.home_shapes[0]),
-            home_grads[1].reshape(ctx.home_shapes[1]),
-            None,
-            None,
-            None,
-        )
 
 
 class MoonEPDispatcher(GenericDispatcher):
@@ -778,6 +787,7 @@ class GroupedLinear(nn.Module):
         tokens_per_expert: Tensor,
         *,
         trainable_weight: Tensor | None = None,
+        trainable_wgrad_out: Tensor | None = None,
         external_weight: Tensor | None = None,
         external_wgrad_out: Tensor | None = None,
     ) -> Tensor:
@@ -790,13 +800,20 @@ class GroupedLinear(nn.Module):
             )
 
         if external_weight is None:
-            # Ordinary EP and MoonEP use the standard one-segment autograd path.
-            # MoonEP captures its natural dW on the differentiable weight alias.
-            return group_gemm(hidden_states, trainable_weight, tokens_per_expert)
+            # Ordinary EP passes None and keeps allocation-return autograd. MoonEP
+            # passes a leaf Parameter plus a direct-output VMM WGrad target.
+            if trainable_wgrad_out is not None and not isinstance(trainable_weight, nn.Parameter):
+                raise TypeError("a direct-output trainable WGrad requires a leaf Parameter")
+            return group_gemm(
+                hidden_states,
+                trainable_weight,
+                tokens_per_expert,
+                grad_weight_out=trainable_wgrad_out,
+            )
 
         # The only real two-allocation caller is UltraEP. Its external weight
         # and WGrad tensors may have different expert strides and dtypes.
-        assert external_wgrad_out is not None
+        assert trainable_wgrad_out is None and external_wgrad_out is not None
         return _TwoSegmentGroupedLinear.apply(
             hidden_states,
             trainable_weight,
@@ -810,8 +827,8 @@ class TileWiseFloat8GroupedLinear(nn.Module):
     """Existing FP8 Module implementing the same caller Interface directly.
 
     Ordinary EP may receive an FSDP-prequantized weight. MoonEP deliberately
-    supplies a BF16 local [2B] alias; this Adapter dynamically quantizes it and
-    natural autograd still returns BF16 dW to _ExpertWeightAutograd.
+    supplies a BF16 local leaf Parameter; this Adapter dynamically quantizes it
+    and writes BF16 dW directly to the same optional target as the BF16 Adapter.
     """
 
     weight: nn.Parameter
@@ -822,6 +839,7 @@ class TileWiseFloat8GroupedLinear(nn.Module):
         tokens_per_expert: Tensor,
         *,
         trainable_weight: Tensor | None = None,
+        trainable_wgrad_out: Tensor | None = None,
         external_weight: Tensor | None = None,
         external_wgrad_out: Tensor | None = None,
     ) -> Tensor:
@@ -831,10 +849,13 @@ class TileWiseFloat8GroupedLinear(nn.Module):
             raise RuntimeError("UltraEP FP8 is not supported")
         if trainable_weight is None:
             trainable_weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+        if trainable_wgrad_out is not None and not isinstance(trainable_weight, nn.Parameter):
+            raise TypeError("a direct-output trainable WGrad requires a leaf Parameter")
         return tilewise_fp8_group_gemm(
             hidden_states,
             trainable_weight,
             tokens_per_expert,
+            grad_weight_out=trainable_wgrad_out,
         )
 
 
@@ -861,6 +882,10 @@ class MoEBlock(nn.Module):
     ) -> Tensor:
         trainable_w1w3 = None if weight_layout.trainable_weights is None else weight_layout.trainable_weights[0]
         trainable_w2 = None if weight_layout.trainable_weights is None else weight_layout.trainable_weights[1]
+        trainable_dw1w3 = (
+            None if weight_layout.trainable_wgrad_outs is None else weight_layout.trainable_wgrad_outs[0]
+        )
+        trainable_dw2 = None if weight_layout.trainable_wgrad_outs is None else weight_layout.trainable_wgrad_outs[1]
         external_w1w3 = None if weight_layout.external_weights is None else weight_layout.external_weights[0]
         external_w2 = None if weight_layout.external_weights is None else weight_layout.external_weights[1]
         external_dw1w3 = None if weight_layout.external_wgrad_outs is None else weight_layout.external_wgrad_outs[0]
@@ -870,6 +895,7 @@ class MoEBlock(nn.Module):
             hidden_states,
             tokens_per_expert,
             trainable_weight=trainable_w1w3,
+            trainable_wgrad_out=trainable_dw1w3,
             external_weight=external_w1w3,
             external_wgrad_out=external_dw1w3,
         )
@@ -877,6 +903,7 @@ class MoEBlock(nn.Module):
             self.moe_act(gate_up),
             tokens_per_expert,
             trainable_weight=trainable_w2,
+            trainable_wgrad_out=trainable_dw2,
             external_weight=external_w2,
             external_wgrad_out=external_dw2,
         )
@@ -1225,9 +1252,41 @@ def create_moonep_invocation(
 
 def materialize_moonep_local_tensors(
     invocation: _MoonEPInvocation,
-) -> tuple[Tensor, Tensor, ProjectionPair]:
-    """Return local activations/counts and weights wrapped by _ExpertWeightAutograd。"""
+) -> tuple[Tensor, Tensor, ProjectionPair, ProjectionPair, tuple[nn.Parameter, nn.Parameter]]:
+    """Return activations/counts, local weights, WGrad targets, and FSDP leaves。"""
     ...
+
+
+def complete_moonep_duplicate_gradients(
+    invocation: _MoonEPInvocation,
+    local_grads: ProjectionPair,
+) -> ProjectionPair:
+    """Exact-SUM duplicated VMM targets into the two home-expert gradients。"""
+    ...
+
+
+def accumulate_fsdp_unsharded_expert_gradients(
+    parameters: tuple[nn.Parameter, nn.Parameter],
+    local_gradients: ProjectionPair,
+) -> None:
+    """Transfer first-producer storage; accumulate later Domino producers。"""
+    with torch.no_grad():
+        for parameter, local_gradient in zip(parameters, local_gradients, strict=True):
+            if isinstance(parameter, DTensor):
+                gradient: Tensor = DTensor.from_local(
+                    local_gradient,
+                    parameter.device_mesh,
+                    parameter.placements,
+                    run_check=False,
+                    shape=parameter.shape,
+                    stride=parameter.stride(),
+                )
+            else:
+                gradient = local_gradient
+            if parameter.grad is None:
+                parameter.grad = gradient
+            else:
+                parameter.grad.add_(gradient)
 
 
 def validate_moonep_fsdp_config(fsdp_config: Any) -> None: ...
@@ -1332,12 +1391,15 @@ def group_gemm(
     x: Tensor,
     weight: Tensor,
     tokens_per_expert: Tensor,
+    *,
+    grad_weight_out: Tensor | None = None,
 ) -> Tensor:
-    """Selected standard one-segment Adapter with natural autograd WGrad.
+    """Selected one-segment Adapter with two Parameter accumulation paths.
 
-    Triton and CUTLASS keep their existing allocation-return contract. TileWise
-    FP8 stays behind its own GroupedLinear Implementation because its raw op also
-    consumes quantization scales.
+    ``None`` preserves allocation-return WGrad. Otherwise backward completely
+    overwrites and returns ``grad_weight_out``. If no other Tensor reference is
+    retained, AccumulateGrad steals that storage; otherwise it copies into
+    Parameter.grad while the original target remains valid for MoonEP completion.
     """
     ...
 
@@ -1346,11 +1408,14 @@ def tilewise_fp8_group_gemm(
     x: Tensor,
     weight: Tensor,
     tokens_per_expert: Tensor,
+    *,
+    grad_weight_out: Tensor | None = None,
 ) -> Tensor:
-    """Hide dynamic block quant/scales and return natural BF16 dW.
+    """Hide dynamic block quant/scales and optionally direct-write BF16 dW.
 
-    ``weight`` may be an ordinary prequantized FSDP value or MoonEP's BF16
-    local [2B] override. UltraEP external segments are rejected at build time.
+    ``weight`` may be an ordinary prequantized FSDP value or MoonEP's BF16 local
+    leaf Parameter. The dynamic-quant autograd node clears its target reference
+    before returning dW so AccumulateGrad can take the no-copy path.
     """
     ...
 
@@ -1411,8 +1476,10 @@ def close_other_engine_resources(engine: TrainEngine) -> None: ...
 # - UltraEP v1 rejects a second same-layer call before shared storage is overwritten;
 # - each backend only enables Domino/MTP/reentrant paths declared by its capability boundary;
 # - runtimes do not retain the full model/config, and close releases registered projections;
-# - ordinary and MoonEP BF16 GMM paths use the same three-argument Interface;
-# - MoonEP FP8 dynamically quantizes a BF16 local override and returns natural BF16 dW,
+# - ordinary and MoonEP BF16 GMM paths differ only by optional WGrad storage;
+# - no retained target alias gives Parameter.grad the same pointer; a retained alias
+#   triggers the standard copy path without a second MoonEP copy;
+# - MoonEP FP8 dynamically quantizes a BF16 local Parameter and direct-writes BF16 dW,
 #   or rejects the configuration before resource/FSDP mutation;
 # - ordinary FP8/CUTLASS paths still use their natural autograd WGrad;
 # - UltraEP v1 rejects FP8 rather than exposing quantization metadata to Dispatcher;

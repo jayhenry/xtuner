@@ -165,6 +165,7 @@ class GroupedLinear(nn.Module):
         tokens_per_expert: torch.Tensor,
         *,
         trainable_weight: torch.Tensor | None = None,
+        trainable_wgrad_out: torch.Tensor | None = None,
         external_weight: torch.Tensor | None = None,
         external_wgrad_out: torch.Tensor | None = None,
     ):
@@ -178,7 +179,9 @@ class GroupedLinear(nn.Module):
             weight = weight.view(-1, self.local_out_features, self.local_in_features)
         else:
             weight = trainable_weight
-        out = group_gemm(x, weight, tokens_per_expert)
+        if trainable_wgrad_out is not None and not isinstance(weight, nn.Parameter):
+            raise TypeError("a preallocated trainable WGrad requires a leaf Parameter weight")
+        out = group_gemm(x, weight, tokens_per_expert, grad_weight_out=trainable_wgrad_out)
 
         if self.moe_bias:
             bias = self.bias.to_local() if isinstance(self.bias, DTensor) else self.bias

@@ -14,7 +14,7 @@ from xtuner.v1.float8.float8_tensor import Float8Tensor, ScalingGranularity
 from xtuner.v1.float8.float8_utils import EPS, to_fp8_saturated
 from xtuner.v1.float8.fsdp_utils import WeightWithDynamicTilewiseFloat8CastTensor
 from xtuner.v1.float8.triton_kernels import per_tile_quant
-from xtuner.v1.ops.moe.cuda.triton_kernels import k_grouped_gemm
+from xtuner.v1.ops.moe.cuda.triton_kernels import k_grouped_gemm, k_grouped_gemm_out
 from xtuner.v1.utils.interleaved_shard import InterleavedShard
 
 
@@ -80,12 +80,14 @@ class weight_to_per_block_float8_dynamic(torch.autograd.Function):
 
 class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w_fp8, tokens_per_expert):
+    def forward(ctx, x, w_fp8, tokens_per_expert, grad_weight_out=None):
         seq = x.shape[0]
         dout = w_fp8.shape[1]
         ctx.zero_token_dispatch = seq == 0
         ctx.input_shape = x.shape
         ctx.weight_shape = w_fp8.shape
+        ctx.grad_weight_out = grad_weight_out
+        ctx.tokens_per_expert = tokens_per_expert
 
         if ctx.zero_token_dispatch:
             return x.new_empty((seq, dout))
@@ -102,14 +104,21 @@ class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
     def backward(ctx, grad_output_hp):
         if ctx.zero_token_dispatch:
             dx = grad_output_hp.new_empty(ctx.input_shape)
-            dw = grad_output_hp.new_zeros(ctx.weight_shape)
-            return dx, dw, None
+            grad_weight_out = ctx.grad_weight_out
+            if grad_weight_out is not None:
+                k_grouped_gemm_out(grad_output_hp, dx, ctx.tokens_per_expert, grad_weight_out)
+                dw = grad_weight_out
+                ctx.grad_weight_out = None
+            else:
+                dw = grad_output_hp.new_zeros(ctx.weight_shape)
+            return dx, dw, None, None
 
         (
             x,
             w_fp8,
             tokens_per_expert,
         ) = ctx.saved_tensors
+        grad_weight_out = ctx.grad_weight_out
 
         grad_out_fp8, grad_out_scale = per_tile_quant(grad_output_hp)
         dx = m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(
@@ -124,9 +133,14 @@ class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
         # AdaptiveGEMM's FP8 WGrad launcher is not valid for all production
         # projection shapes/SM counts. BF16 WGrad is also the numerically safer
         # accumulation path and preserves the standard natural-dW contract.
-        dw = k_grouped_gemm(grad_output_hp.contiguous(), x, tokens_per_expert)
+        if grad_weight_out is None:
+            dw = k_grouped_gemm(grad_output_hp.contiguous(), x, tokens_per_expert)
+        else:
+            k_grouped_gemm_out(grad_output_hp.contiguous(), x, tokens_per_expert, grad_weight_out)
+            dw = grad_weight_out
+            ctx.grad_weight_out = None
 
-        return dx, dw, None
+        return dx, dw, None, None
 
 
 # Use torch._dynamo.allow_in_graph to allow the fwd out is a Float8Tensor but the
@@ -335,6 +349,7 @@ class TileWiseFloat8GroupedLinear(torch.nn.Module):
         tokens_per_expert: torch.Tensor,
         *,
         trainable_weight: torch.Tensor | None = None,
+        trainable_wgrad_out: torch.Tensor | None = None,
         external_weight: torch.Tensor | None = None,
         external_wgrad_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -358,6 +373,8 @@ class TileWiseFloat8GroupedLinear(torch.nn.Module):
         else:
             # MoonEP supplies a BF16 differentiable local [2B] alias. Quantize
             # it per invocation; backward remains an identity to BF16 dW.
+            if trainable_wgrad_out is not None and not isinstance(trainable_weight, nn.Parameter):
+                raise TypeError("a preallocated trainable WGrad requires a leaf Parameter weight")
             weight_fp8 = weight_to_per_block_float8_dynamic.apply(
                 trainable_weight,
                 torch.float8_e4m3fn,
@@ -367,7 +384,12 @@ class TileWiseFloat8GroupedLinear(torch.nn.Module):
         orig_shape = input.shape
         num_tokens = input.numel() // input.shape[-1]
         input = input.view(num_tokens, input.shape[-1])
-        out = fp8_gmm_weight_per_block_act_per_tile.apply(input, weight_fp8, tokens_per_expert)
+        out = fp8_gmm_weight_per_block_act_per_tile.apply(
+            input,
+            weight_fp8,
+            tokens_per_expert,
+            trainable_wgrad_out,
+        )
         out = out.view(*orig_shape[:-1], self.local_out_features)
         return out
 

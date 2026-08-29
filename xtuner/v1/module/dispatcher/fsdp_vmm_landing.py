@@ -140,11 +140,12 @@ def install_fsdp_vmm_landing(
     return tuple(item[0] for item in selected)
 
 
-def fsdp_current_unsharded_expert_weights(
+def fsdp_current_unsharded_expert_parameters(
     projections: tuple[nn.Module, nn.Module],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Read the already-unsharded BF16 expert views without starting an AG."""
-    current_weights: list[torch.Tensor] = []
+) -> tuple[nn.Parameter, nn.Parameter]:
+    """Return the current FSDP leaf Parameters without starting an
+    AllGather."""
+    current_parameters: list[nn.Parameter] = []
     for projection in projections:
         fsdp_param = getattr(projection, _FSDP_PARAM_ATTR, None)
         if fsdp_param is None:
@@ -154,12 +155,44 @@ def fsdp_current_unsharded_expert_weights(
         registered = getattr(fsdp_param._module_info.module, fsdp_param._module_info.param_name)
         if registered is not fsdp_param.unsharded_param:
             raise RuntimeError("MoonEP observed an unexpected FSDP Parameter switch")
+        if not isinstance(registered, nn.Parameter):
+            raise RuntimeError("MoonEP expected FSDP to expose an unsharded Parameter")
         local = registered.to_local() if isinstance(registered, DTensor) else registered
         landing = getattr(fsdp_param, _BINDING_ATTR)
         if local.data_ptr() != landing.data_ptr() or local.numel() != landing.numel():
             raise RuntimeError("MoonEP unsharded FSDP view no longer aliases its VMM landing")
-        current_weights.append(local.view_as(landing))
-    return current_weights[0], current_weights[1]
+        current_parameters.append(registered)
+    return current_parameters[0], current_parameters[1]
+
+
+def accumulate_fsdp_unsharded_expert_gradients(
+    parameters: tuple[nn.Parameter, nn.Parameter],
+    local_gradients: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """Hand completed home gradients to the Parameters consumed by FSDP."""
+    with torch.no_grad():
+        for parameter, local_gradient in zip(parameters, local_gradients, strict=True):
+            local_parameter = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+            local_gradient = local_gradient.reshape(local_parameter.shape)
+            if isinstance(parameter, DTensor):
+                gradient: torch.Tensor = DTensor.from_local(
+                    local_gradient,
+                    parameter.device_mesh,
+                    parameter.placements,
+                    run_check=False,
+                    shape=parameter.shape,
+                    stride=parameter.stride(),
+                )
+            else:
+                gradient = local_gradient
+
+            # The first producer transfers storage ownership without a copy;
+            # Domino's later producers use the same accumulation semantics as
+            # native AccumulateGrad.
+            if parameter.grad is None:
+                parameter.grad = gradient
+            else:
+                parameter.grad.add_(gradient)
 
 
 def uninstall_fsdp_vmm_landing(fsdp_params: tuple[FSDPParam, ...]) -> None:
@@ -190,7 +223,8 @@ def uninstall_fsdp_vmm_landing(fsdp_params: tuple[FSDPParam, ...]) -> None:
 
 
 __all__ = [
-    "fsdp_current_unsharded_expert_weights",
+    "accumulate_fsdp_unsharded_expert_gradients",
+    "fsdp_current_unsharded_expert_parameters",
     "install_fsdp_vmm_landing",
     "uninstall_fsdp_vmm_landing",
 ]

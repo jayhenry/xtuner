@@ -442,9 +442,9 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
                         while parent is not None:
                             ancestry.append(parent.name)
                             parent = parent.cpu_parent
-                        # A standard GMM naturally allocates local dW. MoonEP
-                        # may copy that result once into its symmetric reduce
-                        # slot, but no other full-dW materialization is valid.
+                        # Parameter-owned GMM WGrad lands directly in the VMM
+                        # slot. A copy here means the storage-stealing fast path
+                        # regressed or another full-dW materialization appeared.
                         if event.name == "aten::copy_" and "MoonEP::gradient_handoff" in ancestry:
                             full_dw_staging_copies += 1
                         else:
@@ -486,14 +486,14 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
         direct_copies, direct_dw_staging, direct_dw_materializations, direct_host_syncs, _ = profile_mode(False)
         assert staging_copies > 0  # Calibrates the shape-based copy detector.
         assert direct_copies == 0
-        assert direct_dw_staging > 0
+        assert direct_dw_staging == 0
         assert direct_dw_materializations == 0
         assert direct_host_syncs == [], direct_host_syncs
         combo_copies, combo_dw_staging, combo_dw_materializations, combo_host_syncs, combo_peak_bytes = profile_mode(
             False, mtp_micro2_sp4=True
         )
         assert combo_copies == 0
-        assert combo_dw_staging > 0
+        assert combo_dw_staging == 0
         assert combo_dw_materializations == 0
         assert combo_host_syncs == [], combo_host_syncs
         # The fixed tiny fallback measured 0.185 GiB/rank on H200; leave ample

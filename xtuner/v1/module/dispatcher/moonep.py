@@ -23,7 +23,8 @@ from xtuner.v1.utils import log_rank0
 
 from .base import ExpertWeightLayout, GenericDispatcher, PostDispatchResult, ProjectionPair
 from .fsdp_vmm_landing import (
-    fsdp_current_unsharded_expert_weights,
+    accumulate_fsdp_unsharded_expert_gradients,
+    fsdp_current_unsharded_expert_parameters,
     install_fsdp_vmm_landing,
     uninstall_fsdp_vmm_landing,
 )
@@ -266,7 +267,9 @@ class _MoonEPInvocation:
         self._plan: Any | None = None
         self._dispatch_done: Any | None = None
         self._combine_done: Any | None = None
-        self._gradient_targets: ProjectionPair | None = None
+        self._fallback_gradient_targets: ProjectionPair | None = None
+        self._home_parameters: tuple[nn.Parameter, nn.Parameter] | None = None
+        self._local_gradient_parameters: list[nn.Parameter | None] = [None, None]
 
     def dispatch(
         self,
@@ -292,29 +295,31 @@ class _MoonEPInvocation:
             _moonep_invocation=self,
         )
 
-    def _current_home_weights(self) -> ProjectionPair:
-        """Return this layer's current FSDP views, staging only by request."""
+    def _current_home_parameters(self) -> tuple[nn.Parameter, nn.Parameter]:
+        """Return current FSDP leaves, staging their values only by request."""
         layer_fqn, projections = self._runtime._layers[self._layer_id]
         if not self._runtime._staging_reference:
-            return fsdp_current_unsharded_expert_weights(projections)
+            return fsdp_current_unsharded_expert_parameters(projections)
 
         workspace = self._runtime._workspace
         assert workspace is not None
         landings = workspace.landing(self._layer_id % 2)
-        sources: list[torch.Tensor] = []
+        parameters: list[nn.Parameter] = []
         for linear, landing in zip(
             projections,
             landings,
             strict=True,
         ):
             weight = cast(torch.Tensor, linear.weight)
+            if not isinstance(weight, nn.Parameter):
+                raise RuntimeError(f"{layer_fqn} staging expected an unsharded expert Parameter")
             source = weight.to_local() if isinstance(weight, DTensor) else weight
             if source.dtype is not torch.bfloat16 or source.numel() != landing.numel():
                 raise RuntimeError(f"{layer_fqn} staging expected an unsharded BF16 expert weight")
             with torch.no_grad():
                 landing.copy_(source.view_as(landing))
-            sources.append(source)
-        return sources[0], sources[1]
+            parameters.append(weight)
+        return parameters[0], parameters[1]
 
     def prepare_experts(
         self,
@@ -328,18 +333,17 @@ class _MoonEPInvocation:
         buffer = runtime._buffer
         assert workspace is not None and buffer is not None and self._plan is not None
 
-        # FSDP has exposed differentiable BF16 unsharded views at this point.
-        # Staging copies their values but keeps the source tensors as the
-        # native FSDP gradient edge.
+        # FSDP has exposed its BF16 unsharded Parameters at this point.
+        # Staging changes only how their values reach the MoonEP workspace;
+        # completed home gradients are handed back before FSDP post-backward.
         with torch.profiler.record_function("MoonEP::prepare_experts"):
-            home_weights = self._current_home_weights()
+            home_parameters = self._current_home_parameters()
             local_weights, gradient_targets, weights_ready = workspace.materialize(
                 buffer=buffer,
                 plan=self._plan,
                 generation=self._layer_id % 2,
                 grad_slot=self._grad_slot,
             )
-            self._gradient_targets = gradient_targets
             # async_op=True leaves dispatch on MoonEP's comm stream. Its event
             # is a device dependency (never a host wait) that makes cu_seqlens
             # safe before deriving local grouped-GEMM counts.
@@ -365,17 +369,32 @@ class _MoonEPInvocation:
                 )
             )
             weights_ready.wait()
-        differentiable_weights = _ExpertWeightAutograd.apply(
-            home_weights[0],
-            home_weights[1],
-            local_weights[0],
-            local_weights[1],
-            self,
-        )
+        trainable_wgrad_outs: ProjectionPair | None = None
+        if torch.is_grad_enabled():
+            # A leaf Parameter lets AccumulateGrad steal the preallocated VMM
+            # WGrad target. The post-accumulate hooks then complete both fused
+            # projections as one MoonEP transaction before FSDP post-backward.
+            differentiable_weights = (
+                nn.Parameter(local_weights[0]),
+                nn.Parameter(local_weights[1]),
+            )
+            self._home_parameters = home_parameters
+            for projection, parameter in enumerate(differentiable_weights):
+                parameter.register_post_accumulate_grad_hook(
+                    lambda completed_parameter, projection=projection: self._record_parameter_gradient(
+                        projection, completed_parameter
+                    )
+                )
+            trainable_wgrad_outs = gradient_targets
+        else:
+            differentiable_weights = local_weights
         return MoonEPPostDispatchResult(
             hidden_states=hidden_states,
             tokens_per_expert=local_counts,
-            expert_weight_layout=ExpertWeightLayout(trainable_weights=differentiable_weights),
+            expert_weight_layout=ExpertWeightLayout(
+                trainable_weights=differentiable_weights,
+                trainable_wgrad_outs=trainable_wgrad_outs,
+            ),
         )
 
     def combine(self, expert_output: torch.Tensor, route_weights: torch.Tensor, *, async_op: bool) -> torch.Tensor:
@@ -391,7 +410,9 @@ class _MoonEPInvocation:
         self._plan = None
         self._dispatch_done = None
         self._combine_done = None
-        self._gradient_targets = None
+        self._fallback_gradient_targets = None
+        self._home_parameters = None
+        self._local_gradient_parameters = [None, None]
 
     def _dispatch_backward(
         self,
@@ -428,13 +449,22 @@ class _MoonEPInvocation:
 
             # The pre-backward AllGather has restored this generation before
             # duplicated weights are replayed.
-            self._current_home_weights()
-            _, _, replay_done = workspace.materialize(
+            replay_home_parameters = self._current_home_parameters()
+            if self._home_parameters is not None and any(
+                replay is not forward
+                for replay, forward in zip(replay_home_parameters, self._home_parameters, strict=True)
+            ):
+                raise RuntimeError("MoonEP backward observed a different FSDP unsharded Parameter")
+            _, fallback_gradient_targets, replay_done = workspace.materialize(
                 buffer=runtime._buffer,
                 plan=self._plan,
                 generation=self._layer_id % 2,
                 grad_slot=self._grad_slot,
             )
+            # These are fresh Tensor objects aliasing the same VMM slot as the
+            # forward targets. Keeping them does not increase the reference
+            # count that controls AccumulateGrad's storage-stealing fast path.
+            self._fallback_gradient_targets = fallback_gradient_targets
             dispatch_done.wait()
         return grad_weighted, replay_done
 
@@ -442,22 +472,44 @@ class _MoonEPInvocation:
         """Return duplicated BF16 partials before FSDP ReduceScatter."""
         runtime = self._runtime
         assert self._plan is not None and runtime._buffer is not None and runtime._workspace is not None
-        assert self._gradient_targets is not None
+        assert self._fallback_gradient_targets is not None
         with torch.profiler.record_function("MoonEP::gradient_handoff"):
-            # Standard one-segment GMMs own their natural dW allocation. Stage
-            # that result into MoonEP's symmetric reduction slot privately;
-            # the grouped-linear and op interfaces remain backend-neutral.
-            for source, target in zip(local_grads, self._gradient_targets):
-                target.copy_(source)
+            reduction_grads: list[torch.Tensor] = []
+            for source, target in zip(local_grads, self._fallback_gradient_targets, strict=True):
+                if source.data_ptr() == target.data_ptr():
+                    reduction_grads.append(source)
+                else:
+                    # Extra references can force AccumulateGrad to copy the
+                    # direct-output target into Parameter.grad. The original
+                    # target is already complete, so reduce it without a
+                    # second full-gradient copy.
+                    reduction_grads.append(target)
             home_grads, done = runtime._workspace.complete_gradients(
                 buffer=runtime._buffer,
                 plan=self._plan,
-                local_grads=self._gradient_targets,
+                local_grads=tuple(reduction_grads),
                 grad_slot=self._grad_slot,
             )
             done.wait()
-        self._gradient_targets = None
+        self._fallback_gradient_targets = None
         return home_grads
+
+    def _record_parameter_gradient(self, projection: int, parameter: nn.Parameter) -> None:
+        if parameter.grad is None:
+            raise RuntimeError("MoonEP local expert Parameter completed without a gradient")
+        self._local_gradient_parameters[projection] = parameter
+        if any(item is None for item in self._local_gradient_parameters):
+            return
+
+        local_parameters = cast(list[nn.Parameter], self._local_gradient_parameters)
+        local_grads = cast(ProjectionPair, tuple(parameter.grad for parameter in local_parameters))
+        assert self._home_parameters is not None and all(gradient is not None for gradient in local_grads)
+        home_grads = self._complete_weight_gradients(local_grads)
+        accumulate_fsdp_unsharded_expert_gradients(self._home_parameters, home_grads)
+        for local_parameter in local_parameters:
+            local_parameter.grad = None
+        self._home_parameters = None
+        self._local_gradient_parameters = [None, None]
 
 
 class _DispatchAutograd(torch.autograd.Function):
@@ -548,38 +600,6 @@ class _CombineAutograd(torch.autograd.Function):
         # The next autograd node immediately reads duplicated weights.
         replay_done.wait()
         return grad_expert, grad_route_weights, None, None
-
-
-class _ExpertWeightAutograd(torch.autograd.Function):
-    """Complete two local-[2B] weight gradients as one FSDP transaction."""
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        home_w1w3: torch.Tensor,
-        home_w2: torch.Tensor,
-        local_w1w3: torch.Tensor,
-        local_w2: torch.Tensor,
-        invocation: _MoonEPInvocation,
-    ) -> ProjectionPair:
-        ctx.invocation = invocation
-        ctx.home_shapes = home_w1w3.shape, home_w2.shape
-        return local_w1w3.view_as(local_w1w3), local_w2.view_as(local_w2)
-
-    @staticmethod
-    def backward(
-        ctx: Any,
-        grad_local_w1w3: torch.Tensor,
-        grad_local_w2: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, None, None, None]:
-        home_w1w3_grad, home_w2_grad = ctx.invocation._complete_weight_gradients((grad_local_w1w3, grad_local_w2))
-        return (
-            home_w1w3_grad.reshape(ctx.home_shapes[0]),
-            home_w2_grad.reshape(ctx.home_shapes[1]),
-            None,
-            None,
-            None,
-        )
 
 
 class MoonEPDispatcher(

@@ -6,6 +6,7 @@ TestGroupedLinearFactory
 
 import pytest
 import torch
+from torch import nn
 
 from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 from xtuner.v1.float8.float8_gmm_tile_wise import ADAPTIVEGEMM_INSTALLED, TileWiseFloat8GroupedLinear
@@ -88,6 +89,33 @@ def test_grouped_linear_returns_natural_gradient_for_call_local_weight() -> None
     torch.testing.assert_close(override.grad, override_ref.grad, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_grouped_linear_parameter_owns_preallocated_gradient() -> None:
+    layer = GroupedLinear(in_features=128, out_features=128, num_routed_experts=2).cuda().bfloat16()
+    override = nn.Parameter(torch.randn(2, 128, 128, device="cuda", dtype=torch.bfloat16))
+    target_storage = torch.empty_like(override)
+    target = target_storage.new_empty(0).set_(
+        target_storage.untyped_storage(),
+        target_storage.storage_offset(),
+        target_storage.shape,
+        target_storage.stride(),
+    )
+    hidden_states = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    counts = torch.tensor([2, 2], device="cuda", dtype=torch.int32)
+
+    output = layer(
+        hidden_states,
+        counts,
+        trainable_weight=override,
+        trainable_wgrad_out=target,
+    )
+    del target
+    output.sum().backward()
+
+    assert override.grad is not None
+    assert override.grad.data_ptr() == target_storage.data_ptr()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not ADAPTIVEGEMM_INSTALLED, reason="requires H100+ and adaptive_gemm"
 )
@@ -103,13 +131,26 @@ def test_fp8_grouped_linear_dynamically_quantizes_call_local_bf16_weight() -> No
         .bfloat16()
     )
     original_parameter = layer.weight
-    override = torch.randn(3, 2048, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    override = nn.Parameter(torch.randn(3, 2048, 512, device="cuda", dtype=torch.bfloat16))
+    target_storage = torch.empty_like(override)
+    target = target_storage.new_empty(0).set_(
+        target_storage.untyped_storage(),
+        target_storage.storage_offset(),
+        target_storage.shape,
+        target_storage.stride(),
+    )
     hidden_states = torch.randn(4, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     counts = torch.tensor([2, 0, 2], device="cuda", dtype=torch.int32)
     override_ref = override.detach().clone().requires_grad_()
     hidden_states_ref = hidden_states.detach().clone().requires_grad_()
 
-    output = layer(hidden_states, counts, trainable_weight=override)
+    output = layer(
+        hidden_states,
+        counts,
+        trainable_weight=override,
+        trainable_wgrad_out=target,
+    )
+    del target
     expected = torch.cat(
         (
             hidden_states_ref[:2] @ override_ref[0].T,
@@ -123,6 +164,7 @@ def test_fp8_grouped_linear_dynamically_quantizes_call_local_bf16_weight() -> No
     assert layer.weight is original_parameter
     assert original_parameter.grad is None
     assert override.grad is not None and override.grad.dtype is torch.bfloat16
+    assert override.grad.data_ptr() == target_storage.data_ptr()
     for actual, reference in (
         (output, expected),
         (hidden_states.grad, hidden_states_ref.grad),

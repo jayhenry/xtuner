@@ -786,3 +786,37 @@ flowchart LR
 ```
 
 该修复保持 checkpoint global-coordinate format、shared-memory staging 和 process writer 不变，也不让 planner 持有 model、DTensor 或 ProcessGroup；它只把必须在训练 PG 存活时解析的 layout 提前到正确的生命周期边界。
+
+# 2026-08-29_EP扩展重构-08-Parameter梯度NoCopy
+
+完成 MoonEP WGrad ownership 调整：local `[2B]` weights 改为 call-local leaf `Parameter`，BF16 Triton、BF16 CUTLASS 与 TileWise FP8 都可将 WGrad 直接覆盖到 invocation 的 VMM target。生产路径由 `AccumulateGrad` 接管同一 storage，不再分配 natural dW 或执行 symmetric-slot staging；保留额外 target 引用时仍遵循 PyTorch 标准 copy 路径，MoonEP 直接消费原 target，避免第二次回拷。
+
+## 开发与测试记录
+
+- CPU 与 CUDA 最小复现均实锤引用计数条件：释放调用端 target alias 时 `Parameter.grad.data_ptr() == target.data_ptr()`；保留 alias 时指针不同且数值完全一致。CUDA eager 与 `torch.compile(fullgraph=True)` 结果一致。
+- `ExpertWeightLayout` 只增加成对的 `trainable_wgrad_outs`，未新增 invocation、schedule 或 operator capability entity；已有 `_ExpertWeightAutograd` 被删除，两个 leaf Parameter 的 post-accumulate hooks 直接回调 `_MoonEPInvocation`。
+- Triton 恢复同 launcher 的 direct-output entry；CUTLASS 增加声明 mutable output 的 custom op，并继续使用 device counts/problem builder；FP8 FWD/DGrad 保持 AdaptiveGEMM，BF16 WGrad 使用 Triton direct-output entry，dynamic-quant node 在返回前释放 target 引用。
+- 真实空 batch 复现确认 CUTLASS raw backend 可处理 `M=0`，因此删除旧 `matmul(w[0])` 旁路。Triton 的真实失败原因是零元素展开梯度仍先检查 stride；将 `K==0` 完整写零移到 stride 检查之前，两种 backend 的 empty expert、`M=0`、eager/compile 均通过。
+- 单卡 public GMM/GroupedLinear/FP8 矩阵：`21 passed`。其中显式覆盖 no-copy fast path、retained-reference copy path、zero-token full overwrite 和自然 allocation-return 回归。
+- 8×H200、BF16 FSDP2×EP4、`torch.compile` 两步 MoonEP/DeepEP 数值回归：`1 passed`。
+- 8×H200、TileWise FP8 FWD/DGrad + BF16 direct-output WGrad 两步 loss/grad-norm 回归：`1 passed`。
+- 8×H200、CUTLASS FWD/DGrad/direct-output WGrad 两步 MoonEP/DeepEP 数值回归：`1 passed`。
+- 8×H200 profiler 覆盖 direct landing、普通 microbatch、MTP 双 microbatch + SP4：`1 passed`；完整 home-weight copy、local `[2B]` dW staging/materialization 与 MoonEP range 内 host sync 均为 `0`。
+
+```mermaid
+flowchart TD
+    A["Grouped GEMM backward"] --> B["Direct-write VMM WGrad target"]
+    B --> C{"Forward target alias retained?"}
+    C -- "no" --> D["AccumulateGrad storage steal<br/>no-copy fast path"]
+    C -- "yes" --> E["AccumulateGrad standard copy path"]
+    E --> F["Use already-complete original target<br/>no second copy"]
+    D --> G["Two Parameter post hooks"]
+    F --> G
+    G --> H["MoonEP duplicate exact SUM"]
+    H --> I["FSDP unsharded Parameter.grad"]
+    I --> J["FSDP ReduceScatter"]
+```
+
+接口统一在 storage ownership，而不是 kernel metadata：普通 EP 传 `grad_weight_out=None`，保持自然 autograd；MoonEP 传 leaf Parameter 与 target；UltraEP 继续使用真正需要双 allocation/mixed-dtype output 的 two-segment op。首次 MoonEP producer 直接把完成后的 home gradient 赋给 FSDP `.grad`，Domino 后续 producer 才原位累加，语义与 FSDP 的首个梯度接管/后续累加一致。
+
+本阶段删除了 `_ExpertWeightAutograd` 和旧 full-dW staging，不增加新的生命周期实体；no-copy 已成为生产 profiler 门禁，copy fallback 由 public operator behavior test 固化。下一步在新输出目录执行完整 BF16、FP8、CUTLASS、persistence 与正式训练验收，并把最终结果补入验收文档。

@@ -22,6 +22,7 @@ class ExpertWeightLayout(NamedTuple):
     """Call-local expert weight ownership at the dispatcher/MLP seam."""
 
     trainable_weights: ProjectionPair | None = None
+    trainable_wgrad_outs: ProjectionPair | None = None
     external_weights: ProjectionPair | None = None
     external_wgrad_outs: ProjectionPair | None = None
 
