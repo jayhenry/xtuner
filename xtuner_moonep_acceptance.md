@@ -206,3 +206,138 @@ PYTHONPATH=. python -m xtuner._testing.moonep_acceptance compare \
 ## 最终结论
 
 MoonEP dispatcher 已在真实 Qwen3.5 SFT 上满足首版 Definition of Done：两组 20-step 数值门禁和 95% 吞吐门禁全部通过，Direct FSDP-to-VMM 路径保持 BF16 计算/通信、FP32 shard optimizer 流程，并由 profiler 固化无完整权重 copy、无 full-dW temporary、MoonEP 热路径无 host sync。
+
+## 2026-08-29 Parameter 梯度 No-Copy 重构验收
+
+### 结论
+
+本轮重构验收通过。MoonEP 的 call-local expert weight 现为 leaf `Parameter`，grouped GEMM 可将 WGrad 直接写入 VMM target；生产路径由 `AccumulateGrad` 接管同一 storage，不再产生完整 local dW staging copy。真实 Qwen3.5-35B-A3B 的 MTP0/MTP1 两组 20-step 正式验收中，MoonEP 稳态吞吐分别为 DeepEP 的 `96.74%` 与 `97.10%`，全部 loss/grad-norm 曲线通过数值门禁。
+
+```mermaid
+flowchart LR
+    A["Parameter WGrad direct output"] --> B["No-copy and copy-fallback behavior tests"]
+    B --> C["BF16 Triton / CUTLASS / TileWise FP8"]
+    C --> D["8-GPU forward and persistence suites"]
+    D --> E["Qwen3.5 MTP0 and MTP1<br/>4 x 20 steps"]
+    E --> F["Throughput >= 95%"]
+    E --> G["Curve cosine >= 0.99<br/>mean relative diff < 1%"]
+    F --> H["PASS"]
+    G --> H
+```
+
+### 版本、环境与验收范围
+
+| 项目 | 验收值 |
+| --- | --- |
+| XTuner commit | `52c9705ad25320a88567364dc076332fefaa944f` |
+| MoonEP-mod commit | `c14bd43001efd8233950bb99e8eac9b1bafbdcc4` |
+| 实际 imported module | `/mnt/shared-storage-user/zhaopenghao/github/MoonEP-mod/moonep/__init__.py` |
+| Python / PyTorch / CUDA | `pt212_cu132` / `2.12.1+cu132` / `13.2` |
+| 硬件 | 同一节点 `8 x NVIDIA H200`，所有 GPU 测试均持有 8 卡文件锁 |
+| 正式模型与数据 | Qwen3.5-35B-A3B / Alpaca，真实 checkpoint，无 tiny fallback |
+| 正式训练 | BF16、FSDP2、EP4、TP1、SP1、micro1、global batch 8、hard/global pack 65536、20 steps、seed 0、`torch.compile` |
+| 正式性能算子 | BF16 Triton grouped GEMM；steps 6-20 计算吞吐中位数 |
+| 功能算子矩阵 | BF16 Triton、BF16 CUTLASS、TileWise FP8 FWD/DGrad + BF16 Triton WGrad |
+| 验收输出根目录 | `work_dirs/moonep_ep_extend_acceptance_nocopy_20260829` |
+
+四次正式运行的完整 config、环境、GPU 与版本记录分别位于：
+
+- `work_dirs/moonep_ep_extend_acceptance_nocopy_20260829/deepep_mtp0_pack65536/acceptance_manifest.json`
+- `work_dirs/moonep_ep_extend_acceptance_nocopy_20260829/moonep_mtp0_pack65536/acceptance_manifest.json`
+- `work_dirs/moonep_ep_extend_acceptance_nocopy_20260829/deepep_mtp1_pack65536/acceptance_manifest.json`
+- `work_dirs/moonep_ep_extend_acceptance_nocopy_20260829/moonep_mtp1_pack65536/acceptance_manifest.json`
+
+每一对运行仅切换 dispatcher；checkpoint、data order、packing、compile、dtype、grouped-GEMM backend 与有效 token 数保持一致。
+
+### 正式 20-step 数值与性能结果
+
+| Gate | DeepEP median tokens/s | MoonEP median tokens/s | MoonEP / DeepEP | 判定 |
+| --- | ---: | ---: | ---: | --- |
+| MTP0，steps 6-20 | 5962.276258 | 5767.752399 | 0.967374 | PASS |
+| MTP1，steps 6-20 | 5343.249998 | 5188.428713 | 0.971025 | PASS |
+
+| Gate / curve | Cosine similarity | Mean relative difference | Finite | 判定 |
+| --- | ---: | ---: | --- | --- |
+| MTP0 balancing loss | 0.999999918 | 0.033117% | 是 | PASS |
+| MTP0 LM loss | 0.999999976 | 0.015764% | 是 | PASS |
+| MTP0 total loss | 0.999999977 | 0.015077% | 是 | PASS |
+| MTP0 grad norm | 0.999999295 | 0.259798% | 是 | PASS |
+| MTP1 balancing loss | 0.999999874 | 0.043555% | 是 | PASS |
+| MTP1 LM loss | 0.999999959 | 0.023972% | 是 | PASS |
+| MTP1 MTP loss | 0.999999909 | 0.046970% | 是 | PASS |
+| MTP1 total loss | 0.999999966 | 0.022482% | 是 | PASS |
+| MTP1 grad norm | 0.999995169 | 0.726449% | 是 | PASS |
+
+机器判定原始结果为：
+
+- `work_dirs/moonep_ep_extend_acceptance_nocopy_20260829/mtp0_comparison.json`
+- `work_dirs/moonep_ep_extend_acceptance_nocopy_20260829/mtp1_comparison.json`
+
+两个比较器均以退出码 `0` 完成，`passed=true`。正式性能结论只覆盖 BF16 Triton；FP8 与 CUTLASS 是本轮新增的 public-op、编译和 8 卡端到端功能/数值验收，不据此声明正式吞吐。
+
+### Parameter 梯度存储语义
+
+```mermaid
+flowchart TD
+    A["Grouped GEMM backward"] --> B["Write invocation VMM WGrad target"]
+    B --> C{"Target TensorImpl has another owner?"}
+    C -- "No" --> D["AccumulateGrad steals storage<br/>Parameter.grad aliases target"]
+    C -- "Yes" --> E["PyTorch standard copy path"]
+    E --> F["Original target is already complete<br/>MoonEP adds no second copy"]
+    D --> G["Paired post-accumulate hooks"]
+    F --> G
+    G --> H["MoonEP duplicate completion"]
+    H --> I["Assign first FSDP grad producer"]
+    I --> J["Later Domino producers add in-place"]
+```
+
+- 无额外 target alias 时，CPU、CUDA eager 与 `torch.compile(fullgraph=True)` 均实测 `Parameter.grad.data_ptr() == target.data_ptr()`，即 no-copy 快路径。
+- 调用端保留额外 target alias 时，`AccumulateGrad` 按 PyTorch 标准语义复制到 `.grad`；原 VMM target 已包含完整 WGrad，MoonEP 直接消费它，不再执行第二次回拷。
+- 两块 fused projection 的 post-accumulate hooks 都到达后才触发 duplicated-gradient completion；第一个 microbatch 直接赋予 FSDP unsharded Parameter `.grad` storage，Domino 后续 producer 才执行 `add_`。
+- `_ExpertWeightAutograd` 已删除，未增加替代 invocation、schedule 或 capability 实体。普通 EP 传 `grad_weight_out=None` 并保持自然 allocation-return；MoonEP 才提供 caller-owned output storage。
+
+### Grouped GEMM 与完整回归
+
+| 路径 | FWD / DGrad | WGrad 与动态 EP 适配 | 验收结果 |
+| --- | --- | --- | --- |
+| BF16 Triton | 现有 one-segment kernel | 可选 direct-output；`M=0` 在 stride 检查前完整写零 | eager/compile/no-copy/copy fallback 通过 |
+| BF16 CUTLASS | raw grouped backend、device counts | mutable output custom op；支持 empty expert 与 `M=0` | eager/compile 与 8 卡训练通过 |
+| TileWise FP8 | AdaptiveGEMM 动态量化 FWD/DGrad | BF16 Triton direct-output WGrad；返回前释放 target alias | public op 与 8 卡训练通过 |
+| 普通/DeepEP | 所选标准算子 | `grad_weight_out=None`，自然返回 dW | 原行为回归通过 |
+
+| Suite | 结果 |
+| --- | --- |
+| public GMM / GroupedLinear / FP8 storage behavior | `21 passed` |
+| MoonEP 六阶段与 dispatcher contracts | `9 passed` |
+| 8 卡 BF16 MoonEP / DeepEP 两步数值回归 | `1 passed` |
+| 8 卡 TileWise FP8 两步 loss / grad-norm 回归 | `1 passed`，38.76s |
+| 8 卡 CUTLASS 两步 MoonEP / DeepEP 回归 | `1 passed`，36.19s |
+| direct、普通 microbatch、MTP micro2 + SP4 profiler | `1 passed`，41.82s |
+| Qwen / GLM、direct/staging、FP8、MTP、Domino、reentrant、shared expert、SP2/4/8 完整 forward suite | `17 passed`，513.96s |
+| DCP save/load、跨进程 async DCP、HF export、offload、optimizer 与 lifecycle | `10 passed`，308.14s |
+| Qwen3.5 正式 DeepEP/MoonEP x MTP0/MTP1 | `4 x 20 steps`，两个 compare 均 PASS |
+
+Profiler 校准后确认 production direct path 的完整 home-weight copy、local `[2B]` dW staging/materialization 与 MoonEP range 内 host sync 均为 `0`。这使 no-copy 从实现假设变为持续回归门禁。
+
+### 复现命令
+
+```bash
+tests/acceptance/run_qwen35_moonep_acceptance.sh deepep 0 65536 work_dirs/moonep_ep_extend_acceptance_nocopy_20260829
+tests/acceptance/run_qwen35_moonep_acceptance.sh moonep 0 65536 work_dirs/moonep_ep_extend_acceptance_nocopy_20260829
+tests/acceptance/run_qwen35_moonep_acceptance.sh deepep 1 65536 work_dirs/moonep_ep_extend_acceptance_nocopy_20260829
+tests/acceptance/run_qwen35_moonep_acceptance.sh moonep 1 65536 work_dirs/moonep_ep_extend_acceptance_nocopy_20260829
+
+PYTHONPATH=. python -m xtuner._testing.moonep_acceptance compare \
+  --deepep work_dirs/moonep_ep_extend_acceptance_nocopy_20260829/deepep_mtp0_pack65536 \
+  --moonep work_dirs/moonep_ep_extend_acceptance_nocopy_20260829/moonep_mtp0_pack65536 \
+  --output work_dirs/moonep_ep_extend_acceptance_nocopy_20260829/mtp0_comparison.json
+
+PYTHONPATH=. python -m xtuner._testing.moonep_acceptance compare \
+  --deepep work_dirs/moonep_ep_extend_acceptance_nocopy_20260829/deepep_mtp1_pack65536 \
+  --moonep work_dirs/moonep_ep_extend_acceptance_nocopy_20260829/moonep_mtp1_pack65536 \
+  --output work_dirs/moonep_ep_extend_acceptance_nocopy_20260829/mtp1_comparison.json
+```
+
+### 最终结论
+
+Parameter WGrad no-copy 重构已达到本轮 Definition of Done：统一 grouped GEMM caller-owned output storage 后，BF16 Triton、CUTLASS 与 TileWise FP8 可复用同一调用端；copy fallback 仍严格遵循 PyTorch Parameter 语义；完整 forward、持久化、profiler 和真实 Qwen3.5 MTP0/MTP1 门禁全部通过。历史首版结论中的 FP8 边界由本节的功能验收结果更新，但正式性能声明仍限定为 BF16 Triton。

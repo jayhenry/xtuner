@@ -820,3 +820,31 @@ flowchart TD
 接口统一在 storage ownership，而不是 kernel metadata：普通 EP 传 `grad_weight_out=None`，保持自然 autograd；MoonEP 传 leaf Parameter 与 target；UltraEP 继续使用真正需要双 allocation/mixed-dtype output 的 two-segment op。首次 MoonEP producer 直接把完成后的 home gradient 赋给 FSDP `.grad`，Domino 后续 producer 才原位累加，语义与 FSDP 的首个梯度接管/后续累加一致。
 
 本阶段删除了 `_ExpertWeightAutograd` 和旧 full-dW staging，不增加新的生命周期实体；no-copy 已成为生产 profiler 门禁，copy fallback 由 public operator behavior test 固化。下一步在新输出目录执行完整 BF16、FP8、CUTLASS、persistence 与正式训练验收，并把最终结果补入验收文档。
+
+# 2026-08-29_EP扩展重构-09-最终验收
+
+Parameter WGrad no-copy 方案完成最终验收。完整 forward 与 persistence suites、BF16/FP8/CUTLASS 两步训练、热路径 profiler 均通过；真实 Qwen3.5-35B-A3B 的 DeepEP/MoonEP x MTP0/MTP1 四组 20-step 训练全部完成，两个自动比较器均判定 PASS。
+
+## 验收记录
+
+- 实现版本为 XTuner `52c9705ad25320a88567364dc076332fefaa944f`、MoonEP-mod `c14bd43001efd8233950bb99e8eac9b1bafbdcc4`。
+- public GMM/GroupedLinear/FP8 storage behavior 为 `21 passed`，dispatcher contracts 为 `9 passed`。
+- 8 卡 BF16、TileWise FP8、CUTLASS 两步数值回归各 `1 passed`；profiler 覆盖 direct、普通 microbatch 与 MTP micro2 + SP4，完整 home-weight copy、local dW staging/materialization、MoonEP range 内 host sync 均为 `0`。
+- 完整 forward suite 为 `17 passed`，513.96s；DCP/HF/offload/optimizer/lifecycle suite 为 `10 passed`，308.14s。
+- MTP0 steps 6-20：DeepEP/MoonEP 中位吞吐为 `5962.276258/5767.752399` tokens/s，比值 `0.967374`；四条数值曲线全部通过。
+- MTP1 steps 6-20：DeepEP/MoonEP 中位吞吐为 `5343.249998/5188.428713` tokens/s，比值 `0.971025`；五条数值曲线全部通过。
+- 最大的 mean relative difference 是 MTP1 grad norm 的 `0.726449%`，仍低于 `1%`；全部 cosine similarity 均高于 `0.999995`。
+- 原始运行与机器判定保存在 `work_dirs/moonep_ep_extend_acceptance_nocopy_20260829`，完整结论已追加到 `xtuner_moonep_acceptance.md`。
+
+```mermaid
+flowchart LR
+    A["Parameter WGrad direct output"] --> B["Public storage behavior"]
+    B --> C["BF16 / FP8 / CUTLASS 8-GPU"]
+    C --> D["Forward + persistence + profiler"]
+    D --> E["Qwen3.5 MTP0<br/>ratio 0.967374"]
+    D --> F["Qwen3.5 MTP1<br/>ratio 0.971025"]
+    E --> G["Numerical and throughput PASS"]
+    F --> G
+```
+
+正式吞吐只声明 BF16 Triton；FP8 与 CUTLASS 在本轮完成的是 public-op、compile 和 8 卡端到端功能/数值验收。至此 no-copy 快路径、PyTorch 标准 copy fallback、FSDP handoff 与 Domino 后续累加都有真实行为测试和端到端门禁，重构达到本轮 Definition of Done。
