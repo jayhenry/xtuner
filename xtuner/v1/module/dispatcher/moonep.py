@@ -261,6 +261,9 @@ class MoonEPPreDispatchResult(TypedDict):
     hidden_states: torch.Tensor  # [S, H], BF16 source-token order.
     topk_ids: torch.Tensor  # [S, K], contiguous int32 global expert IDs.
     tokens_per_expert: torch.Tensor  # [E], contiguous int32 source histogram.
+    # The invocation is opaque control state for the remaining five stages;
+    # it never crosses into the compiled tensor-only expert block.
+    _moonep_invocation: _MoonEPLayerInvocation
 
 
 class MoonEPDispatchResult(TypedDict):
@@ -340,8 +343,8 @@ class _MoonEPLayerInvocation:
         # Current FSDP unsharded home Parameters [B, O_p, I_p] receive the
         # returned BF16 home gradients after both local projections complete.
         self._home_parameters: tuple[nn.Parameter, nn.Parameter] | None = None
-        self._local_gradient_parameters: list[nn.Parameter | None] = [None, None]
-        # TODO: 上面所有关键数据结构，加上形状和注释
+        # Completed home views and the event covering the pair reduction.
+        self._gradient_completion: tuple[ProjectionPair, torch.cuda.Event] | None = None
 
     def begin_dispatch(
         self,
@@ -353,7 +356,6 @@ class _MoonEPLayerInvocation:
         async_op: bool,
     ) -> MoonEPDispatchResult:
         """Create the activation autograd edge and start weight prefetch."""
-        # TODO: 这个函数改名 dispatch
         hidden_nvsh, weights_nvs, cu_seqlens = _DispatchAutograd.apply(
             hidden_states,
             topk_ids,
@@ -385,12 +387,10 @@ class _MoonEPLayerInvocation:
         )
 
     def finish_combine(self, combined: torch.Tensor, *, async_op: bool) -> torch.Tensor:
-        """Establish the final device dependency and finish no-grad calls."""
+        """Establish the final device dependency."""
         if async_op:
             assert self._combine_done is not None
             self._combine_done.wait()
-        if not torch.is_grad_enabled():
-            self._finish_forward_only()
         return combined
 
     def prepare_experts(self, dispatched: MoonEPDispatchResult) -> MoonEPPostDispatchResult:
@@ -424,28 +424,19 @@ class _MoonEPLayerInvocation:
         gradient_targets = self._gradient_targets
         self._local_weights = None
         self._gradient_targets = None
-        differentiable_weights: ProjectionPair
-        trainable_wgrad_outs: ProjectionPair | None = None
-        if torch.is_grad_enabled():
-            # Leaf Parameters let AccumulateGrad hand the preallocated VMM
-            # targets to grouped GEMM without a full-gradient copy.
-            differentiable_weights = (
-                nn.Parameter(local_weights[0]),
-                nn.Parameter(local_weights[1]),
-            )
-            for projection, parameter in enumerate(differentiable_weights):
-                parameter.register_post_accumulate_grad_hook(
-                    lambda completed, projection=projection: self._record_parameter_gradient(projection, completed)
-                )
-            trainable_wgrad_outs = gradient_targets
-        else:
-            differentiable_weights = local_weights
+        # Leaf Parameters make grouped GEMM compute dW. Its backward writes the
+        # pair directly into the VMM targets; Start consumes the replay aliases,
+        # so no AccumulateGrad hook or Parameter.grad handoff is required.
+        differentiable_weights: ProjectionPair = (
+            nn.Parameter(local_weights[0]),
+            nn.Parameter(local_weights[1]),
+        )
         return MoonEPPostDispatchResult(
             hidden_states=hidden_states,
             tokens_per_expert=local_counts,
             expert_weight_layout=ExpertWeightLayout(
                 trainable_weights=differentiable_weights,
-                trainable_wgrad_outs=trainable_wgrad_outs,
+                trainable_wgrad_outs=gradient_targets,
             ),
         )
 
@@ -593,7 +584,9 @@ class _MoonEPLayerInvocation:
             # FSDP pre-backward has restored this generation. Stage it before
             # dispatch's barrier, then replay remote weights on the same stream.
             replay_home_parameters = self._current_home_parameters()
-            if self._home_parameters is not None and any(
+            if self._home_parameters is None:
+                raise RuntimeError("MoonEP backward has no forward home Parameters")
+            if any(
                 replay is not forward
                 for replay, forward in zip(replay_home_parameters, self._home_parameters, strict=True)
             ):
@@ -624,66 +617,92 @@ class _MoonEPLayerInvocation:
             gradient_dispatch_done.wait()
         return grad_weighted, replay_done
 
-    def _complete_weight_gradients(self, local_grads: ProjectionPair) -> ProjectionPair:
+    def _start_gradient_completion(self) -> None:
+        """Enqueue the one pair reduction after both GMM backwards."""
+        if self._gradient_completion is not None:
+            raise RuntimeError("MoonEP gradient completion was started twice")
+        if self._plan is None or self._fallback_gradient_targets is None:
+            raise RuntimeError("MoonEP gradient completion has no plan/targets")
+        # Both grouped-GEMM backwards write these VMM slots before propagating
+        # activation gradients to Start. The fresh aliases share that storage
+        # without retaining the forward TensorImpl/version counters.
+        reduction_pair = self._fallback_gradient_targets
         runtime = self._runtime
         workspace = runtime._workspace
-        assert self._plan is not None and runtime._buffer is not None and workspace is not None
-        assert self._fallback_gradient_targets is not None
-        reduction_grads: list[torch.Tensor] = []
-        for source, target in zip(local_grads, self._fallback_gradient_targets, strict=True):
-            # AccumulateGrad may copy a direct-output target when extra Tensor
-            # references exist. The original VMM target already owns the dW.
-            reduction_grads.append(source if source.data_ptr() == target.data_ptr() else target)
+        buffer = runtime._buffer
+        if workspace is None or buffer is None:
+            raise RuntimeError("MoonEP gradient completion has no runtime workspace")
 
+        # Only the pair reduction is enqueued here.  The completion event is
+        # consumed later by ``_finish_gradient_completion`` on the caller's
+        # stream, so upstream backward can overlap the communication.
         with torch.profiler.record_function("MoonEP::gradient_handoff"):
             home_grads, done = runtime._enqueue(
                 lambda: workspace.complete_gradients(
-                    buffer=runtime._buffer,
+                    buffer=buffer,
                     plan=self._plan,
-                    local_grads=tuple(reduction_grads),
+                    local_grads=reduction_pair,
                     grad_slot=self._grad_slot,
                 ),
-                inputs=tuple(reduction_grads),
+                inputs=reduction_pair,
             )
-            # FSDP post-backward is downstream on the caller stream, so this
-            # device wait guarantees ReduceScatter sees the returned BF16 dW.
-            done.wait()
-        self._fallback_gradient_targets = None
-        return home_grads
+        self._gradient_completion = (home_grads, done)
 
-    def _record_parameter_gradient(
-        self,
-        projection: int,
-        parameter: nn.Parameter,
-    ) -> None:
-        if parameter.grad is None:
-            raise RuntimeError("MoonEP local expert Parameter completed without a gradient")
-        self._local_gradient_parameters[projection] = parameter
-        if any(item is None for item in self._local_gradient_parameters):
-            return
+    def _finish_gradient_completion(self) -> None:
+        """Wait on the device event and hand BF16 home grads to FSDP."""
+        completion = self._gradient_completion
+        if completion is None:
+            raise RuntimeError("MoonEP gradient completion was not started")
+        home_grads, done = completion
+        done.wait()
 
-        local_parameters = cast(list[nn.Parameter], self._local_gradient_parameters)
-        local_grads = cast(ProjectionPair, tuple(parameter.grad for parameter in local_parameters))
-        assert self._home_parameters is not None and all(gradient is not None for gradient in local_grads)
-        home_grads = self._complete_weight_gradients(local_grads)
+        if self._home_parameters is None:
+            raise RuntimeError("MoonEP gradient completion has no home Parameters")
         accumulate_fsdp_unsharded_expert_gradients(self._home_parameters, home_grads)
-        for local_parameter in local_parameters:
-            local_parameter.grad = None
-        self._home_parameters = None
-        self._local_gradient_parameters = [None, None]
 
-    def _finish_forward_only(self) -> None:
-        # Python ownership can be dropped after device waits are enqueued;
-        # route-dependent state is never queried or synchronized on the host.
-        self._plan = None
-        self._dispatch_done = None
-        self._weights_ready = None
-        self._combine_done = None
-        self._local_weights = None
-        self._gradient_targets = None
         self._fallback_gradient_targets = None
         self._home_parameters = None
-        self._local_gradient_parameters = [None, None]
+        self._gradient_completion = None
+
+
+class _MoonEPGradReduceStart(torch.autograd.Function):
+    """Identity edge whose backward starts duplicate-gradient transport."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        hidden_states: torch.Tensor,
+        invocation: _MoonEPLayerInvocation,
+    ) -> torch.Tensor:
+        ctx.invocation = invocation
+        return hidden_states
+
+    @staticmethod
+    def backward(ctx: Any, grad_hidden: torch.Tensor) -> tuple[torch.Tensor, None]:
+        # Only enqueue work here.  The current stream does not wait, allowing
+        # attention/router backward to overlap the MoonEP communication.
+        cast(_MoonEPLayerInvocation, ctx.invocation)._start_gradient_completion()
+        return grad_hidden, None
+
+
+class _MoonEPGradReduceJoin(torch.autograd.Function):
+    """Identity edge whose backward waits and hands home grads to FSDP."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        layer_input: torch.Tensor,
+        invocation: _MoonEPLayerInvocation,
+    ) -> torch.Tensor:
+        ctx.invocation = invocation
+        return layer_input
+
+    @staticmethod
+    def backward(ctx: Any, grad_input: torch.Tensor) -> tuple[torch.Tensor, None]:
+        # Event.wait inserts a dependency into the current CUDA stream; it does
+        # not block the Python host or poll event readiness.
+        cast(_MoonEPLayerInvocation, ctx.invocation)._finish_gradient_completion()
+        return grad_input, None
 
 
 class _DispatchAutograd(torch.autograd.Function):
@@ -789,6 +808,30 @@ class MoonEPDispatcher(
         self._generation = generation
         self._next_gradient_slot = 0
 
+    def _new_invocation(self) -> _MoonEPLayerInvocation:
+        """Allocate the next call-local slot and invocation token."""
+        grad_slot = self._next_gradient_slot
+        self._next_gradient_slot = (grad_slot + 1) % self._runtime._intra_layer_micro_batch
+        return _MoonEPLayerInvocation(
+            runtime=self._runtime,
+            layer_fqn=self._layer_fqn,
+            projections=self._projections,
+            generation=self._generation,
+            grad_slot=grad_slot,
+        )
+
+    @override
+    def prepare_layer_input(
+        self,
+        layer_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, object | None]:
+        """Create an invocation before attention/router backward is built."""
+        invocation = self._new_invocation()
+        # Join is an identity in forward and gives the invocation a stable
+        # autograd edge immediately before attention/router computation. Under
+        # no-grad, apply remains an identity without recording a backward node.
+        return _MoonEPGradReduceJoin.apply(layer_input, invocation), invocation
+
     @override
     def dispatch_preprocess(
         self,
@@ -797,14 +840,23 @@ class MoonEPDispatcher(
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         tokens_per_expert: torch.Tensor,
+        layer_state: object | None = None,
         async_op: bool = False,
     ) -> MoonEPPreDispatchResult:
         del topk_weights, async_op
+        if layer_state is None:
+            raise RuntimeError("MoonEP dispatch_preprocess requires layer_state from prepare_layer_input")
+        if not isinstance(layer_state, _MoonEPLayerInvocation):
+            raise TypeError("MoonEP layer_state must be a _MoonEPLayerInvocation")
         self._runtime._validate_tokens_per_rank(hidden_states.shape[0])
+        invocation = layer_state
+        # As with Join, outer no-grad suppresses the backward node naturally.
+        hidden_states = _MoonEPGradReduceStart.apply(hidden_states, invocation)
         return MoonEPPreDispatchResult(
             hidden_states=hidden_states,
             topk_ids=topk_ids.to(dtype=torch.int32).contiguous(),
             tokens_per_expert=tokens_per_expert.to(dtype=torch.int32).contiguous(),
+            _moonep_invocation=invocation,
         )
 
     @override
@@ -818,15 +870,7 @@ class MoonEPDispatcher(
     ) -> MoonEPDispatchResult:
         if decoding:
             raise NotImplementedError("MoonEP fixed-S training dispatch does not implement decoding")
-        grad_slot = self._next_gradient_slot
-        self._next_gradient_slot = (grad_slot + 1) % self._runtime._intra_layer_micro_batch
-        invocation = _MoonEPLayerInvocation(
-            runtime=self._runtime,
-            layer_fqn=self._layer_fqn,
-            projections=self._projections,
-            generation=self._generation,
-            grad_slot=grad_slot,
-        )
+        invocation = pre_dispatched["_moonep_invocation"]
         return invocation.begin_dispatch(
             hidden_states=pre_dispatched["hidden_states"],
             topk_ids=pre_dispatched["topk_ids"],

@@ -1,3 +1,4 @@
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -5,7 +6,12 @@ import torch
 from torch import nn
 
 from xtuner.v1.module.dispatcher import build_dispatcher
-from xtuner.v1.module.dispatcher.moonep import MoonEPDispatcher, MoonEPModelRuntime
+from xtuner.v1.module.dispatcher.moonep import (
+    MoonEPDispatcher,
+    MoonEPModelRuntime,
+    _MoonEPGradReduceJoin,
+    _MoonEPGradReduceStart,
+)
 
 
 class _Event:
@@ -168,7 +174,7 @@ def backend(monkeypatch):
     return module
 
 
-def test_staging_dispatcher_runs_the_public_six_stage_forward_seam(backend) -> None:
+def test_staging_dispatcher_runs_the_public_forward_path(backend) -> None:
     ep_group = SimpleNamespace(size=lambda: 2)
     runtime = MoonEPModelRuntime(
         ep_group=ep_group,
@@ -199,17 +205,20 @@ def test_staging_dispatcher_runs_the_public_six_stage_forward_seam(backend) -> N
     )
     runtime.install_after_fsdp(fsdp_root=experts)
 
-    hidden_states = torch.randn(3, 128, dtype=torch.bfloat16)
+    hidden_states = torch.randn(3, 128, dtype=torch.bfloat16, requires_grad=True)
     topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int64)
     source_counts = torch.tensor([1, 2, 2, 1], dtype=torch.int64)
     route_weights = torch.full((3, 2), 0.5, dtype=torch.float32)
 
     with torch.no_grad():
+        layer_input, layer_state = dispatcher.prepare_layer_input(hidden_states)
+        assert layer_input.grad_fn is None
         pre = dispatcher.dispatch_preprocess(
-            hidden_states=hidden_states,
+            hidden_states=layer_input,
             topk_ids=topk_ids,
             topk_weights=route_weights,
             tokens_per_expert=source_counts,
+            layer_state=layer_state,
         )
         dispatched = dispatcher.dispatch(pre_dispatched=pre, topk_weights=route_weights)
         assert runtime._buffer.prefetch_calls == 1
@@ -240,16 +249,33 @@ def test_staging_dispatcher_runs_the_public_six_stage_forward_seam(backend) -> N
     assert torch.equal(pre["tokens_per_expert"], source_counts.to(torch.int32))
     assert post["tokens_per_expert"].shape == (4,)
     assert post["expert_weight_layout"].trainable_weights is not None
+    assert all(isinstance(weight, nn.Parameter) for weight in post["expert_weight_layout"].trainable_weights)
     assert post["expert_weight_layout"].trainable_weights[0].shape == (4, 256, 128)
+    assert post["expert_weight_layout"].trainable_wgrad_outs is not None
     assert torch.equal(result["hidden_states"], hidden_states * 0.5)
+    assert not result["hidden_states"].requires_grad
     assert runtime._buffer.num_sms == 64
 
-    with pytest.raises(RuntimeError, match="fixed S changed"):
+    invocation_ref = weakref.ref(layer_state)
+    del layer_state, pre, dispatched, post, pre_combined, combined
+    assert invocation_ref() is None
+
+    with pytest.raises(RuntimeError, match="requires layer_state from prepare_layer_input"):
         dispatcher.dispatch_preprocess(
-            hidden_states=torch.randn(4, 128, dtype=torch.bfloat16),
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=route_weights,
+            tokens_per_expert=source_counts,
+        )
+
+    with pytest.raises(RuntimeError, match="fixed S changed"):
+        invalid_hidden, invalid_state = dispatcher.prepare_layer_input(torch.randn(4, 128, dtype=torch.bfloat16))
+        dispatcher.dispatch_preprocess(
+            hidden_states=invalid_hidden,
             topk_ids=torch.zeros(4, 2, dtype=torch.int64),
             topk_weights=torch.full((4, 2), 0.5),
             tokens_per_expert=torch.tensor([8, 0, 0, 0]),
+            layer_state=invalid_state,
         )
 
 
@@ -287,3 +313,101 @@ def test_direct_install_failure_is_explicit_and_never_falls_back_to_staging(back
         runtime.install_after_fsdp(fsdp_root=experts)
 
     assert _Workspace.allocated[-1].destroyed
+
+
+def test_gradient_reduce_start_uses_the_workspace_targets_once() -> None:
+    from xtuner.v1.module.dispatcher import moonep as moonep_integration
+
+    class _CompletionEvent:
+        def __init__(self) -> None:
+            self.waits = 0
+
+        def wait(self) -> None:
+            self.waits += 1
+
+    local_grads = tuple(torch.arange(24, dtype=torch.bfloat16).view(4, 2, 3) + projection for projection in range(2))
+    fallback = tuple(gradient.clone() for gradient in local_grads)
+    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+    event = _CompletionEvent()
+
+    class _Workspace:
+        def complete_gradients(self, *, local_grads, **kwargs):
+            del kwargs
+            calls.append(local_grads)
+            return local_grads[0][:2], local_grads[1][:2]
+
+    runtime = SimpleNamespace(_workspace=_Workspace(), _buffer=object())
+
+    def enqueue(operation, inputs=()):
+        del inputs
+        return operation(), event
+
+    runtime._enqueue = enqueue
+    invocation = moonep_integration._MoonEPLayerInvocation(
+        runtime=runtime,
+        layer_fqn="layers.0.experts",
+        projections=(nn.Linear(3, 3), nn.Linear(3, 3)),
+        generation=0,
+        grad_slot=0,
+    )
+    invocation._plan = object()
+    home_parameters = (
+        nn.Parameter(torch.zeros_like(local_grads[0][:2])),
+        nn.Parameter(torch.zeros_like(local_grads[1][:2])),
+    )
+    invocation._home_parameters = home_parameters
+    invocation._fallback_gradient_targets = fallback
+
+    invocation._start_gradient_completion()
+
+    assert len(calls) == 1
+    assert all(actual is expected for actual, expected in zip(calls[0], fallback, strict=True))
+    assert event.waits == 0
+
+    invocation._finish_gradient_completion()
+    assert event.waits == 1
+    for parameter, expected in zip(home_parameters, fallback, strict=True):
+        torch.testing.assert_close(parameter.grad, expected[:2])
+    assert invocation._fallback_gradient_targets is None
+
+
+def test_gradient_reduce_start_and_join_preserve_device_order() -> None:
+    events: list[str] = []
+    targets = (torch.zeros(4), torch.zeros(4))
+
+    class _Invocation:
+        def _start_gradient_completion(self) -> None:
+            assert all(
+                torch.equal(target, torch.full_like(target, projection + 1))
+                for projection, target in enumerate(targets)
+            )
+            events.append("start")
+
+        def _finish_gradient_completion(self) -> None:
+            events.append("finish")
+
+    class _WriteWGrad(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value, target, projection):
+            ctx.target = target
+            ctx.projection = projection
+            return value
+
+        @staticmethod
+        def backward(ctx, grad):
+            ctx.target.fill_(ctx.projection + 1)
+            events.append(f"projection-{ctx.projection}")
+            return grad, None, None
+
+    invocation = _Invocation()
+    source = torch.ones(4, requires_grad=True)
+
+    joined = _MoonEPGradReduceJoin.apply(source, invocation)
+    started = _MoonEPGradReduceStart.apply(joined, invocation)
+    projection_0 = _WriteWGrad.apply(started, targets[0], 0)
+    projection_1 = _WriteWGrad.apply(projection_0, targets[1], 1)
+    projection_1.sum().backward()
+
+    assert joined.data_ptr() == source.data_ptr()
+    assert started.data_ptr() == source.data_ptr()
+    assert events == ["projection-1", "projection-0", "start", "finish"]
