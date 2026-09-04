@@ -741,6 +741,17 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
         assert torch.isfinite(grad_norm)
         assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients.values())
 
+    def test_qwen_micro8_trains_with_the_configured_width(self) -> None:
+        self.create_pg("cuda")
+        loss, grad_norm, gradients = self._train_microbatches_without_mtp(
+            "moonep",
+            recompute_ratio=0.0,
+            offsets=tuple(range(0, 128, 16)),
+        )
+        assert torch.isfinite(torch.tensor(loss, device="cuda"))
+        assert torch.isfinite(grad_norm)
+        assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients.values())
+
     def test_qwen_shared_expert_variants_train(self) -> None:
         self.create_pg("cuda")
         _, no_shared_norm, no_shared_gradients = self._train_microbatches_without_mtp(
