@@ -39,6 +39,9 @@ conda activate pt212_cu132
 cd "$repo_root"
 
 run_dir="$acceptance_root/${backend}_mtp${mtp}_pack${pack_length}"
+if [[ ${MOONEP_ACCEPTANCE_MICRO_BATCH:-1} != "1" ]]; then
+    run_dir="${run_dir}_micro${MOONEP_ACCEPTANCE_MICRO_BATCH}"
+fi
 if [[ -e $run_dir ]]; then
     echo "refusing to mix acceptance attempts in existing directory: $run_dir" >&2
     exit 2
@@ -68,6 +71,13 @@ config=tests/acceptance/sft_qwen35_moonep_acceptance.py
 python -m xtuner._testing.moonep_acceptance capture \
     --config "$config" \
     --output "$run_dir/acceptance_manifest.json"
+
+# VMM/NCCL allocations are not all visible to PyTorch's allocator counters.
+# Sample all eight devices while the same GPU lock covers the training job.
+nvidia-smi --query-gpu=timestamp,index,memory.used --format=csv,noheader,nounits \
+    --loop-ms=500 > "$run_dir/device_memory.csv" &
+memory_monitor_pid=$!
+trap 'kill "$memory_monitor_pid" 2>/dev/null || true; wait "$memory_monitor_pid" 2>/dev/null || true' EXIT
 
 torchrun \
     --nproc-per-node 8 \

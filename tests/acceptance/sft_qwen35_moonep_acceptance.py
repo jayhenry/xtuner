@@ -31,6 +31,9 @@ if backend not in {"deepep", "moonep"}:
 
 mtp_enabled = bool(int(_required_env("MOONEP_ACCEPTANCE_MTP")))
 pack_length = int(_required_env("MOONEP_ACCEPTANCE_PACK_LENGTH"))
+micro_batch = int(os.environ.get("MOONEP_ACCEPTANCE_MICRO_BATCH", "1"))
+if micro_batch not in (1, 2):
+    raise ValueError("MOONEP_ACCEPTANCE_MICRO_BATCH must be 1 or 2")
 if pack_length <= 0:
     raise ValueError("MOONEP_ACCEPTANCE_PACK_LENGTH must be positive")
 if os.environ.get("XTUNER_ACTIVATION_OFFLOAD", "0") != "0":
@@ -92,8 +95,8 @@ trainer = TrainerConfig(
         cpu_offload=False,
     ),
     dataloader_cfg=dataloader_cfg,
-    global_batch_size=8,
-    intra_layer_micro_batch=1,
+    global_batch_size=8 * micro_batch,
+    intra_layer_micro_batch=micro_batch,
     sp_size=1,
     total_step=20,
     work_dir=_required_env("MOONEP_ACCEPTANCE_WORK_DIR"),

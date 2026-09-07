@@ -3,7 +3,7 @@ import runpy
 
 import pytest
 
-from xtuner._testing.moonep_acceptance import AcceptanceRun, compare_runs
+from xtuner._testing.moonep_acceptance import AcceptanceRun, compare_runs, summarize_memory
 
 
 def _write_tracker(path, *, tgs_scale: float, mtp: bool) -> None:
@@ -27,9 +27,11 @@ def _write_tracker(path, *, tgs_scale: float, mtp: bool) -> None:
 
 @pytest.mark.parametrize("backend", ["deepep", "moonep"])
 @pytest.mark.parametrize("mtp", [False, True])
-def test_qwen35_acceptance_config_locks_the_formal_workload(monkeypatch, tmp_path, backend, mtp) -> None:
+@pytest.mark.parametrize("micro_batch", [1, 2])
+def test_qwen35_acceptance_config_locks_the_formal_workload(monkeypatch, tmp_path, backend, mtp, micro_batch) -> None:
     monkeypatch.setenv("MOONEP_ACCEPTANCE_BACKEND", backend)
     monkeypatch.setenv("MOONEP_ACCEPTANCE_MTP", str(int(mtp)))
+    monkeypatch.setenv("MOONEP_ACCEPTANCE_MICRO_BATCH", str(micro_batch))
     monkeypatch.setenv("MOONEP_ACCEPTANCE_PACK_LENGTH", "65536")
     monkeypatch.setenv("MOONEP_ACCEPTANCE_WORK_DIR", str(tmp_path / "run"))
     monkeypatch.setenv("MOONEP_ACCEPTANCE_MODEL_PATH", "/model")
@@ -39,8 +41,8 @@ def test_qwen35_acceptance_config_locks_the_formal_workload(monkeypatch, tmp_pat
     model = trainer.model_cfg
 
     assert trainer.total_step == 20
-    assert trainer.global_batch_size == 8
-    assert trainer.intra_layer_micro_batch == 1
+    assert trainer.global_batch_size == 8 * micro_batch
+    assert trainer.intra_layer_micro_batch == micro_batch
     assert trainer.sp_size == 1
     assert trainer.debug_skip_save is True
     assert trainer.dataloader_cfg.pack_to_max_length is True
@@ -113,7 +115,37 @@ def test_acceptance_report_rejects_incomplete_or_mismatched_runs(tmp_path) -> No
     with pytest.raises(ValueError, match="pack_length"):
         compare_runs(deepep, mismatched)
 
+    micro2 = AcceptanceRun.from_tracker(moonep_tracker, backend="moonep", mtp=False, pack_length=65536, micro_batch=2)
+    with pytest.raises(ValueError, match="micro_batch"):
+        compare_runs(deepep, micro2)
+
     lines = moonep_tracker.read_text().splitlines()
     moonep_tracker.write_text("\n".join(lines[:-1]) + "\n")
     with pytest.raises(ValueError, match="exactly steps 1..20"):
         AcceptanceRun.from_tracker(moonep_tracker, backend="moonep", mtp=False, pack_length=65536)
+
+
+def test_memory_report_includes_all_ranks_and_external_device_allocations(tmp_path) -> None:
+    for rank in range(2):
+        tracker = tmp_path / "logs" / "exp_tracking" / f"rank{rank}" / "tracker.jsonl"
+        tracker.parent.mkdir(parents=True)
+        tracker.write_text(
+            "\n".join(
+                json.dumps(
+                    {
+                        "step": step,
+                        "memory/max_memory_GB": (10 if step == 1 else 6) + rank,
+                        "memory/reserved_memory_GB": (12 if step == 1 else 8) + rank,
+                    }
+                )
+                for step in range(1, 21)
+            )
+        )
+    (tmp_path / "device_memory.csv").write_text(
+        "2026/09/07 00:00:00.000, 0, 15360\n2026/09/07 00:00:00.000, 1, 16384\n2026/09/07 00:00:00.500, 0, 14336\n"
+    )
+    result = summarize_memory(tmp_path)
+    assert result["recorded_ranks"] == 2
+    assert result["all_steps"] == {"allocated_gib": 11, "reserved_gib": 13}
+    assert result["steps_6_20"] == {"allocated_gib": 7, "reserved_gib": 9}
+    assert result["sampled_device_peak_gib"] == {"0": 15, "1": 16}

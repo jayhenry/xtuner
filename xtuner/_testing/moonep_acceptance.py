@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib
 import json
 import math
@@ -24,6 +25,7 @@ class AcceptanceRun:
     mtp: bool
     pack_length: int
     records: tuple[dict[str, Any], ...]
+    micro_batch: int = 1
 
     @classmethod
     def from_tracker(
@@ -33,6 +35,7 @@ class AcceptanceRun:
         backend: str,
         mtp: bool,
         pack_length: int,
+        micro_batch: int = 1,
     ) -> "AcceptanceRun":
         tracker = Path(tracker)
         records = tuple(json.loads(line) for line in tracker.read_text(encoding="utf-8").splitlines() if line)
@@ -47,7 +50,7 @@ class AcceptanceRun:
             missing = required - record.keys()
             if missing:
                 raise ValueError(f"step {record['step']} is missing metrics: {sorted(missing)}")
-        return cls(backend=backend, mtp=mtp, pack_length=pack_length, records=records)
+        return cls(backend=backend, mtp=mtp, pack_length=pack_length, records=records, micro_batch=micro_batch)
 
     @classmethod
     def from_work_dir(cls, work_dir: str | Path) -> "AcceptanceRun":
@@ -61,6 +64,7 @@ class AcceptanceRun:
             backend=manifest["backend"],
             mtp=manifest["mtp"],
             pack_length=manifest["pack_length"],
+            micro_batch=manifest.get("micro_batch", 1),
         )
 
     @property
@@ -148,7 +152,7 @@ def _compare_curve(
 def compare_runs(deepep: AcceptanceRun, moonep: AcceptanceRun) -> PairComparison:
     if deepep.backend != "deepep" or moonep.backend != "moonep":
         raise ValueError(f"expected deepep/moonep pair, got {deepep.backend}/{moonep.backend}")
-    for field in ("mtp", "pack_length"):
+    for field in ("mtp", "pack_length", "micro_batch"):
         if getattr(deepep, field) != getattr(moonep, field):
             raise ValueError(f"workload mismatch for {field}: {getattr(deepep, field)} != {getattr(moonep, field)}")
     if deepep.tokens != moonep.tokens:
@@ -200,6 +204,7 @@ def capture_manifest(config_path: Path, output: Path) -> None:
         "backend": os.environ["MOONEP_ACCEPTANCE_BACKEND"],
         "mtp": bool(int(os.environ["MOONEP_ACCEPTANCE_MTP"])),
         "pack_length": int(os.environ["MOONEP_ACCEPTANCE_PACK_LENGTH"]),
+        "micro_batch": trainer.intra_layer_micro_batch,
         "xtuner_commit": _git_commit(repo_root),
         "moonep_commit": _git_commit(moonep_source.parents[1]),
         "moonep_module": str(moonep_source),
@@ -223,6 +228,38 @@ def capture_manifest(config_path: Path, output: Path) -> None:
     output.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def summarize_memory(work_dir: str | Path) -> dict[str, Any]:
+    """Report allocator peaks separately from sampled device use (incl. VMM).
+
+    Trainer resets its allocator peak after each step. Aggregate every logged
+    rank, and retain both whole-run and steady-state maxima, not averages.
+    Device samples cover the whole process, including startup/compilation.
+    """
+    work_dir = Path(work_dir)
+    trackers = sorted(work_dir.glob("**/exp_tracking/rank*/tracker.jsonl"))
+    records = [json.loads(line) for path in trackers for line in path.read_text().splitlines() if line]
+    result: dict[str, Any] = {"recorded_ranks": len(trackers)}
+    for phase, selected in (
+        ("all_steps", records),
+        ("steps_6_20", [record for record in records if 6 <= record["step"] <= 20]),
+    ):
+        result[phase] = {
+            label: max((record[key] for record in selected if key in record), default=None)
+            for label, key in (
+                ("allocated_gib", "memory/max_memory_GB"),
+                ("reserved_gib", "memory/reserved_memory_GB"),
+            )
+        }
+    device_peaks: dict[str, float] = {}
+    samples = work_dir / "device_memory.csv"
+    if samples.exists():
+        for _, device, used_mib in csv.reader(samples.read_text().splitlines()):
+            device = device.strip()
+            device_peaks[device] = max(device_peaks.get(device, 0.0), float(used_mib) / 1024)
+    result["sampled_device_peak_gib"] = device_peaks
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -241,7 +278,9 @@ def main() -> int:
 
     result = compare_runs(AcceptanceRun.from_work_dir(args.deepep), AcceptanceRun.from_work_dir(args.moonep))
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result.to_dict(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    report = result.to_dict()
+    report["memory"] = {"deepep": summarize_memory(args.deepep), "moonep": summarize_memory(args.moonep)}
+    args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return 0 if result.passed else 1
 
 
