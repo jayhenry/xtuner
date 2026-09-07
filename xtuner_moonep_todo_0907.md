@@ -162,15 +162,15 @@ paired Start 可以在两个 projection 都完成 WGrad 和外部累加后发起
 
 | 方案 | 累积/通信存储 | 额外 dW 存储 | 额外工作 |
 |---|---:|---|---|
-| 当前 N 份 `[home + duplicate]` | `2NG` | 当前 direct-output 路径无需额外 dW | 各 invocation 完成后逐次 home 交接 |
+| 旧版 N 份 `[home + duplicate]` | `2NG` | direct-output 路径无需额外 dW | 各 invocation 完成后逐次 home 交接 |
 | A：共享 home，无 grad_out | `(N+1)G` | 每份完整 projection-pair dW 为 `2G`，在途数量取决于反向调度 | autograd bridge、home 累加与 duplicate copy |
 | B：共享 home，out 映射到 `[S \| D_i]` | `(N+1)G` | 每个 projection 一份 S，合计 `G` | GEMM 外 home 累加、scratch 复用 |
 
-方案 B 的总 workspace 是 `(N+2)G`，而不是 `(N+1)G`。相对当前 `2NG`：
+方案 B 的总 workspace 是 `(N+2)G`，而不是 `(N+1)G`。相对旧版 `2NG`：
 
 - micro2：`4G → 4G`，没有 workspace 容量收益，而且仍有额外 local dW 读写。
 - micro4：`8G → 6G`，理论节省 25%，前提是每个 projection 确实只需要一份 scratch。
-- micro1 不需要该共享优化，适合继续当前直接输出路径。
+- micro1 不需要该共享优化；若后续实现 B，可以评估保留旧版直接输出路径。目前实现的 A 对 micro1/2/4 统一使用 allocation-return，不保留 micro1 特例。
 
 方案 A 按文中 paired bridge 保留一个 invocation 两块 projection 的完整 dW 时，仅 workspace 加这份临时输出就达到 `(N+3)G`；更多在途输出还会抬高峰值。不能只比较 `(N+1)G` 的累积/通信存储。
 
@@ -182,18 +182,20 @@ paired Start 可以在两个 projection 都完成 WGrad 和外部累加后发起
 - [x] 建立 call 级初始化和完成边界：home 清零一次、全部贡献完成后交接一次、FSDP copy-in 消费后才复用。
 - [x] A：实现 GEMM 外的 autograd bridge，建立 dW staging → paired duplicate return → 层级 Join → FSDP RS 的依赖。
 - [ ] B：建立额外 scratch 及 `[S | D_i]` GEMM 输出视图，通过 Python/autograd 接线完成外部累加，证明 scratch 消费先于复用。
-- [ ] 用相同 seed/input 比较当前实现、A、B 的逐参数梯度及 optimizer 更新；说明 BF16 舍入契约和容差。
-- [ ] 覆盖 micro1/2/4、两个及以上 MoE 层、连续梯度累积和 optimizer steps、local/remote/empty/skew routing。
-- [ ] 覆盖实际重计算路径、shared-weight MTP 多 calls、eager/compile，以及 Triton/CUTLASS。
-- [ ] 用 CUDA profiler 测量稳定期临时 dW 分配、D2D 搬运、峰值显存和 step 耗时，并检查新增 host sync。
+- [x] A：相同 seed/重复输入下，比较 micro1/2/4 的 routed/shared/router 梯度与三次 AdamW 更新；不同输入的 DeepEP 对照另由模型回归和正式验收覆盖。容差为 `rtol=1e-2, atol=1e-3`，不是 bitwise 等价。
+- [ ] B：实现后与 A、旧版做同输入逐参数梯度和 optimizer 更新对照。
+- [x] A：覆盖 micro1/2/4、多个 MoE 层、连续梯度累积和 optimizer steps；真实 VMM/transport 测试覆盖 EP2/4/8 的 hot expert、空 slot 和 duplicate 隔离。
+- [x] A：覆盖实际重计算路径、shared-weight MTP 多 calls、eager/compile，以及 Triton/CUTLASS。
+- [x] A：CUDA profiler 检查真实热路径无新增 host sync、无完整 home weight copy，并确认 allocation-return dW 确实存在。
+- [ ] 若继续优化 A/B，进一步测量各临时 dW 的在途生命周期与 D2D 带宽；整模型显存和 step 耗时以正式验收报告为准。
 
 ## 7. 当前代码依据
 
 - `xtuner/v1/module/grouped_linear/moe_group_linear.py`：当前动态 weight 和可选 WGrad target 的传递入口。
-- `xtuner/v1/ops/moe/cuda/group_gemm.py`：不带 out 时返回新 dW；带 out 时写 workspace，并返回 `dw=None`。
+- `xtuner/v1/ops/moe/cuda/group_gemm.py`：不带 out 时返回新 dW；带 out 时调用覆盖写入 kernel。本次 A 不使用带 out 分支，也不修改其 autograd 返回约定。
 - `xtuner/v1/ops/moe/cuda/triton_kernels/k_grouped_gemm_TMA_triton3_4.py`：allocation-return 路径通过 `new_empty` 创建完整 dW；现有 out 路径复用相同覆盖写入 kernel，尚无 home 累加 epilogue。
-- `xtuner/v1/module/dispatcher/moonep_workspace.py`：当前 N 份 home/duplicate slot 的 VMM 布局及 paired gradient completion。
-- `xtuner/v1/module/dispatcher/fsdp_vmm_landing.py`：当前逐 invocation 的首份赋值 / 后续原地相加逻辑，不能直接用于共享累计 H 的重复交接。
+- `xtuner/v1/module/dispatcher/moonep_workspace.py`：一份 home 与 N 份 duplicate slot 的 VMM 布局及 paired gradient completion。
+- `xtuner/v1/module/dispatcher/fsdp_vmm_landing.py`：保留首份赋值 / 后续原地相加接口，由层级 Join 仅交接一次累计 H，不能逐 invocation 重复交接共享 H。
 - MoonEP-mod 的 `moonep/api.py::Buffer.reduce_grad_bf16` 与 `moonep/bf16_grad_reduce.py`：读取已有 BF16 home，使用 FP32 寄存器累加 remote duplicate，再写回 BF16 home。共享 H 后仍须验证其调用顺序和 slot lifecycle。
 
 最终约束是：不改 Triton kernel、单次 `[2B]` GEMM、一份当前层 home 累积区、N 份按 plan 隔离的 duplicate 梯度、每次 backward 必须 RS。在此约束下需要额外临时 dW 存储；带 out 可以把额外存储缩小为 home scratch，但不能将它从显存账目中省略。
