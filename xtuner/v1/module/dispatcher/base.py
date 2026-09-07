@@ -117,17 +117,17 @@ class GenericDispatcher(
         self._process_group = process_group
         self._n_routed_experts = n_routed_experts
 
-    def prepare_layer_input(
+    def prepare_layer_inputs(
         self,
-        layer_input: torch.Tensor,
-    ) -> tuple[torch.Tensor, object | None]:
-        """Return the layer input and optional backend ordering state.
+        layer_inputs: list[torch.Tensor],
+    ) -> tuple[list[torch.Tensor], list[object | None]]:
+        """Prepare all inputs of one FSDP layer call before branching.
 
         Most dispatchers have no work to schedule before attention, so they
         keep the identity behavior.  A backend that needs an autograd ordering
         seam may return an opaque token for ``dispatch_preprocess``.
         """
-        return layer_input, None
+        return layer_inputs, [None] * len(layer_inputs)
 
     @abstractmethod
     def dispatch(

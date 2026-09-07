@@ -9,8 +9,8 @@ from xtuner.v1.module.dispatcher import build_dispatcher
 from xtuner.v1.module.dispatcher.moonep import (
     MoonEPDispatcher,
     MoonEPModelRuntime,
-    _MoonEPGradReduceJoin,
-    _MoonEPGradReduceStart,
+    _MoonEPExpertGradBridge,
+    _MoonEPLayerGradJoin,
 )
 
 
@@ -211,7 +211,8 @@ def test_staging_dispatcher_runs_the_public_forward_path(backend) -> None:
     route_weights = torch.full((3, 2), 0.5, dtype=torch.float32)
 
     with torch.no_grad():
-        layer_input, layer_state = dispatcher.prepare_layer_input(hidden_states)
+        layer_inputs, layer_states = dispatcher.prepare_layer_inputs([hidden_states])
+        layer_input, layer_state = layer_inputs[0], layer_states[0]
         assert layer_input.grad_fn is None
         pre = dispatcher.dispatch_preprocess(
             hidden_states=layer_input,
@@ -249,15 +250,15 @@ def test_staging_dispatcher_runs_the_public_forward_path(backend) -> None:
     assert torch.equal(pre["tokens_per_expert"], source_counts.to(torch.int32))
     assert post["tokens_per_expert"].shape == (4,)
     assert post["expert_weight_layout"].trainable_weights is not None
-    assert all(isinstance(weight, nn.Parameter) for weight in post["expert_weight_layout"].trainable_weights)
+    assert all(isinstance(weight, torch.Tensor) for weight in post["expert_weight_layout"].trainable_weights)
     assert post["expert_weight_layout"].trainable_weights[0].shape == (4, 256, 128)
-    assert post["expert_weight_layout"].trainable_wgrad_outs is not None
+    assert post["expert_weight_layout"].trainable_wgrad_outs is None
     assert torch.equal(result["hidden_states"], hidden_states * 0.5)
     assert not result["hidden_states"].requires_grad
     assert runtime._buffer.num_sms == 64
 
     invocation_ref = weakref.ref(layer_state)
-    del layer_state, pre, dispatched, post, pre_combined, combined
+    del layer_state, layer_states, pre, dispatched, post, pre_combined, combined
     assert invocation_ref() is None
 
     with pytest.raises(RuntimeError, match="requires layer_state from prepare_layer_input"):
@@ -269,13 +270,13 @@ def test_staging_dispatcher_runs_the_public_forward_path(backend) -> None:
         )
 
     with pytest.raises(RuntimeError, match="fixed S changed"):
-        invalid_hidden, invalid_state = dispatcher.prepare_layer_input(torch.randn(4, 128, dtype=torch.bfloat16))
+        invalid_inputs, invalid_states = dispatcher.prepare_layer_inputs([torch.randn(4, 128, dtype=torch.bfloat16)])
         dispatcher.dispatch_preprocess(
-            hidden_states=invalid_hidden,
+            hidden_states=invalid_inputs[0],
             topk_ids=torch.zeros(4, 2, dtype=torch.int64),
             topk_weights=torch.full((4, 2), 0.5),
             tokens_per_expert=torch.tensor([8, 0, 0, 0]),
-            layer_state=invalid_state,
+            layer_state=invalid_states[0],
         )
 
 
@@ -336,7 +337,9 @@ def test_gradient_reduce_start_uses_the_workspace_targets_once() -> None:
             calls.append(local_grads)
             return local_grads[0][:2], local_grads[1][:2]
 
-    runtime = SimpleNamespace(_workspace=_Workspace(), _buffer=object())
+    runtime = SimpleNamespace(
+        _workspace=_Workspace(), _buffer=object(), _num_experts=4, _ep_group=SimpleNamespace(size=lambda: 2)
+    )
 
     def enqueue(operation, inputs=()):
         del inputs
@@ -349,6 +352,7 @@ def test_gradient_reduce_start_uses_the_workspace_targets_once() -> None:
         projections=(nn.Linear(3, 3), nn.Linear(3, 3)),
         generation=0,
         grad_slot=0,
+        layer_gradients=moonep_integration._MoonEPLayerGradients(),
     )
     invocation._plan = object()
     home_parameters = (
@@ -358,16 +362,18 @@ def test_gradient_reduce_start_uses_the_workspace_targets_once() -> None:
     invocation._home_parameters = home_parameters
     invocation._fallback_gradient_targets = fallback
 
-    invocation._start_gradient_completion()
+    invocation._start_gradient_completion(local_grads)
 
     assert len(calls) == 1
     assert all(actual is expected for actual, expected in zip(calls[0], fallback, strict=True))
     assert event.waits == 0
 
-    invocation._finish_gradient_completion()
+    parameters, gradients = invocation._finish_gradient_completion()
     assert event.waits == 1
-    for parameter, expected in zip(home_parameters, fallback, strict=True):
-        torch.testing.assert_close(parameter.grad, expected[:2])
+    assert parameters is home_parameters
+    for parameter, actual, expected in zip(parameters, gradients, local_grads, strict=True):
+        assert parameter.grad is None  # Only the layer Join publishes H.
+        torch.testing.assert_close(actual, expected[:2])
     assert invocation._fallback_gradient_targets is None
 
 
@@ -376,36 +382,35 @@ def test_gradient_reduce_start_and_join_preserve_device_order() -> None:
     targets = (torch.zeros(4), torch.zeros(4))
 
     class _Invocation:
-        def _start_gradient_completion(self) -> None:
-            assert all(
-                torch.equal(target, torch.full_like(target, projection + 1))
-                for projection, target in enumerate(targets)
-            )
+        def _start_gradient_completion(self, gradients) -> None:
+            for target, gradient in zip(targets, gradients, strict=True):
+                target.copy_(gradient)
             events.append("start")
 
-        def _finish_gradient_completion(self) -> None:
+        def _finish_gradient_completion(self):
             events.append("finish")
+            return (nn.Parameter(torch.zeros(4)), nn.Parameter(torch.zeros(4))), targets
 
     class _WriteWGrad(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, value, target, projection):
-            ctx.target = target
+        def forward(ctx, value, weight, projection):
             ctx.projection = projection
             return value
 
         @staticmethod
         def backward(ctx, grad):
-            ctx.target.fill_(ctx.projection + 1)
             events.append(f"projection-{ctx.projection}")
-            return grad, None, None
+            return grad, torch.full_like(grad, ctx.projection + 1), None
 
     invocation = _Invocation()
     source = torch.ones(4, requires_grad=True)
 
-    joined = _MoonEPGradReduceJoin.apply(source, invocation)
-    started = _MoonEPGradReduceStart.apply(joined, invocation)
-    projection_0 = _WriteWGrad.apply(started, targets[0], 0)
-    projection_1 = _WriteWGrad.apply(projection_0, targets[1], 1)
+    (joined,) = _MoonEPLayerGradJoin.apply((invocation,), source)
+    started, w0, w1 = _MoonEPExpertGradBridge.apply(
+        joined, nn.Parameter(torch.ones(4)), nn.Parameter(torch.ones(4)), invocation
+    )
+    projection_0 = _WriteWGrad.apply(started, w0, 0)
+    projection_1 = _WriteWGrad.apply(projection_0, w1, 1)
     projection_1.sum().backward()
 
     assert joined.data_ptr() == source.data_ptr()

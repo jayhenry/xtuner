@@ -2,6 +2,7 @@ import unittest
 
 import torch
 import torch.distributed as dist
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 
 from xtuner._testing import DeterministicDDPTestCase
@@ -112,6 +113,110 @@ def _tiny_config(
 
 @unittest.skipUnless(torch.cuda.device_count() >= 8, "requires 8 CUDA devices")
 class TestMoonEPStagingForward(DeterministicDDPTestCase):
+    def test_shared_home_micro1_micro2_micro4_accumulation_and_updates(self) -> None:
+        """Identical items isolate accumulation from routing/rounding changes.
+
+        Compare eight synchronized backwards with four/two layer joins over
+        the same effective batch, through full recompute and three AdamW steps.
+        Different-input/backend parity remains covered by the training tests.
+        """
+        self.create_pg("cuda")
+        reference = None
+        for width in (1, 2, 4):
+            torch.manual_seed(20260805)
+            engine = TrainEngine(
+                model_cfg=_tiny_config("qwen", "moonep", compile=True),
+                optim_cfg=AdamWConfig(lr=6e-5, foreach=False),
+                fsdp_cfg=FSDPConfig(ep_size=4, recompute_ratio=1.0, torch_compile=True),
+                intra_layer_micro_batch=width,
+            )
+            engine.init_model_weights()
+            observed = []
+            for step in range(3):
+                engine.optimizer.zero_grad()
+                ids = (torch.arange(2, 18, device="cuda") + 16 * step).view(1, -1) % 256
+                seq_ctxs = [SequenceContext.from_input_ids((ids,), device="cuda") for _ in range(8)]
+                # Normalize the entire effective batch, exactly as Trainer
+                # does, then retain RS on every accumulation backward.
+                loss_ctxs = engine.model.build_loss_ctx_batch(
+                    [{"seq_ctx": seq_ctx, "shifted_labels": (ids + 1) % 256} for seq_ctx in seq_ctxs]
+                )
+                items = [
+                    ModelItem(seq_ctx=seq_ctx, loss_ctx=loss_ctx)
+                    for seq_ctx, loss_ctx in zip(seq_ctxs, loss_ctxs, strict=True)
+                ]
+                for start in range(0, 8, width):
+                    engine.model.set_is_last_backward(start + width == 8)
+                    engine.train_step(items[start : start + width])
+                grad_norm = engine.clip_grad_norm(do_clip=False)
+                gradients = self._selected_training_tensors(engine, gradients=True)
+                # Empty local experts are valid; require routed contributions
+                # globally instead of requiring every EP owner to receive work.
+                routed_nonzero = torch.stack(
+                    [torch.count_nonzero(value) for name, value in gradients.items() if ".experts." in name]
+                ).sum()
+                dist.all_reduce(routed_nonzero)
+                assert routed_nonzero > 0
+                engine.step_optimizer(grad_norm)
+                observed.append((gradients, self._selected_training_tensors(engine, gradients=False)))
+            if reference is None:
+                reference = observed
+            else:
+                for step, (actual_step, expected_step) in enumerate(zip(observed, reference, strict=True)):
+                    for kind, (actual, expected) in enumerate(zip(actual_step, expected_step, strict=True)):
+                        assert actual.keys() == expected.keys()
+                        for name in actual:
+                            torch.testing.assert_close(
+                                actual[name],
+                                expected[name],
+                                rtol=1e-2,
+                                atol=1e-3,
+                                msg=lambda message: f"width={width}, step={step}, kind={kind}, {name}: {message}",
+                            )
+            # Only clean up successful, rank-coordinated runs. A finally
+            # barrier would mask rank-local assertions from the test runner.
+            torch.cuda.synchronize()
+            dist.barrier()
+            engine.close()
+
+    def test_micro2_accumulation_requires_sync_on_root_and_layers(self) -> None:
+        self.create_pg("cuda")
+        torch.manual_seed(20260805)
+        engine = TrainEngine(
+            model_cfg=_tiny_config("qwen", "moonep", compile=False),
+            optim_cfg=AdamWConfig(foreach=False),
+            fsdp_cfg=FSDPConfig(ep_size=4, recompute_ratio=1.0, torch_compile=False),
+            intra_layer_micro_batch=2,
+        )
+        engine.init_model_weights()
+        try:
+            units = [module for module in engine.model.modules() if isinstance(module, FSDPModule)]
+            assert len(units) > 1
+            for module in units:
+                for recurse in (False, True):
+                    with self.assertRaisesRegex(ValueError, "requires gradient ReduceScatter on every backward"):
+                        module.set_requires_gradient_sync(False, recurse=recurse)
+                    module.set_requires_gradient_sync(True, recurse=recurse)
+
+            # Reentrant recomputation and state retention still allow ordinary
+            # accumulation in sharded gradients after each synchronized RS.
+            first_gradients = {}
+            for last in (False, True):
+                engine.model.set_is_last_backward(last)
+                engine.train_step([self._model_training_item(engine, offset=offset) for offset in (0, 16)])
+                torch.cuda.synchronize()
+                gradients = self._selected_training_tensors(engine, gradients=True)
+                if not last:
+                    first_gradients = gradients
+                else:
+                    assert gradients.keys() == first_gradients.keys()
+                    for name, gradient in gradients.items():
+                        torch.testing.assert_close(gradient, 2 * first_gradients[name], rtol=1e-2, atol=1e-3)
+        finally:
+            torch.cuda.synchronize()
+            dist.barrier()
+            engine.close()
+
     @staticmethod
     def _training_item() -> ModelItem:
         input_ids = torch.arange(2, 18, device="cuda").view(1, -1)
@@ -398,8 +503,18 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
                         for shape in event.input_shapes
                         if isinstance(shape, list) and all(isinstance(dim, int) for dim in shape)
                     }
-                    if event.name == "aten::copy_" and tensor_shapes & full_home_shapes:
+                    parent = event.cpu_parent
+                    gradient_staging = False
+                    while parent is not None:
+                        gradient_staging |= parent.name == "MoonEP::gradient_handoff"
+                        parent = parent.cpu_parent
+                    if event.name == "aten::copy_" and tensor_shapes & full_home_shapes and not gradient_staging:
                         full_weight_copies += 1
+                    # Scheme A deliberately allocates dW via this public op.
+                    # Gradient suffix staging has the same shape as weights,
+                    # so it must not be misclassified as a weight landing copy.
+                    if event.name == "moe::k_grouped_gemm":
+                        full_dw_materializations += 1
                     if event.name in {"aten::clone", "aten::copy_", "aten::zeros_like"} and (
                         tensor_shapes & full_local_dw_shapes
                     ):
@@ -440,14 +555,14 @@ class TestMoonEPStagingForward(DeterministicDDPTestCase):
         direct_copies, direct_dw_materializations, direct_host_syncs, _ = profile_mode(False)
         assert staging_copies > 0  # Calibrates the shape-based copy detector.
         assert direct_copies == 0
-        assert direct_dw_materializations == 0
+        assert direct_dw_materializations > 0
         assert direct_host_syncs == [], direct_host_syncs
         combo_copies, combo_dw_materializations, combo_host_syncs, combo_peak_bytes = profile_mode(
             False,
             mtp_micro2_sp4=True,
         )
         assert combo_copies == 0
-        assert combo_dw_materializations == 0
+        assert combo_dw_materializations > 0
         assert combo_host_syncs == [], combo_host_syncs
         # The fixed tiny fallback measured 0.185 GiB/rank on H200; leave ample
         # headroom while still catching an accidental full-model materialization.

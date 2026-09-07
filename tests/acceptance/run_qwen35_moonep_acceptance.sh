@@ -10,7 +10,9 @@ backend=$1
 mtp=$2
 pack_length=$3
 acceptance_root=${4:-work_dirs/moonep_qwen35_acceptance}
-repo_root=/mnt/shared-storage-user/zhaopenghao/github/xtuner_moonep
+# Resolve the checkout that owns this script so commit-level comparisons can
+# run in isolated worktrees without importing the developer's dirty checkout.
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 gpu_lock=/mnt/shared-storage-user/zhaopenghao/github/xtuner/zdev/gpu_lock.sh
 
 if [[ $backend != "deepep" && $backend != "moonep" ]]; then

@@ -428,7 +428,8 @@ class MoEDecoderLayer(nn.Module):
     ) -> tuple[HiddenStates, RouterLogits, RouterWeights, RouterTopKIds]:
         # MoonEP uses this identity seam to place Join before attention and
         # carries its opaque invocation token into dispatch phase 1.
-        hidden_states, layer_state = self.dispatcher.prepare_layer_input(hidden_states)
+        layer_inputs, layer_states = self.dispatcher.prepare_layer_inputs([hidden_states])
+        hidden_states, layer_state = layer_inputs[0], layer_states[0]
         residual, hidden_states, router_results = self._pre_moe_forward(
             hidden_states=hidden_states,
             seq_ctx=seq_ctx,
@@ -547,17 +548,22 @@ class MoEDecoderLayer(nn.Module):
         dispatched_list: list[DispatchResult] = []
         pre_moe_forward_out_list: list[torch.Tensor] = []
 
+        # A single multi-output Join must precede every branch (including
+        # residuals), so shared expert gradients reach FSDP exactly once.
+        hidden_states_list, layer_states = self.dispatcher.prepare_layer_inputs(hidden_states_list)
+
         # Attention + gate + pre-dispatch
         for (
             hidden_states,
+            layer_state,
             seq_ctx,
             position_embeddings,
         ) in zip(
             hidden_states_list,
+            layer_states,
             seq_ctx_list,
             position_embeddings_list,
         ):
-            hidden_states, layer_state = self.dispatcher.prepare_layer_input(hidden_states)
             residual, hidden_states, router_results = self._pre_moe_forward(
                 hidden_states=hidden_states,
                 seq_ctx=seq_ctx,

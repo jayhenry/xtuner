@@ -50,8 +50,8 @@ class _WorkspaceAllocations(TypedDict):
     home_weights: tuple[tuple[_VMMAllocation, ...], ...]
     # [P]: local duplicate-weight destination/FDS shared by both generations.
     duplicate_weights: tuple[_VMMAllocation, ...]
-    # [P][N]: local-home WGrad chunks/FDS, one per invocation slot.
-    home_gradients: tuple[tuple[_VMMAllocation, ...], ...]
+    # [P]: one home accumulator shared by every invocation of the active call.
+    home_gradients: tuple[_VMMAllocation, ...]
     # [P][N]: duplicate WGrad chunks/FDS published to every EP owner.
     duplicate_gradients: tuple[tuple[_VMMAllocation, ...], ...]
     # Flat strong references to all physical tensors; excludes mapped views.
@@ -73,7 +73,7 @@ class _WorkspaceLayout(TypedDict):
     global_weights: tuple[tuple[torch.Tensor, ...], ...]
     # [G][P], each [2B, O_p, I_p]: zero-copy [home, duplicate] weights consumed by grouped GEMM.
     local_weights: tuple[tuple[torch.Tensor, ...], ...]
-    # [N][P], each [2B, O_p, I_p]: direct grouped-GEMM WGrad targets for one invocation slot.
+    # [N][P], each [2B, O_p, I_p]: return views [shared home, slot-local duplicate].
     local_grad_outputs: tuple[tuple[torch.Tensor, ...], ...]
     # [N][P], each [R, B, O_p, I_p]: every rank's duplicate WGrad, mapped for return to local home.
     distributed_duplicate_grads: tuple[tuple[torch.Tensor, ...], ...]
@@ -250,12 +250,12 @@ class _ExpertVMMWorkspace:
         # projection has its own (O_p, I_p) chunk shape.
         home_weights: list[tuple[_VMMAllocation, ...]] = []
         duplicate_weights: list[_VMMAllocation] = []
-        home_gradients: list[tuple[_VMMAllocation, ...]] = []
+        home_gradients: list[_VMMAllocation] = []
         duplicate_gradients: list[tuple[_VMMAllocation, ...]] = []
         for chunk_shape in chunk_shapes:
             duplicate_weights.append(allocate_chunk(chunk_shape))
             home_weights.append(tuple(allocate_chunk(chunk_shape) for _ in range(2)))
-            home_gradients.append(tuple(allocate_chunk(chunk_shape) for _ in range(gradient_slots)))
+            home_gradients.append(allocate_chunk(chunk_shape))
             duplicate_gradients.append(tuple(allocate_chunk(chunk_shape) for _ in range(gradient_slots)))
 
         return _WorkspaceAllocations(
@@ -360,11 +360,11 @@ class _ExpertVMMWorkspace:
             grad_locals: list[torch.Tensor] = []
             distributed_grads: list[torch.Tensor] = []
             for slot, all_duplicate_fds in enumerate(duplicate_gradient_graph[projection]):
-                home_fd = allocations["home_gradients"][projection][slot][1]
+                home_fd = allocations["home_gradients"][projection][1]
                 duplicate_fd = allocations["duplicate_gradients"][projection][slot][1]
-                # Grouped GEMM writes one contiguous [home, duplicate] segment.
-                # Owners also map every rank's duplicate chunk for in-place
-                # BF16 gradient return.
+                # Different virtual views share the physical home accumulator H.
+                # Only the duplicate suffix is slot-local. These are return
+                # views, not safe overwrite-output targets for grouped GEMM.
                 grad_locals.append(
                     nvl_dist_map(
                         chunk_shape=list(chunk_shape),
@@ -426,8 +426,11 @@ class _ExpertVMMWorkspace:
         )
 
     def prefetch_weights(self, *, buffer, plan, generation: int, grad_slot: int):
-        """Prefetch ``[E+B]`` weights and return local ``[2B]`` weight/WGrad
-        pairs."""
+        """Prefetch weights and return local weight/gradient-return views.
+
+        The gradient prefixes alias a shared accumulator: callers must stage
+        dW with addition, never pass these views to an overwrite GEMM.
+        """
         if self._destroyed:
             raise RuntimeError("MoonEP workspace has been destroyed")
         if generation not in (0, 1):
@@ -454,7 +457,7 @@ class _ExpertVMMWorkspace:
         return self._local_weights[generation], grad_outputs
 
     def complete_gradients(self, *, buffer, plan, local_grads, grad_slot: int):
-        """Reduce ``[2B]`` WGrads and return their local-home ``[B]``
+        """Add this slot's duplicate contributions into shared home
         prefixes."""
         if self._destroyed:
             raise RuntimeError("MoonEP workspace has been destroyed")

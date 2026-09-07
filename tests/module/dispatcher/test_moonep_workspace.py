@@ -84,13 +84,16 @@ class TestMoonEPOneSegmentWorkspace(DeterministicDDPTestCase):
                         workspace.landing(0)[projection],
                     )
 
-                # Gradient slots are independent. Duplicate BF16 partials are
-                # returned to their home chunk and cleared without repacking.
+                # Home storage is shared, but duplicate slots stay independent.
+                # Verify physical aliasing by writes through different VAs.
                 for gradient in gradients_0:
                     gradient.zero_()
                     gradient[experts_per_rank:].fill_(1)
                 for gradient in gradients_1:
-                    gradient.fill_(7)
+                    gradient[experts_per_rank:].fill_(7)
+                for first, second in zip(gradients_0, gradients_1, strict=True):
+                    first[:experts_per_rank].fill_(3)
+                    assert torch.all(second[:experts_per_rank] == 3)
                 home_grads = workspace.complete_gradients(
                     buffer=buffer,
                     plan=plan,
@@ -98,7 +101,9 @@ class TestMoonEPOneSegmentWorkspace(DeterministicDDPTestCase):
                     grad_slot=0,
                 )
                 assert all(torch.count_nonzero(gradient[experts_per_rank:]) == 0 for gradient in gradients_0)
-                assert all(torch.all(gradient == 7) for gradient in gradients_1)
+                assert all(torch.all(gradient[experts_per_rank:] == 7) for gradient in gradients_1)
+                for first, second in zip(home_grads, gradients_1, strict=True):
+                    torch.testing.assert_close(first, second[:experts_per_rank])
 
                 copied = torch.count_nonzero(plan.experts_to_copy >= 0)
                 dist.all_reduce(copied, group=ep_group)

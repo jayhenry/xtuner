@@ -195,9 +195,9 @@ def accumulate_fsdp_unsharded_expert_gradients(
             else:
                 gradient = local_gradient
 
-            # The first producer transfers storage ownership without a copy;
-            # Domino's later producers use the same accumulation semantics as
-            # native AccumulateGrad.
+            # MoonEP's layer Join publishes one completed home sum per FSDP
+            # call. Assignment retains its VMM alias until native copy-in;
+            # it does not allocate persistent full-model gradient storage.
             if parameter.grad is None:
                 parameter.grad = gradient
             else:
