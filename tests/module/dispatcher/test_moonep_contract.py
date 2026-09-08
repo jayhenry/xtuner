@@ -235,14 +235,14 @@ def test_runtime_allows_triton_grouped_gemm(monkeypatch) -> None:
     ("environment_value", "effective_cutlass", "valid"),
     [(None, True, False), ("1", False, False), ("1", True, True)],
 )
-def test_runtime_requires_grouped_gemm_cutlass_backend(
+def test_capability_check_requires_grouped_gemm_cutlass_backend(
     monkeypatch, environment_value: str | None, effective_cutlass: bool, valid: bool
 ) -> None:
     pytest.importorskip("grouped_gemm")
     from grouped_gemm import backend as grouped_gemm_backend
 
     from xtuner.v1.module.dispatcher import moonep as moonep_integration
-    from xtuner.v1.module.dispatcher.moonep import MoonEPModelRuntime
+    from xtuner.v1.module.dispatcher.moonep_capability import check_config
     from xtuner.v1.module.grouped_linear import moe_group_linear
     from xtuner.v1.ops.moe.cuda import cutlass_group_gemm
 
@@ -264,20 +264,12 @@ def test_runtime_requires_grouped_gemm_cutlass_backend(
     else:
         monkeypatch.setenv("GROUPED_GEMM_USE_CUTLASS", environment_value)
 
-    kwargs = dict(
-        ep_group=SimpleNamespace(size=lambda: 4),
-        hidden_size=128,
-        intermediate_size=128,
-        num_experts=8,
-        top_k=2,
-        intra_layer_micro_batch=1,
-        staging_reference=False,
-    )
+    config = _moe_config(dispatcher="moonep", ep_size=4, n_routed_experts=8)
     if valid:
-        assert isinstance(MoonEPModelRuntime(**kwargs), MoonEPModelRuntime)
+        check_config(config)
     else:
         with pytest.raises(RuntimeError, match="grouped_gemm requires GROUPED_GEMM_USE_CUTLASS=1"):
-            MoonEPModelRuntime(**kwargs)
+            check_config(config)
 
 
 def test_runtime_reports_optional_backend_source_on_capability_mismatch(monkeypatch) -> None:

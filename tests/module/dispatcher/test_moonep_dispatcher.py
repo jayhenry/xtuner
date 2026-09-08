@@ -206,7 +206,7 @@ def test_staging_dispatcher_runs_the_public_forward_path(backend) -> None:
         dispatcher="moonep",
         n_routed_experts=4,
         ep_group=ep_group,
-        moonep_runtime=runtime,
+        ep_runtime=runtime,
         layer_fqn="layers.0.experts",
         projections=(experts.fused_w1w3, experts.fused_w2),
     )
@@ -311,7 +311,7 @@ def test_direct_install_failure_is_explicit_and_never_falls_back_to_staging(back
         dispatcher="moonep",
         n_routed_experts=4,
         ep_group=ep_group,
-        moonep_runtime=runtime,
+        ep_runtime=runtime,
         layer_fqn="layers.0.experts",
         projections=(experts.fused_w1w3, experts.fused_w2),
     )

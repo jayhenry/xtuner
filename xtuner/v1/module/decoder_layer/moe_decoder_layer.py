@@ -241,7 +241,7 @@ class MoEDecoderLayer(nn.Module):
         ep_mesh: DeviceMesh | None = None,
         expert_tp_mesh: DeviceMesh | None = None,
         ep_tp_mesh: DeviceMesh | None = None,
-        moonep_runtime=None,
+        ep_runtime=None,
         layer_fqn: str | None = None,
     ):
         super().__init__()
@@ -316,7 +316,7 @@ class MoEDecoderLayer(nn.Module):
             ep_group=process_group,
             tp_group=tp_group,
             ep_tp_group=ep_tp_group,
-            moonep_runtime=moonep_runtime,
+            ep_runtime=ep_runtime,
             layer_fqn=layer_fqn,
             projections=(self.experts.fused_w1w3, self.experts.fused_w2),
         )

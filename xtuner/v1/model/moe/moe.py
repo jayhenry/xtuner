@@ -63,6 +63,8 @@ from xtuner.v1.module import (
 )
 from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayer
 from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEActFnConfig, MoEBlock, MoEDecoderLayer, MoEGate
+from xtuner.v1.module.dispatcher import build_ep_execution_runtime
+from xtuner.v1.module.dispatcher.moonep_capability import check_config, check_fsdp_policy
 from xtuner.v1.module.mtp import MTPBlock, MTPConfig, MTPLayer
 from xtuner.v1.utils import (
     get_device,
@@ -204,9 +206,9 @@ class MoE(BaseModel):
 
     def __init__(self, config: MoEConfig):
         # Concrete MoE configs override build(), so validate dispatcher support
-        # at the shared model-construction boundary.
-        if config.dispatcher == "moonep" and config.float8_cfg is not None and config.float8_cfg.enable_float8:
-            raise ValueError("MoonEP currently requires BF16 expert compute; FP8 is not supported")
+        # at the shared model-construction boundary. MoonEP's config-only
+        # capability checks live in one entry point.
+        check_config(config)
         if config.dispatcher == "agrs":
             if config.expert_tp_size > 1:
                 raise NotImplementedError("AGRS with ExpertTP is not supported")
@@ -252,24 +254,10 @@ class MoE(BaseModel):
             self.expert_tp_mesh = None
             self.ep_tp_mesh = None
 
-        self._moonep_runtime = None
-        if config.dispatcher == "moonep":
-            if self.ep_mesh is None:
-                raise ValueError("MoonEP requires expert parallelism")
-            if config.moe_bias:
-                raise ValueError("MoonEP does not support routed-expert linear bias")
-            from xtuner.v1.module.dispatcher.moonep import MoonEPModelRuntime
-
-            self._moonep_runtime = MoonEPModelRuntime(
-                ep_group=self.ep_mesh.get_group(),
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                num_experts=config.n_routed_experts,
-                top_k=config.num_experts_per_tok,
-                intra_layer_micro_batch=config.intra_layer_micro_batch,
-                staging_reference=config.moonep_staging_reference,
-                num_sms=config.moonep_num_sms,
-            )
+        # Optional model-scoped EP execution runtime (MoonEP today, a no-op
+        # Adapter otherwise). Its four lifecycle boundaries are called
+        # unconditionally below.
+        self._ep_runtime = build_ep_execution_runtime(config, self.ep_mesh)
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, type=config.rms_norm_type)
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, bias=False)
@@ -1080,7 +1068,7 @@ class MoE(BaseModel):
                     ep_mesh=self.ep_mesh,
                     expert_tp_mesh=self.expert_tp_mesh,
                     ep_tp_mesh=self.ep_tp_mesh,
-                    moonep_runtime=self._moonep_runtime,
+                    ep_runtime=self._ep_runtime,
                     layer_fqn=f"layers.{layer_idx}.experts",
                 )
                 if self.config.freeze_routers:
@@ -1149,7 +1137,7 @@ class MoE(BaseModel):
                 ep_mesh=self.ep_mesh,
                 expert_tp_mesh=self.expert_tp_mesh,
                 ep_tp_mesh=self.ep_tp_mesh,
-                moonep_runtime=self._moonep_runtime,
+                ep_runtime=self._ep_runtime,
                 layer_fqn=f"mtp_block.layers.{i}.decoder_layer.experts",
             )
 
@@ -1191,8 +1179,8 @@ class MoE(BaseModel):
     ) -> Self:
         if fsdp_config.hsdp_sharding_size is not None and self.config.expert_tp_size > 1:
             raise NotImplementedError("HSDP with ExpertTP is not supported")
-        if self._moonep_runtime is not None:
-            self._moonep_runtime.validate_before_fsdp(fsdp_config)
+        check_fsdp_policy(self.config, fsdp_config)
+        self._ep_runtime.validate_before_fsdp(fsdp_config)
 
         self.fsdp_config = fsdp_config
         assert self.fsdp_config.ep_size == self.config.ep_size
@@ -1365,11 +1353,10 @@ class MoE(BaseModel):
 
         self._init_load_spec()
         self._to_empty_meta()
-        if self._moonep_runtime is not None:
-            self._moonep_runtime.install_after_fsdp(
-                fsdp_root=self,
-                execution_order=self.expert_bearing_layers_in_execution_order(),
-            )
+        self._ep_runtime.install_after_fsdp(
+            fsdp_root=self,
+            execution_order=self.expert_bearing_layers_in_execution_order(),
+        )
         return self
 
     def expert_bearing_layers_in_execution_order(self) -> list[str]:
@@ -1401,8 +1388,7 @@ class MoE(BaseModel):
 
     def close_ep_runtime(self) -> None:
         """Release optional dynamic-EP resources before PG teardown."""
-        if self._moonep_runtime is not None:
-            self._moonep_runtime.close()
+        self._ep_runtime.close()
 
     @property
     def need_update_bias(self) -> bool:

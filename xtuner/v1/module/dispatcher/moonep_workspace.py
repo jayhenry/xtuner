@@ -99,14 +99,11 @@ class _ExpertVMMWorkspace:
         experts_per_rank: int,
         home_generations: int,
     ) -> None:
-        # Publish the completed layout under lifecycle-managed private names;
-        # their detailed contracts remain centralized on _WorkspaceLayout.
-        self._landings = layout["landings"]
-        self._global_weights = layout["global_weights"]
-        self._local_weights = layout["local_weights"]
-        self._local_grad_outputs = layout["local_grad_outputs"]
-        self._distributed_duplicate_grads = layout["distributed_duplicate_grads"]
-        self._keepalives = layout["keepalives"]
+        # One field. Every view's shape, indexing, and storage ownership stay
+        # centralized on ``_WorkspaceLayout``; adding a view touches only the
+        # layout and its accessor, and the rank-divergence quarantine keeps
+        # the whole graph by referencing this one object.
+        self._layout: _WorkspaceLayout | None = layout
         self._ep_group = ep_group
         self._ep_rank = ep_rank
         self._num_experts = num_experts
@@ -407,6 +404,12 @@ class _ExpertVMMWorkspace:
     def destroyed(self) -> bool:
         return self._destroyed
 
+    @property
+    def _views(self) -> _WorkspaceLayout:
+        if self._layout is None:
+            raise RuntimeError("MoonEP workspace has been destroyed")
+        return self._layout
+
     def generation_for(self, execution_ordinal: int) -> int:
         """Issue the home generation for one physical layer in execution order.
 
@@ -419,9 +422,7 @@ class _ExpertVMMWorkspace:
 
     def landing(self, generation: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return projection-paired FSDP targets, each ``[B, O_p, I_p]``."""
-        if self._destroyed:
-            raise RuntimeError("MoonEP workspace has been destroyed")
-        return cast(tuple[torch.Tensor, torch.Tensor], self._landings[generation])
+        return cast(tuple[torch.Tensor, torch.Tensor], self._views["landings"][generation])
 
     def local_compute_view(
         self, *, hidden_nvsh: torch.Tensor, cu_seqlens: torch.Tensor
@@ -435,8 +436,7 @@ class _ExpertVMMWorkspace:
         ``NvS - sum(counts)`` on the last group so the GEMM still walks the
         full ``[NvS, H]``. Only small device metadata is computed here.
         """
-        if self._destroyed:
-            raise RuntimeError("MoonEP workspace has been destroyed")
+        _ = self._views
         counts = self._local_token_counts(cu_seqlens)
         covered = counts.sum()
         row_is_covered = torch.arange(hidden_nvsh.shape[0], device=hidden_nvsh.device) < covered
@@ -447,14 +447,12 @@ class _ExpertVMMWorkspace:
     def prefetch_weights(self, *, buffer, plan, generation: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Prefetch the global ``[E+B]`` weights and return this generation's
         local ``[2B]`` compute aliases."""
-        if self._destroyed:
-            raise RuntimeError("MoonEP workspace has been destroyed")
         buffer.prefetch_weight(
             plan=plan,
-            projections=self._global_weights[generation],
+            projections=self._views["global_weights"][generation],
             async_finish=False,
         )
-        return cast(tuple[torch.Tensor, torch.Tensor], self._local_weights[generation])
+        return cast(tuple[torch.Tensor, torch.Tensor], self._views["local_weights"][generation])
 
     def return_expert_gradients(
         self, *, buffer, plan, gradients, grad_slot: int, initialize: bool
@@ -468,8 +466,6 @@ class _ExpertVMMWorkspace:
         to otherwise; the duplicate suffix is slot-local. ``reduce_grad_bf16``
         then sums the EP partials without dividing.
         """
-        if self._destroyed:
-            raise RuntimeError("MoonEP workspace has been destroyed")
         if not 0 <= grad_slot < self._gradient_slots:
             raise ValueError(f"gradient slot out of range: {grad_slot}")
         gradients = tuple(gradients)
@@ -486,7 +482,7 @@ class _ExpertVMMWorkspace:
                 target.shape,
                 target.stride(),
             )
-            for target in self._local_grad_outputs[grad_slot]
+            for target in self._views["local_grad_outputs"][grad_slot]
         )
         for target, gradient in zip(targets, gradients, strict=True):
             if initialize:
@@ -496,7 +492,7 @@ class _ExpertVMMWorkspace:
         buffer.reduce_grad_bf16(
             plan=plan,
             local_grads=targets,
-            distributed_duplicate_grads=self._distributed_duplicate_grads[grad_slot],
+            distributed_duplicate_grads=self._views["distributed_duplicate_grads"][grad_slot],
             async_finish=False,
         )
         return targets[0][:b], targets[1][:b]
@@ -519,36 +515,18 @@ class _ExpertVMMWorkspace:
             return
         torch.cuda.synchronize()
         dist.barrier(group=self._ep_group)
-        self._landings = ()
-        self._global_weights = ()
-        self._local_weights = ()
-        self._local_grad_outputs = ()
-        self._distributed_duplicate_grads = ()
-        self._keepalives = ()
+        self._layout = None
         self._destroyed = True
 
     def __del__(self) -> None:
-        if getattr(self, "_destroyed", True):
+        if getattr(self, "_destroyed", True) or getattr(self, "_layout", None) is None:
             return
         warnings.warn(
             "MoonEP workspace was not destroyed explicitly; resources may leak.",
             ResourceWarning,
         )
-        # Keep mappings alive instead of tearing CUDA/VMM state down after
-        # distributed ranks may have diverged during interpreter shutdown.
-        _UNDISPOSED_WORKSPACE_TENSORS.append(
-            (
-                self._landings,
-                self._global_weights,
-                self._local_weights,
-                self._local_grad_outputs,
-                self._distributed_duplicate_grads,
-                self._keepalives,
-            )
-        )
-        self._landings = ()
-        self._global_weights = ()
-        self._local_weights = ()
-        self._local_grad_outputs = ()
-        self._distributed_duplicate_grads = ()
-        self._keepalives = ()
+        # Keep the whole view graph alive by referencing the one layout object
+        # instead of tearing CUDA/VMM state down after distributed ranks may
+        # have diverged during interpreter shutdown.
+        _UNDISPOSED_WORKSPACE_TENSORS.append(self._layout)
+        self._layout = None

@@ -11,7 +11,6 @@ private VMM workspace remains the deep module for physical expert layout.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -264,23 +263,11 @@ class MoonEPModelRuntime:
         staging_reference: bool,
         num_sms: int = 64,
     ) -> None:
+        # Config-level capability validation (backend version, EP geometry,
+        # dtype, grouped-GEMM backend, ...) lives in ``moonep_capability`` and
+        # runs at meta model build. Keep only the optional-backend gate here so
+        # direct construction still fails fast.
         require_moonep_backend()
-        if intra_layer_micro_batch < 1:
-            raise ValueError("intra_layer_micro_batch must be positive")
-
-        # MoonEP keeps token counts device-resident. Triton already satisfies
-        # that contract; grouped_gemm does so only with its CUTLASS backend.
-        # Validate this once here instead of branching in every GMM call.
-        from xtuner.v1.module.grouped_linear import moe_group_linear
-        from xtuner.v1.ops.moe.cuda import cutlass_group_gemm
-
-        if cutlass_group_gemm is not None and moe_group_linear.group_gemm is cutlass_group_gemm:
-            from grouped_gemm import backend as grouped_gemm_backend
-
-            if os.environ.get("GROUPED_GEMM_USE_CUTLASS") != "1" or not grouped_gemm_backend.use_cutlass:
-                raise RuntimeError(
-                    "MoonEP with grouped_gemm requires GROUPED_GEMM_USE_CUTLASS=1 before importing grouped_gemm"
-                )
 
         self._ep_group = ep_group
         self._hidden_size = hidden_size
@@ -296,7 +283,7 @@ class MoonEPModelRuntime:
         self._resources: _MoonEPResources | None = None
         self._closed = False
 
-    def build_dispatcher(
+    def bind_layer(
         self,
         *,
         layer_fqn: str,
@@ -310,15 +297,10 @@ class MoonEPModelRuntime:
         return MoonEPDispatcher(runtime=self, layer=layer)
 
     def validate_before_fsdp(self, fsdp_config: Any) -> None:
-        """Validate the build-time FSDP policy without retaining its config."""
-        if fsdp_config.param_dtype is not torch.bfloat16 or fsdp_config.reduce_dtype is not torch.bfloat16:
-            raise ValueError("MoonEP requires BF16 FSDP param and reduce dtypes")
-        if fsdp_config.cpu_offload:
-            raise ValueError("MoonEP VMM weights cannot use FSDP CPU offload")
-        if not fsdp_config.requires_grad:
-            raise ValueError("MoonEP v1 requires trainable FSDP parameters")
-        if not fsdp_config.reshard_after_forward:
-            raise ValueError("MoonEP requires reshard_after_forward=True")
+        # The build-time FSDP policy checks moved to ``moonep_capability``.
+        # This boundary stays because the Protocol needs it and a future
+        # backend may have its own FSDP preconditions.
+        del fsdp_config
 
     def install_after_fsdp(self, *, fsdp_root: nn.Module, execution_order: list[str]) -> None:
         """Allocate execution resources after native FSDP has been
