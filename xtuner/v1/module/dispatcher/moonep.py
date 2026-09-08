@@ -355,10 +355,10 @@ class MoonEPModelRuntime:
     @property
     def resources(self) -> _MoonEPResources:
         """One place decides "is MoonEP installed"."""
-        if self._resources is None:
-            raise RuntimeError("MoonEP FSDP resources must be installed before forward")
         if self._closed:
             raise RuntimeError("MoonEP runtime was closed")
+        if self._resources is None:
+            raise RuntimeError("MoonEP FSDP resources must be installed before forward")
         return self._resources
 
     def close(self) -> None:
