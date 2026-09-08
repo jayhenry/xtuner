@@ -270,22 +270,24 @@ class MoonEPPreDispatchResult(TypedDict):
 
 
 class MoonEPDispatchResult(TypedDict):
-    """Stage 2: global dispatch outputs plus its eager control-plane state."""
+    """Stage 2: global dispatch outputs.
+
+    The call state travels on ``MoonEPPreDispatchResult`` only; every later
+    stage already receives ``pre_dispatched`` and reads ``_moonep_call`` there.
+    """
 
     hidden_states: torch.Tensor  # [NvS, H], BF16 physical VM-group order.
     topk_weights: torch.Tensor  # [NvS], FP32 weights in the same row order.
     # [E+B], int32 padded group ends; stays on device and is non-differentiable.
     cu_seqlens: torch.Tensor
-    # Opaque per-call state shared by later stages; never enters compiled expert compute.
-    _moonep_call: _MoonEPLayerCallState
 
 
 class MoonEPPostDispatchResult(PostDispatchResult):
     """Stage 3: tensor-only local ``[2B]`` expert-compute bundle.
 
     ``hidden_states`` is ``[NvS, H]``; ``tokens_per_expert`` is device int32
-    ``[2B]`` for home then duplicate groups; ``expert_weight_layout`` holds
-    projection-paired ``[2B, O_p, I_p]`` weights and direct BF16 WGrad targets.
+    ``[2B]`` for home then duplicate groups; ``expert_weight_layout`` holds the
+    projection-paired ``[2B, O_p, I_p]`` call-local weight aliases.
     """
 
 
@@ -386,7 +388,6 @@ def begin_dispatch(
         hidden_states=hidden_nvsh,
         topk_weights=weights_nvs,
         cu_seqlens=cu_seqlens,
-        _moonep_call=state,
     )
 
 
@@ -438,12 +439,11 @@ def prepare_experts(state: _MoonEPLayerCallState, dispatched: MoonEPDispatchResu
 
     local_weights = state.local_weights
     state.local_weights = None
-    # Keep the allocation-return GEMM interface. Joining activation and both
-    # weight edges makes staging precede upstream activation backward; a
-    # weight-only hook cannot establish that dependency.
-    hidden_states, w13, w2 = _MoonEPExpertGradBridge.apply(
-        hidden_states, nn.Parameter(local_weights[0]), nn.Parameter(local_weights[1]), state
-    )
+    # Join activation and both weight edges so staging precedes upstream
+    # activation backward; a weight-only hook cannot establish that dependency.
+    # The bridge already makes the aliases require grad, so grouped GEMM
+    # returns their dW without a leaf ``nn.Parameter`` wrapper.
+    hidden_states, w13, w2 = _MoonEPExpertGradBridge.apply(hidden_states, local_weights[0], local_weights[1], state)
     return MoonEPPostDispatchResult(
         hidden_states=hidden_states,
         tokens_per_expert=local_counts,
@@ -929,8 +929,8 @@ class MoonEPDispatcher(
         dispatched: MoonEPDispatchResult,
         async_op: bool = False,
     ) -> MoonEPPostDispatchResult:
-        del pre_dispatched, async_op
-        return prepare_experts(dispatched["_moonep_call"], dispatched)
+        del async_op
+        return prepare_experts(pre_dispatched["_moonep_call"], dispatched)
 
     @override
     def combine_preprocess(
@@ -957,10 +957,10 @@ class MoonEPDispatcher(
         async_op: bool = False,
         decoding: bool = False,
     ) -> MoonEPCombineResult:
-        del pre_dispatched, post_dispatched, decoding
+        del post_dispatched, decoding
         return MoonEPCombineResult(
             hidden_states=begin_combine(
-                dispatched["_moonep_call"],
+                pre_dispatched["_moonep_call"],
                 expert_output=pre_combined["hidden_states"],
                 route_weights=dispatched["topk_weights"],
                 async_op=async_op,
@@ -978,10 +978,10 @@ class MoonEPDispatcher(
         combined: MoonEPCombineResult,
         async_op: bool = False,
     ) -> MoonEPPostCombineResult:
-        del pre_dispatched, post_dispatched, pre_combined
+        del post_dispatched, pre_combined
         return MoonEPPostCombineResult(
             hidden_states=finish_combine(
-                dispatched["_moonep_call"],
+                pre_dispatched["_moonep_call"],
                 combined["hidden_states"],
                 async_op=async_op,
             )

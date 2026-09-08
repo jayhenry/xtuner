@@ -84,9 +84,9 @@ def test_non_moonep_fp8_accepts_the_uniform_grouped_linear_interface() -> None:
     hidden_states = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
     counts = torch.tensor([2, 2], device="cuda", dtype=torch.int64)
 
-    output = layer(hidden_states, counts, trainable_wgrad_out=None)
+    output = layer(hidden_states, counts)
 
     assert output.shape == (4, 128)
     assert torch.isfinite(output).all()
-    with pytest.raises(NotImplementedError, match="preallocated trainable WGrad"):
-        layer(hidden_states, counts, trainable_wgrad_out=torch.empty_like(layer.weight))
+    with pytest.raises(NotImplementedError, match="trainable weight override"):
+        layer(hidden_states, counts, trainable_weight=torch.empty_like(layer.weight))

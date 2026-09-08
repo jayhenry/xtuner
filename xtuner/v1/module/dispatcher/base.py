@@ -19,12 +19,14 @@ ProjectionPair: TypeAlias = tuple[torch.Tensor, torch.Tensor]
 
 
 class ExpertWeightLayout(NamedTuple):
-    """Call-local expert weight ownership at the dispatcher/MLP seam."""
+    """Call-local expert weight ownership at the dispatcher/MLP seam.
+
+    A dynamic-EP backend may hand ``MoEBlock`` a call-local weight alias whose
+    dW still returns through autograd. Direct-output WGrad and external
+    (two-segment) storage are not part of the first-version contract.
+    """
 
     trainable_weights: ProjectionPair | None = None
-    trainable_wgrad_outs: ProjectionPair | None = None
-    external_weights: ProjectionPair | None = None
-    external_wgrad_outs: ProjectionPair | None = None
 
 
 def _get_backward_pre_hook(backward_previous_event: torch.cuda.Event):

@@ -252,7 +252,6 @@ def test_staging_dispatcher_runs_the_public_forward_path(backend) -> None:
     assert post["expert_weight_layout"].trainable_weights is not None
     assert all(isinstance(weight, torch.Tensor) for weight in post["expert_weight_layout"].trainable_weights)
     assert post["expert_weight_layout"].trainable_weights[0].shape == (4, 256, 128)
-    assert post["expert_weight_layout"].trainable_wgrad_outs is None
     assert torch.equal(result["hidden_states"], hidden_states * 0.5)
     assert not result["hidden_states"].requires_grad
     assert runtime._buffer.num_sms == 64
