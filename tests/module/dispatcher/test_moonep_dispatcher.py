@@ -257,9 +257,9 @@ def test_staging_dispatcher_runs_the_public_forward_path(backend) -> None:
     assert not result["hidden_states"].requires_grad
     assert runtime._buffer.num_sms == 64
 
-    invocation_ref = weakref.ref(layer_state)
+    call_state_ref = weakref.ref(layer_state)
     del layer_state, layer_states, pre, dispatched, post, pre_combined, combined
-    assert invocation_ref() is None
+    assert call_state_ref() is None
 
     with pytest.raises(RuntimeError, match="requires layer_state from prepare_layer_input"):
         dispatcher.dispatch_preprocess(
@@ -346,7 +346,7 @@ def test_gradient_reduce_start_uses_the_workspace_targets_once() -> None:
         return operation(), event
 
     runtime._enqueue = enqueue
-    invocation = moonep_integration._MoonEPLayerInvocation(
+    call_state = moonep_integration._MoonEPLayerCallState(
         runtime=runtime,
         layer_fqn="layers.0.experts",
         projections=(nn.Linear(3, 3), nn.Linear(3, 3)),
@@ -354,42 +354,48 @@ def test_gradient_reduce_start_uses_the_workspace_targets_once() -> None:
         grad_slot=0,
         layer_gradients=moonep_integration._MoonEPLayerGradients(),
     )
-    invocation._plan = object()
+    call_state.plan = object()
     home_parameters = (
         nn.Parameter(torch.zeros_like(local_grads[0][:2])),
         nn.Parameter(torch.zeros_like(local_grads[1][:2])),
     )
-    invocation._home_parameters = home_parameters
-    invocation._fallback_gradient_targets = fallback
+    call_state.home_parameters = home_parameters
+    call_state.fallback_gradient_targets = fallback
 
-    invocation._start_gradient_completion(local_grads)
+    moonep_integration.start_gradient_completion(call_state, local_grads)
 
     assert len(calls) == 1
     assert all(actual is expected for actual, expected in zip(calls[0], fallback, strict=True))
     assert event.waits == 0
 
-    parameters, gradients = invocation._finish_gradient_completion()
+    parameters, gradients = moonep_integration.finish_gradient_completion(call_state)
     assert event.waits == 1
     assert parameters is home_parameters
     for parameter, actual, expected in zip(parameters, gradients, local_grads, strict=True):
         assert parameter.grad is None  # Only the layer Join publishes H.
         torch.testing.assert_close(actual, expected[:2])
-    assert invocation._fallback_gradient_targets is None
+    assert call_state.fallback_gradient_targets is None
 
 
-def test_gradient_reduce_start_and_join_preserve_device_order() -> None:
+def test_gradient_reduce_start_and_join_preserve_device_order(monkeypatch) -> None:
+    from xtuner.v1.module.dispatcher import moonep as moonep_integration
+
     events: list[str] = []
     targets = (torch.zeros(4), torch.zeros(4))
 
-    class _Invocation:
-        def _start_gradient_completion(self, gradients) -> None:
-            for target, gradient in zip(targets, gradients, strict=True):
-                target.copy_(gradient)
-            events.append("start")
+    def fake_start(call_state, gradients) -> None:
+        del call_state
+        for target, gradient in zip(targets, gradients, strict=True):
+            target.copy_(gradient)
+        events.append("start")
 
-        def _finish_gradient_completion(self):
-            events.append("finish")
-            return (nn.Parameter(torch.zeros(4)), nn.Parameter(torch.zeros(4))), targets
+    def fake_finish(call_state):
+        del call_state
+        events.append("finish")
+        return (nn.Parameter(torch.zeros(4)), nn.Parameter(torch.zeros(4))), targets
+
+    monkeypatch.setattr(moonep_integration, "start_gradient_completion", fake_start)
+    monkeypatch.setattr(moonep_integration, "finish_gradient_completion", fake_finish)
 
     class _WriteWGrad(torch.autograd.Function):
         @staticmethod
@@ -402,12 +408,12 @@ def test_gradient_reduce_start_and_join_preserve_device_order() -> None:
             events.append(f"projection-{ctx.projection}")
             return grad, torch.full_like(grad, ctx.projection + 1), None
 
-    invocation = _Invocation()
+    call_state = object()
     source = torch.ones(4, requires_grad=True)
 
-    (joined,) = _MoonEPLayerGradJoin.apply((invocation,), source)
+    (joined,) = _MoonEPLayerGradJoin.apply((call_state,), source)
     started, w0, w1 = _MoonEPExpertGradBridge.apply(
-        joined, nn.Parameter(torch.ones(4)), nn.Parameter(torch.ones(4)), invocation
+        joined, nn.Parameter(torch.ones(4)), nn.Parameter(torch.ones(4)), call_state
     )
     projection_0 = _WriteWGrad.apply(started, w0, 0)
     projection_1 = _WriteWGrad.apply(projection_0, w1, 1)
