@@ -120,17 +120,33 @@ class _Workspace:
         cls.allocated.append(instance)
         return instance
 
+    def generation_for(self, ordinal):
+        return ordinal % 2
+
     def landing(self, generation):
         return self._landings[generation]
 
-    def prefetch_weights(self, *, buffer, plan, generation, grad_slot):
+    def prefetch_weights(self, *, buffer, plan, generation):
         landings = self.landing(generation)
         local_weights = tuple(torch.cat((weight, torch.zeros_like(weight))) for weight in landings)
         buffer.prefetch_weight(plan=plan, projections=landings, async_finish=False)
-        return local_weights, self._slots[grad_slot]
+        return local_weights
 
-    def local_token_counts(self, cu_seqlens):
-        return torch.tensor([cu_seqlens[-1], 0, 0, 0], dtype=torch.int32)
+    def local_compute_view(self, *, hidden_nvsh, cu_seqlens):
+        b = self._landings[0][0].shape[0]
+        counts = torch.tensor([hidden_nvsh.shape[0]] + [0] * (2 * b - 1), dtype=torch.int32)
+        return hidden_nvsh, counts
+
+    def return_expert_gradients(self, *, buffer, plan, gradients, grad_slot, initialize):
+        del buffer, plan
+        b = self._landings[0][0].shape[0]
+        targets = self._slots[grad_slot]
+        for target, gradient in zip(targets, gradients, strict=True):
+            if initialize:
+                target[:b].zero_()
+            target[:b].add_(gradient[:b])
+            target[b:].copy_(gradient[b:])
+        return targets[0][:b], targets[1][:b]
 
     def destroy(self) -> None:
         self.destroyed = True
@@ -162,8 +178,8 @@ def backend(monkeypatch):
     monkeypatch.setattr(moonep_integration.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(moonep_integration.torch.cuda, "current_stream", lambda: stream)
     monkeypatch.setattr(
-        MoonEPModelRuntime,
-        "_enqueue",
+        moonep_integration._MoonEPResources,
+        "enqueue",
         lambda self, operation, inputs=(): (operation(), _Event()),
     )
     monkeypatch.setattr(
@@ -203,7 +219,7 @@ def test_staging_dispatcher_runs_the_public_forward_path(backend) -> None:
             reshard_after_forward=True,
         )
     )
-    runtime.install_after_fsdp(fsdp_root=experts)
+    runtime.install_after_fsdp(fsdp_root=experts, execution_order=["layers.0.experts"])
 
     hidden_states = torch.randn(3, 128, dtype=torch.bfloat16, requires_grad=True)
     topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int64)
@@ -222,7 +238,7 @@ def test_staging_dispatcher_runs_the_public_forward_path(backend) -> None:
             layer_state=layer_state,
         )
         dispatched = dispatcher.dispatch(pre_dispatched=pre, topk_weights=route_weights)
-        assert runtime._buffer.prefetch_calls == 1
+        assert runtime.resources.buffer.prefetch_calls == 1
         post = dispatcher.dispatch_postprocess(pre_dispatched=pre, dispatched=dispatched)
         pre_combined = dispatcher.combine_preprocess(
             hidden_states=post["hidden_states"],
@@ -254,7 +270,7 @@ def test_staging_dispatcher_runs_the_public_forward_path(backend) -> None:
     assert post["expert_weight_layout"].trainable_weights[0].shape == (4, 256, 128)
     assert torch.equal(result["hidden_states"], hidden_states * 0.5)
     assert not result["hidden_states"].requires_grad
-    assert runtime._buffer.num_sms == 64
+    assert runtime.resources.buffer.num_sms == 64
 
     call_state_ref = weakref.ref(layer_state)
     del layer_state, layer_states, pre, dispatched, post, pre_combined, combined
@@ -310,12 +326,12 @@ def test_direct_install_failure_is_explicit_and_never_falls_back_to_staging(back
         )
     )
     with pytest.raises(RuntimeError, match="could not find FSDPParam"):
-        runtime.install_after_fsdp(fsdp_root=experts)
+        runtime.install_after_fsdp(fsdp_root=experts, execution_order=["layers.0.experts"])
 
     assert _Workspace.allocated[-1].destroyed
 
 
-def test_gradient_reduce_start_uses_the_workspace_targets_once() -> None:
+def test_gradient_reduce_start_hands_dw_to_the_workspace_once() -> None:
     from xtuner.v1.module.dispatcher import moonep as moonep_integration
 
     class _CompletionEvent:
@@ -325,55 +341,52 @@ def test_gradient_reduce_start_uses_the_workspace_targets_once() -> None:
         def wait(self) -> None:
             self.waits += 1
 
-    local_grads = tuple(torch.arange(24, dtype=torch.bfloat16).view(4, 2, 3) + projection for projection in range(2))
-    fallback = tuple(gradient.clone() for gradient in local_grads)
-    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+    gradients = tuple(torch.arange(24, dtype=torch.bfloat16).view(4, 2, 3) + projection for projection in range(2))
+    calls: list[tuple] = []
     event = _CompletionEvent()
 
     class _Workspace:
-        def complete_gradients(self, *, local_grads, **kwargs):
-            del kwargs
-            calls.append(local_grads)
-            return local_grads[0][:2], local_grads[1][:2]
-
-    runtime = SimpleNamespace(
-        _workspace=_Workspace(), _buffer=object(), _num_experts=4, _ep_group=SimpleNamespace(size=lambda: 2)
-    )
+        def return_expert_gradients(self, *, buffer, plan, gradients, grad_slot, initialize):
+            del buffer, plan
+            calls.append((gradients, grad_slot, initialize))
+            return gradients[0][:2], gradients[1][:2]
 
     def enqueue(operation, inputs=()):
         del inputs
         return operation(), event
 
-    runtime._enqueue = enqueue
+    resources = SimpleNamespace(workspace=_Workspace(), buffer=object(), enqueue=enqueue)
+    layer = moonep_integration._MoonEPLayer(
+        fqn="layers.0.experts", projections=(nn.Linear(3, 3), nn.Linear(3, 3)), ordinal=0
+    )
     call_state = moonep_integration._MoonEPLayerCallState(
-        runtime=runtime,
-        layer_fqn="layers.0.experts",
-        projections=(nn.Linear(3, 3), nn.Linear(3, 3)),
+        resources=resources,
+        layer=layer,
         generation=0,
         grad_slot=0,
         layer_gradients=moonep_integration._MoonEPLayerGradients(),
     )
     call_state.plan = object()
     home_parameters = (
-        nn.Parameter(torch.zeros_like(local_grads[0][:2])),
-        nn.Parameter(torch.zeros_like(local_grads[1][:2])),
+        nn.Parameter(torch.zeros_like(gradients[0][:2])),
+        nn.Parameter(torch.zeros_like(gradients[1][:2])),
     )
     call_state.home_parameters = home_parameters
-    call_state.fallback_gradient_targets = fallback
 
-    moonep_integration.start_gradient_completion(call_state, local_grads)
+    moonep_integration.start_gradient_completion(call_state, gradients)
 
     assert len(calls) == 1
-    assert all(actual is expected for actual, expected in zip(calls[0], fallback, strict=True))
+    assert calls[0][1] == 0 and calls[0][2] is True
+    assert call_state.layer_gradients.initialized is True
     assert event.waits == 0
 
-    parameters, gradients = moonep_integration.finish_gradient_completion(call_state)
+    parameters, home_grads = moonep_integration.finish_gradient_completion(call_state)
     assert event.waits == 1
     assert parameters is home_parameters
-    for parameter, actual, expected in zip(parameters, gradients, local_grads, strict=True):
+    for parameter, actual, expected in zip(parameters, home_grads, gradients, strict=True):
         assert parameter.grad is None  # Only the layer Join publishes H.
         torch.testing.assert_close(actual, expected[:2])
-    assert call_state.fallback_gradient_targets is None
+    assert call_state.gradient_completion is None
 
 
 def test_gradient_reduce_start_and_join_preserve_device_order(monkeypatch) -> None:

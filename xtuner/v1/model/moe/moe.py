@@ -1366,8 +1366,30 @@ class MoE(BaseModel):
         self._init_load_spec()
         self._to_empty_meta()
         if self._moonep_runtime is not None:
-            self._moonep_runtime.install_after_fsdp(fsdp_root=self)
+            self._moonep_runtime.install_after_fsdp(
+                fsdp_root=self,
+                execution_order=self.expert_bearing_layers_in_execution_order(),
+            )
         return self
+
+    def expert_bearing_layers_in_execution_order(self) -> list[str]:
+        """FQNs of the routed-expert modules in FSDP execution order.
+
+        This is the single source the MoonEP install cross-checks against its
+        construction-order registration: main decoder layers first (skipping
+        the dense prefix), then the MTP physical layers. It is derived from the
+        module structure, not a stored list, so a drift from construction order
+        (or a single-layer + MTP model) fails loudly here.
+        """
+        order = [
+            f"layers.{layer_idx}.experts"
+            for layer_idx, layer in self.layers.items()
+            if isinstance(getattr(layer, "_checkpoint_wrapped_module", layer), MoEDecoderLayer)
+        ]
+        if self.mtp_block is not None and self.config.mtp_config is not None:
+            num_physical = 1 if self.config.mtp_config.share_weights else self.config.mtp_config.num_layers
+            order += [f"mtp_block.layers.{i}.decoder_layer.experts" for i in range(num_physical)]
+        return order
 
     @property
     @override

@@ -59,8 +59,198 @@ def require_moonep_backend() -> Any:
     return _moonep_backend
 
 
+@dataclass(frozen=True)
+class _MoonEPLayer:
+    """One physical routed layer's identity, stored once.
+
+    ``ordinal`` is the FSDP execution-order position; the home generation is
+    issued from it by the workspace, so it is not stored here.
+    """
+
+    fqn: str
+    projections: tuple[nn.Module, nn.Module]
+    ordinal: int
+
+
+@dataclass(frozen=True)
+class _MoonEPResources:
+    """The only non-``None`` state after ``install_after_fsdp``.
+
+    The call state borrows this record instead of the runtime; ``buffer_for``
+    and ``enqueue`` are its two methods. ``_buffer_box`` is a one-slot mutable
+    box holding ``(Buffer, Fixed-S)`` because the activation Buffer is still
+    built lazily on the first forward once Fixed-S is known.
+    """
+
+    workspace: _ExpertVMMWorkspace
+    landing: ExpertLandingAdapter
+    comm_stream: torch.cuda.Stream
+    ep_group: dist.ProcessGroup
+    num_experts: int
+    experts_per_rank: int
+    top_k: int
+    hidden_size: int
+    gradient_slots: int
+    num_sms: int
+    _buffer_box: list
+
+    def buffer_for(self, tokens_per_rank: int) -> Any:
+        """Dispatch entry: build the Fixed-S Buffer once, then check S."""
+        if not self._buffer_box:
+            assert _moonep_backend is not None
+            buffer = _moonep_backend.Buffer(
+                S=tokens_per_rank,
+                H=self.hidden_size,
+                K=self.top_k,
+                E=self.num_experts,
+                num_ep_ranks=self.ep_group.size(),
+                group=self.ep_group,
+                explicitly_destroy=True,
+                num_sms=self.num_sms,
+            )
+            self._buffer_box.append((buffer, tokens_per_rank))
+        buffer, fixed_s = self._buffer_box[0]
+        if tokens_per_rank != fixed_s:
+            raise RuntimeError(f"MoonEP fixed S changed: {fixed_s} -> {tokens_per_rank}")
+        return buffer
+
+    @property
+    def buffer(self) -> Any:
+        """Combine/backward entry: the Buffer this call's dispatch built."""
+        if not self._buffer_box:
+            raise RuntimeError("MoonEP Buffer must be created by dispatch first")
+        return self._buffer_box[0][0]
+
+    def expect_tokens_per_rank(self, tokens_per_rank: int) -> None:
+        """Reject a changed Fixed-S before the first Dispatcher/VMM op."""
+        if self._buffer_box and tokens_per_rank != self._buffer_box[0][1]:
+            raise RuntimeError(f"MoonEP fixed S changed: {self._buffer_box[0][1]} -> {tokens_per_rank}")
+
+    def enqueue(self, operation, *, inputs: tuple[torch.Tensor | None, ...] = ()):
+        """Run one MoonEP transaction on XTuner's stream and return its
+        event."""
+        caller_stream = torch.cuda.current_stream()
+        self.comm_stream.wait_event(caller_stream.record_event())
+        for tensor in inputs:
+            if tensor is not None:
+                tensor.record_stream(self.comm_stream)
+        with torch.cuda.stream(self.comm_stream):
+            result = operation()
+            done = self.comm_stream.record_event()
+        return result, done
+
+    def home_generation(self, layer: _MoonEPLayer) -> int:
+        """The workspace owns the physical chunks and issues the generation."""
+        return self.workspace.generation_for(layer.ordinal)
+
+
+class ExpertLandingAdapter:
+    """Make one generation's home weights ready and hand back its Parameters.
+
+    ``DirectVMMLanding`` is the production path (FSDP unpacks straight into VMM
+    home rows); ``StagingReferenceLanding`` is the numerical-reference path
+    (FSDP lands normal storage, then copies into the VMM home rows). Both are
+    the two Adapters of one Seam, so the runtime and transaction functions
+    only call ``prepare`` and never branch on a ``staging_reference`` flag.
+    """
+
+    def install(
+        self, *, fsdp_root: nn.Module, workspace: _ExpertVMMWorkspace, layers: tuple[_MoonEPLayer, ...]
+    ) -> None:
+        raise NotImplementedError
+
+    def prepare(self, *, layer: _MoonEPLayer, generation: int) -> tuple[nn.Parameter, nn.Parameter]:
+        raise NotImplementedError
+
+    def uninstall(self) -> None:
+        raise NotImplementedError
+
+
+class DirectVMMLanding(ExpertLandingAdapter):
+    """FSDP's final per-parameter unpack lands directly in the VMM home
+    rows."""
+
+    def __init__(self) -> None:
+        self._fsdp_params: tuple[Any, ...] = ()
+
+    @override
+    def install(self, *, fsdp_root, workspace, layers):
+        self._fsdp_params = install_fsdp_vmm_landing(
+            fsdp_root=fsdp_root,
+            targets=tuple(
+                (layer.fqn, layer.projections, workspace.landing(workspace.generation_for(layer.ordinal)))
+                for layer in layers
+            ),
+        )
+
+    @override
+    def prepare(self, *, layer, generation):
+        # "Ready" is one check: FSDP has already materialized the weight in
+        # the VMM landing, so there is no copy.
+        del generation
+        return fsdp_current_unsharded_expert_parameters(layer.projections)
+
+    @override
+    def uninstall(self) -> None:
+        if self._fsdp_params:
+            uninstall_fsdp_vmm_landing(self._fsdp_params)
+            self._fsdp_params = ()
+
+
+class StagingReferenceLanding(ExpertLandingAdapter):
+    """FSDP lands normal storage first, then this copies it into the VMM home
+    rows."""
+
+    def __init__(self) -> None:
+        log_rank0.warning(
+            "moonep_staging_reference=True copies complete BF16 home expert "
+            "weights after every FSDP AllGather; it is a numerical reference, "
+            "not the production performance path."
+        )
+        self._workspace: _ExpertVMMWorkspace | None = None
+
+    @override
+    def install(self, *, fsdp_root, workspace, layers):
+        # No FSDP binding is installed: that is what distinguishes the two
+        # Adapters. The copy happens in ``prepare``.
+        del fsdp_root, layers
+        self._workspace = workspace
+
+    @override
+    def prepare(self, *, layer, generation):
+        assert self._workspace is not None
+        parameters: list[nn.Parameter] = []
+        for linear, landing in zip(layer.projections, self._workspace.landing(generation), strict=True):
+            weight = cast(torch.Tensor, linear.weight)
+            if not isinstance(weight, nn.Parameter):
+                raise RuntimeError(f"{layer.fqn} staging expected an unsharded expert Parameter")
+            source = weight.to_local() if isinstance(weight, DTensor) else weight
+            if source.dtype is not torch.bfloat16 or source.numel() != landing.numel():
+                raise RuntimeError(f"{layer.fqn} staging expected an unsharded BF16 expert weight")
+            with torch.no_grad():
+                landing.copy_(source.view_as(landing))
+            parameters.append(weight)
+        return parameters[0], parameters[1]
+
+    @override
+    def uninstall(self) -> None:
+        self._workspace = None
+
+
+def build_landing_adapter(staging_reference: bool) -> ExpertLandingAdapter:
+    if staging_reference:
+        return StagingReferenceLanding()
+    return DirectVMMLanding()
+
+
 class MoonEPModelRuntime:
-    """Own the resources shared by all routed layers in one model/EP group."""
+    """Own the lifecycle and ordered layer registry for one model/EP group.
+
+    Construction takes no CUDA resources. ``build_dispatcher`` registers one
+    physical routed layer per call in construction order; ``install_after_fsdp``
+    allocates the workspace, cross-checks registration order against FSDP
+    execution order, and installs the landing Adapter.
+    """
 
     def __init__(
         self,
@@ -97,23 +287,13 @@ class MoonEPModelRuntime:
         self._intermediate_size = intermediate_size
         self._num_experts = num_experts
         self._top_k = top_k
-        self._intra_layer_micro_batch = intra_layer_micro_batch
-        self._staging_reference = staging_reference
         self._num_sms = num_sms
+        self._gradient_slots = intra_layer_micro_batch
+        self._landing = build_landing_adapter(staging_reference)
 
-        # Model-owned execution resources. Buffer is created lazily once S is
-        # known; workspace/stream and FSDP bindings are installed as one unit.
-        self._buffer: Any | None = None
-        self._workspace: _ExpertVMMWorkspace | None = None
-        self._comm_stream: torch.cuda.Stream | None = None
-        self._fsdp_params: tuple[Any, ...] = ()
-
-        # Physical routed layers in FSDP execution order. Each entry is
-        # (layer FQN, (fused_w1w3, fused_w2), landing generation).
-        self._layers: list[tuple[str, tuple[nn.Module, nn.Module], int]] = []
-        # MoonEP allocates fixed-size communication buffers on the first call;
-        # later calls must retain the same source-token count S per EP rank.
-        self._fixed_tokens_per_rank: int | None = None
+        # Physical routed layers in registration (construction) order.
+        self._layers: list[_MoonEPLayer] = []
+        self._resources: _MoonEPResources | None = None
         self._closed = False
 
     def build_dispatcher(
@@ -122,17 +302,12 @@ class MoonEPModelRuntime:
         layer_fqn: str,
         projections: tuple[nn.Module, nn.Module],
     ) -> MoonEPDispatcher:
-        """Register one physical routed layer in FSDP execution order."""
-        if any(registered_fqn == layer_fqn for registered_fqn, _, _ in self._layers):
+        """Register one physical routed layer and return its Dispatcher."""
+        if any(layer.fqn == layer_fqn for layer in self._layers):
             raise ValueError(f"duplicate MoonEP routed layer: {layer_fqn}")
-        generation = len(self._layers) % 2
-        self._layers.append((layer_fqn, projections, generation))
-        return MoonEPDispatcher(
-            runtime=self,
-            layer_fqn=layer_fqn,
-            projections=projections,
-            generation=generation,
-        )
+        layer = _MoonEPLayer(fqn=layer_fqn, projections=projections, ordinal=len(self._layers))
+        self._layers.append(layer)
+        return MoonEPDispatcher(runtime=self, layer=layer)
 
     def validate_before_fsdp(self, fsdp_config: Any) -> None:
         """Validate the build-time FSDP policy without retaining its config."""
@@ -145,19 +320,23 @@ class MoonEPModelRuntime:
         if not fsdp_config.reshard_after_forward:
             raise ValueError("MoonEP requires reshard_after_forward=True")
 
-    def install_after_fsdp(self, *, fsdp_root: nn.Module) -> None:
+    def install_after_fsdp(self, *, fsdp_root: nn.Module, execution_order: list[str]) -> None:
         """Allocate execution resources after native FSDP has been
         installed."""
-        if self._workspace is not None:
+        if self._resources is not None:
             raise RuntimeError("MoonEP FSDP resources are already installed")
         if not self._layers:
             raise TypeError("MoonEP requires at least one physical routed-expert layer")
-        if self._staging_reference:
-            log_rank0.warning(
-                "moonep_staging_reference=True copies complete BF16 home expert "
-                "weights after every FSDP AllGather; it is a numerical reference, "
-                "not the production performance path."
+
+        # Registration order vs FSDP execution order, checked once in the only
+        # place that can see both. ``moe.py`` hands over the ordered list
+        # rather than an adapter reading FSDP private structure.
+        registered = [layer.fqn for layer in self._layers]
+        if registered != execution_order:
+            raise RuntimeError(
+                f"MoonEP registration order does not match FSDP execution order: {registered} != {execution_order}"
             )
+
         workspace = _ExpertVMMWorkspace.allocate(
             projection_shapes=(
                 (2 * self._intermediate_size, self._hidden_size),
@@ -165,89 +344,53 @@ class MoonEPModelRuntime:
             ),
             num_experts=self._num_experts,
             ep_group=self._ep_group,
-            gradient_slots=self._intra_layer_micro_batch,
+            gradient_slots=self._gradient_slots,
+            home_generations=2,
         )
         # Keep MoonEP collectives in FSDP's device-side launch order. A
         # separate high-priority stream forms an orthogonal progress wave with
         # NCCL and stalls at MoonEP's rank barriers under a full model.
         comm_stream = torch.cuda.current_stream()
-        if not self._staging_reference:
-            try:
-                self._fsdp_params = install_fsdp_vmm_landing(
-                    fsdp_root=fsdp_root,
-                    targets=tuple(
-                        (
-                            layer_fqn,
-                            projections,
-                            workspace.landing(generation),
-                        )
-                        for layer_fqn, projections, generation in self._layers
-                    ),
-                )
-            except Exception:
-                workspace.destroy()
-                raise
-        self._workspace = workspace
-        self._comm_stream = comm_stream
+        try:
+            self._landing.install(fsdp_root=fsdp_root, workspace=workspace, layers=tuple(self._layers))
+        except Exception:
+            workspace.destroy()
+            raise
+        self._resources = _MoonEPResources(
+            workspace=workspace,
+            landing=self._landing,
+            comm_stream=comm_stream,
+            ep_group=self._ep_group,
+            num_experts=self._num_experts,
+            experts_per_rank=self._num_experts // self._ep_group.size(),
+            top_k=self._top_k,
+            hidden_size=self._hidden_size,
+            gradient_slots=self._gradient_slots,
+            num_sms=self._num_sms,
+            _buffer_box=[],
+        )
 
-    def _validate_tokens_per_rank(self, tokens_per_rank: int) -> None:
+    @property
+    def resources(self) -> _MoonEPResources:
+        """One place decides "is MoonEP installed"."""
+        if self._resources is None:
+            raise RuntimeError("MoonEP FSDP resources must be installed before forward")
         if self._closed:
             raise RuntimeError("MoonEP runtime was closed")
-        if self._fixed_tokens_per_rank is None:
-            self._fixed_tokens_per_rank = tokens_per_rank
-        elif tokens_per_rank != self._fixed_tokens_per_rank:
-            raise RuntimeError(f"MoonEP fixed S changed: {self._fixed_tokens_per_rank} -> {tokens_per_rank}")
-
-    def _buffer_for(self, tokens_per_rank: int) -> Any:
-        self._validate_tokens_per_rank(tokens_per_rank)
-        if self._workspace is None:
-            raise RuntimeError("MoonEP FSDP resources must be installed before forward")
-        if self._buffer is None:
-            assert _moonep_backend is not None
-            self._buffer = _moonep_backend.Buffer(
-                S=tokens_per_rank,
-                H=self._hidden_size,
-                K=self._top_k,
-                E=self._num_experts,
-                num_ep_ranks=self._ep_group.size(),
-                group=self._ep_group,
-                explicitly_destroy=True,
-                num_sms=self._num_sms,
-            )
-        return self._buffer
-
-    def _enqueue(self, operation, *, inputs: tuple[torch.Tensor | None, ...] = ()):
-        """Run one MoonEP transaction on XTuner's stream and return its
-        event."""
-        stream = self._comm_stream
-        if stream is None:
-            raise RuntimeError("MoonEP FSDP resources must be installed before execution")
-        caller_stream = torch.cuda.current_stream()
-        stream.wait_event(caller_stream.record_event())
-        for tensor in inputs:
-            if tensor is not None:
-                tensor.record_stream(stream)
-        with torch.cuda.stream(stream):
-            result = operation()
-            done = stream.record_event()
-        return result, done
+        return self._resources
 
     def close(self) -> None:
         """Release Buffer before VMM workspace at a coordinated boundary."""
         if self._closed:
             return
-        if self._comm_stream is not None:
-            self._comm_stream.synchronize()
-            self._comm_stream = None
-        if self._buffer is not None:
-            self._buffer.destroy()
-            self._buffer = None
-        if self._fsdp_params:
-            uninstall_fsdp_vmm_landing(self._fsdp_params)
-            self._fsdp_params = ()
-        if self._workspace is not None:
-            self._workspace.destroy()
-            self._workspace = None
+        if self._resources is not None:
+            resources = self._resources
+            resources.comm_stream.synchronize()
+            for buffer, _ in resources._buffer_box:
+                buffer.destroy()
+            resources.landing.uninstall()
+            resources.workspace.destroy()
+            self._resources = None
         self._layers.clear()
         self._closed = True
 
@@ -313,7 +456,7 @@ class MoonEPPostCombineResult(TypedDict):
 class _MoonEPLayerGradients:
     """One FSDP call's initialization state, never shared across replay calls.
 
-    Storage belongs to the runtime. Only the first backward producer clears it; forward/checkpoint replay must not
+    Storage belongs to the workspace. Only the first backward producer clears it; forward/checkpoint replay must not
     touch a different call's live H.
     """
 
@@ -325,16 +468,15 @@ class _MoonEPLayerCallState:
     """One routed-layer call's pure lifecycle state for the transaction
     functions.
 
-    The record carries borrowed model resources, the layer projections, and
-    the call-local plan/event/weight/gradient handles that the module-level
-    transaction functions read and advance. It owns no behavior and never
-    references ``MoonEPDispatcher``. Identity, not field equality, distinguishes
-    two calls, so instances stay hashable by ``id``.
+    The record borrows the installed ``_MoonEPResources`` and the ``_MoonEPLayer``
+    identity, plus the call-local plan/event/weight/gradient handles that the
+    module-level transaction functions read and advance. It owns no behavior
+    and never references ``MoonEPDispatcher``. Identity, not field equality,
+    distinguishes two calls, so instances stay hashable by ``id``.
     """
 
-    runtime: MoonEPModelRuntime
-    layer_fqn: str
-    projections: tuple[nn.Module, nn.Module]
+    resources: _MoonEPResources
+    layer: _MoonEPLayer
     generation: int
     grad_slot: int
     layer_gradients: _MoonEPLayerGradients
@@ -346,10 +488,8 @@ class _MoonEPLayerCallState:
     weights_ready: Any | None = None
     combine_done: Any | None = None
 
-    # Borrowed VMM aliases for this call, each [2B, O_p, I_p]. Gradient views
-    # share home storage and must never be GEMM overwrite targets.
+    # Borrowed local [2B, O_p, I_p] weight aliases for this call.
     local_weights: ProjectionPair | None = None
-    fallback_gradient_targets: ProjectionPair | None = None
 
     # Current FSDP unsharded home Parameters [B, O_p, I_p] receive the returned
     # BF16 home gradients after both local projections complete.
@@ -412,33 +552,22 @@ def finish_combine(state: _MoonEPLayerCallState, combined: torch.Tensor, *, asyn
 
 def prepare_experts(state: _MoonEPLayerCallState, dispatched: MoonEPDispatchResult) -> MoonEPPostDispatchResult:
     """Wait at the first weight consumer and expose the tensor-only layout."""
-    workspace = state.runtime._workspace
-    assert workspace is not None
+    resources = state.resources
     assert state.weights_ready is not None
-    assert state.local_weights is not None
 
     with torch.profiler.record_function("MoonEP::prepare_experts"):
         # This inserts a device dependency; it never waits on the host.
         state.weights_ready.wait()
-        local_counts = workspace.local_token_counts(dispatched["cu_seqlens"])
-        covered_rows = local_counts.sum()
-        row_is_covered = (
-            torch.arange(
-                dispatched["hidden_states"].shape[0],
-                device=dispatched["hidden_states"].device,
-            )
-            < covered_rows
-        )
-        hidden_states = dispatched["hidden_states"] * row_is_covered.unsqueeze(-1)
-        local_counts = torch.cat(
-            (
-                local_counts[:-1],
-                local_counts[-1:] + dispatched["hidden_states"].shape[0] - covered_rows,
-            )
+        # Both halves of the ``[E+B] -> [2B]`` contract now live in the
+        # workspace: the caller cannot receive counts it must still fix up.
+        hidden_states, local_counts = resources.workspace.local_compute_view(
+            hidden_nvsh=dispatched["hidden_states"],
+            cu_seqlens=dispatched["cu_seqlens"],
         )
 
     local_weights = state.local_weights
     state.local_weights = None
+    assert local_weights is not None
     # Join activation and both weight edges so staging precedes upstream
     # activation backward; a weight-only hook cannot establish that dependency.
     # The bridge already makes the aliases require grad, so grouped GEMM
@@ -453,33 +582,6 @@ def prepare_experts(state: _MoonEPLayerCallState, dispatched: MoonEPDispatchResu
     )
 
 
-def current_home_parameters(state: _MoonEPLayerCallState) -> tuple[nn.Parameter, nn.Parameter]:
-    """Return current FSDP leaves, staging into the landing only in reference
-    mode."""
-    runtime = state.runtime
-    if not runtime._staging_reference:
-        return fsdp_current_unsharded_expert_parameters(state.projections)
-
-    workspace = runtime._workspace
-    assert workspace is not None
-    parameters: list[nn.Parameter] = []
-    for linear, landing in zip(
-        state.projections,
-        workspace.landing(state.generation),
-        strict=True,
-    ):
-        weight = cast(torch.Tensor, linear.weight)
-        if not isinstance(weight, nn.Parameter):
-            raise RuntimeError(f"{state.layer_fqn} staging expected an unsharded expert Parameter")
-        source = weight.to_local() if isinstance(weight, DTensor) else weight
-        if source.dtype is not torch.bfloat16 or source.numel() != landing.numel():
-            raise RuntimeError(f"{state.layer_fqn} staging expected an unsharded BF16 expert weight")
-        with torch.no_grad():
-            landing.copy_(source.view_as(landing))
-        parameters.append(weight)
-    return parameters[0], parameters[1]
-
-
 def dispatch_forward(
     state: _MoonEPLayerCallState,
     source_hidden: torch.Tensor,
@@ -490,15 +592,15 @@ def dispatch_forward(
     async_op: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dispatch on a fresh plan and start both projection weight prefetches."""
-    runtime = state.runtime
-    buffer = runtime._buffer_for(source_hidden.shape[0])
-    workspace = runtime._workspace
-    assert workspace is not None
+    resources = state.resources
+    buffer = resources.buffer_for(source_hidden.shape[0])
 
     def dispatch_and_prefetch():
-        # The staging copy precedes dispatch's device barrier. The fresh plan
-        # then starts both projection prefetches in this transaction.
-        state.home_parameters = current_home_parameters(state)
+        # Landing.prepare makes this generation's home weights ready: a check
+        # for the direct Adapter, the staging copy for the reference Adapter.
+        # Its call position (before dispatch's device barrier) is part of this
+        # sequence, not an implicit precondition of a mode branch.
+        state.home_parameters = resources.landing.prepare(layer=state.layer, generation=state.generation)
         hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
             source_hidden,
             route_weights_sk=source_route_weights,
@@ -510,16 +612,17 @@ def dispatch_forward(
         assert route_weights_nvs is not None and cu_seqlens is not None
         state.plan = plan
         state.dispatch_done = torch.cuda.current_stream().record_event()
-        state.local_weights, _ = workspace.prefetch_weights(
+        # Only local weights are returned now; the gradient slot views are
+        # created inside ``return_expert_gradients`` when they are needed.
+        state.local_weights = resources.workspace.prefetch_weights(
             buffer=buffer,
             plan=plan,
             generation=state.generation,
-            grad_slot=state.grad_slot,
         )
         return hidden_nvsh, route_weights_nvs, cu_seqlens
 
     with torch.profiler.record_function("MoonEP::dispatch_forward"):
-        result, state.weights_ready = runtime._enqueue(
+        result, state.weights_ready = resources.enqueue(
             dispatch_and_prefetch,
             inputs=(source_hidden, source_route_weights, topk_ids, tokens_per_expert),
         )
@@ -535,9 +638,8 @@ def dispatch_backward(
     grad_route_weights_nvs: torch.Tensor,
 ) -> ProjectionPair:
     """Combine activation and route-weight gradients on the saved plan."""
-    runtime = state.runtime
-    buffer = runtime._buffer
-    assert state.plan is not None and buffer is not None
+    resources = state.resources
+    buffer = resources.buffer
     grad_hidden_nvsh = grad_hidden_nvsh.contiguous()
     grad_route_weights_nvs = grad_route_weights_nvs.contiguous()
 
@@ -553,7 +655,7 @@ def dispatch_backward(
         return grad_hidden, grad_route_weights
 
     with torch.profiler.record_function("MoonEP::dispatch_backward"):
-        result, done = runtime._enqueue(
+        result, done = resources.enqueue(
             combine_gradients,
             inputs=(grad_hidden_nvsh, grad_route_weights_nvs),
         )
@@ -569,9 +671,8 @@ def combine_forward(
     async_op: bool,
 ) -> torch.Tensor:
     """Fuse route scaling into the combine boundary on the saved plan."""
-    runtime = state.runtime
-    buffer = runtime._buffer
-    assert state.plan is not None and buffer is not None
+    resources = state.resources
+    buffer = resources.buffer
 
     def combine_output():
         output, gathered_weights, no_event = buffer.combine(
@@ -586,7 +687,7 @@ def combine_forward(
         return output
 
     with torch.profiler.record_function("MoonEP::combine_forward"):
-        output, state.combine_done = runtime._enqueue(
+        output, state.combine_done = resources.enqueue(
             combine_output,
             inputs=(expert_output, route_weights),
         )
@@ -597,16 +698,14 @@ def combine_forward(
 
 def combine_backward(state: _MoonEPLayerCallState, grad_output: torch.Tensor) -> tuple[torch.Tensor, Any]:
     """Replay duplicated weights on the saved plan and return weighted grad."""
-    runtime = state.runtime
-    buffer = runtime._buffer
-    workspace = runtime._workspace
-    assert state.plan is not None and buffer is not None and workspace is not None
+    resources = state.resources
+    buffer = resources.buffer
     grad_output = grad_output.contiguous()
 
     def dispatch_gradient_and_prefetch():
-        # FSDP pre-backward has restored this generation. Stage it before
-        # dispatch's barrier, then replay remote weights on the same stream.
-        replay_home_parameters = current_home_parameters(state)
+        # FSDP pre-backward has restored this generation; same Adapter call,
+        # same sequence.
+        replay_home_parameters = resources.landing.prepare(layer=state.layer, generation=state.generation)
         if state.home_parameters is None:
             raise RuntimeError("MoonEP backward has no forward home Parameters")
         if any(
@@ -622,16 +721,11 @@ def combine_backward(state: _MoonEPLayerCallState, grad_output: torch.Tensor) ->
         )
         assert no_weights is None and no_cu is None and reused_plan is state.plan
         gradient_dispatch_done = torch.cuda.current_stream().record_event()
-        _, state.fallback_gradient_targets = workspace.prefetch_weights(
-            buffer=buffer,
-            plan=state.plan,
-            generation=state.generation,
-            grad_slot=state.grad_slot,
-        )
+        resources.workspace.prefetch_weights(buffer=buffer, plan=state.plan, generation=state.generation)
         return grad_weighted, gradient_dispatch_done
 
     with torch.profiler.record_function("MoonEP::combine_backward"):
-        (grad_weighted, gradient_dispatch_done), replay_done = runtime._enqueue(
+        (grad_weighted, gradient_dispatch_done), replay_done = resources.enqueue(
             dispatch_gradient_and_prefetch,
             inputs=(grad_output,),
         )
@@ -642,42 +736,26 @@ def combine_backward(state: _MoonEPLayerCallState, grad_output: torch.Tensor) ->
 
 
 def start_gradient_completion(state: _MoonEPLayerCallState, gradients: ProjectionPair) -> None:
-    """Stage allocation-return dW and enqueue the paired duplicate return."""
+    """Hand the allocation-return dW to the workspace for the home return."""
     if state.gradient_completion is not None:
         raise RuntimeError("MoonEP gradient completion was started twice")
-    if state.plan is None or state.fallback_gradient_targets is None:
-        raise RuntimeError("MoonEP gradient completion has no plan/targets")
-    # Replay supplies fresh aliases without retaining forward versions.
-    reduction_pair = state.fallback_gradient_targets
-    runtime = state.runtime
-    workspace = runtime._workspace
-    buffer = runtime._buffer
-    if workspace is None or buffer is None:
-        raise RuntimeError("MoonEP gradient completion has no runtime workspace")
-
-    def stage_and_reduce():
-        # All read/modify/write operations on shared H run on the same runtime
-        # stream, including the remote return kernel. A final event wait alone
-        # cannot prevent concurrent writers racing here.
-        b = runtime._num_experts // runtime._ep_group.size()
-        for target, gradient in zip(reduction_pair, gradients, strict=True):
-            if not state.layer_gradients.initialized:
-                target[:b].zero_()
-            target[:b].add_(gradient[:b])
-            target[b:].copy_(gradient[b:])
-        state.layer_gradients.initialized = True
-        return workspace.complete_gradients(
-            buffer=buffer,
-            plan=state.plan,
-            local_grads=reduction_pair,
-            grad_slot=state.grad_slot,
-        )
+    resources = state.resources
 
     with torch.profiler.record_function("MoonEP::gradient_handoff"):
-        home_grads, done = runtime._enqueue(
-            stage_and_reduce,
-            inputs=(*reduction_pair, *gradients),
+        # The workspace owns the ``B`` split, the home-prefix zero-or-add, the
+        # duplicate-suffix copy, and the EP exact-sum reduction. ``initialize``
+        # is the call-local flag the Dispatcher owns (ADR-0027).
+        home_grads, done = resources.enqueue(
+            lambda: resources.workspace.return_expert_gradients(
+                buffer=resources.buffer,
+                plan=state.plan,
+                gradients=gradients,
+                grad_slot=state.grad_slot,
+                initialize=not state.layer_gradients.initialized,
+            ),
+            inputs=gradients,
         )
+    state.layer_gradients.initialized = True
     state.gradient_completion = (home_grads, done)
 
 
@@ -695,7 +773,6 @@ def finish_gradient_completion(
         raise RuntimeError("MoonEP gradient completion has no home Parameters")
     home_parameters = state.home_parameters
 
-    state.fallback_gradient_targets = None
     state.home_parameters = None
     state.gradient_completion = None
     return home_parameters, home_grads
@@ -838,29 +915,25 @@ class MoonEPDispatcher(
         self,
         *,
         runtime: MoonEPModelRuntime,
-        layer_fqn: str,
-        projections: tuple[nn.Module, nn.Module],
-        generation: int,
+        layer: _MoonEPLayer,
     ) -> None:
         super().__init__(
             n_routed_experts=runtime._num_experts,
             process_group=runtime._ep_group,
         )
         self._runtime = runtime
-        self._layer_fqn = layer_fqn
-        self._projections = projections
-        self._generation = generation
+        self._layer = layer
         self._next_gradient_slot = 0
 
     def _new_call_state(self, layer_gradients: _MoonEPLayerGradients) -> _MoonEPLayerCallState:
         """Allocate the next call-local slot and call-state token."""
+        resources = self._runtime.resources
         grad_slot = self._next_gradient_slot
-        self._next_gradient_slot = (grad_slot + 1) % self._runtime._intra_layer_micro_batch
+        self._next_gradient_slot = (grad_slot + 1) % resources.gradient_slots
         return _MoonEPLayerCallState(
-            runtime=self._runtime,
-            layer_fqn=self._layer_fqn,
-            projections=self._projections,
-            generation=self._generation,
+            resources=resources,
+            layer=self._layer,
+            generation=resources.home_generation(self._layer),
             grad_slot=grad_slot,
             layer_gradients=layer_gradients,
         )
@@ -874,6 +947,8 @@ class MoonEPDispatcher(
         branch."""
         gradients = _MoonEPLayerGradients()
         call_states = tuple(self._new_call_state(gradients) for _ in layer_inputs)
+        if len(call_states) > self._runtime.resources.gradient_slots:
+            raise ValueError("MoonEP layer width exceeds the gradient slot ring")
         # No-grad original forwards build no backward node and never clear H.
         return list(_MoonEPLayerGradJoin.apply(call_states, *layer_inputs)), list(call_states)
 
@@ -893,7 +968,7 @@ class MoonEPDispatcher(
             raise RuntimeError("MoonEP dispatch_preprocess requires layer_state from prepare_layer_inputs")
         if not isinstance(layer_state, _MoonEPLayerCallState):
             raise TypeError("MoonEP layer_state must be a _MoonEPLayerCallState")
-        self._runtime._validate_tokens_per_rank(hidden_states.shape[0])
+        layer_state.resources.expect_tokens_per_rank(hidden_states.shape[0])
         return MoonEPPreDispatchResult(
             hidden_states=hidden_states,
             topk_ids=topk_ids.to(dtype=torch.int32).contiguous(),

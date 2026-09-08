@@ -97,6 +97,7 @@ class _ExpertVMMWorkspace:
         ep_rank: int,
         num_experts: int,
         experts_per_rank: int,
+        home_generations: int,
     ) -> None:
         # Publish the completed layout under lifecycle-managed private names;
         # their detailed contracts remain centralized on _WorkspaceLayout.
@@ -110,6 +111,9 @@ class _ExpertVMMWorkspace:
         self._ep_rank = ep_rank
         self._num_experts = num_experts
         self._experts_per_rank = experts_per_rank
+        # The only place the two-generation ``2`` is stored; ``generation_for``
+        # is the single issuer for every consumer of a home generation.
+        self._home_generations = home_generations
         self._gradient_slots = len(layout["local_grad_outputs"])
         self._destroyed = False
 
@@ -121,6 +125,7 @@ class _ExpertVMMWorkspace:
         num_experts: int,
         ep_group: dist.ProcessGroup,
         gradient_slots: int,
+        home_generations: int = 2,
     ) -> _ExpertVMMWorkspace:
         """Validate, allocate, and publish one complete VMM workspace."""
         ep_size, ep_rank = cls._validate_and_resolve_topology(
@@ -138,6 +143,7 @@ class _ExpertVMMWorkspace:
                 projection_shapes=projection_shapes,
                 experts_per_rank=experts_per_rank,
                 gradient_slots=gradient_slots,
+                home_generations=home_generations,
                 resources=resources,
             )
             home_weight_graph, duplicate_gradient_graph = cls._build_ipc_fd_graph(
@@ -161,6 +167,7 @@ class _ExpertVMMWorkspace:
             ep_rank=ep_rank,
             num_experts=num_experts,
             experts_per_rank=experts_per_rank,
+            home_generations=home_generations,
         )
 
     @staticmethod
@@ -212,6 +219,7 @@ class _ExpertVMMWorkspace:
         projection_shapes: Sequence[tuple[int, int]],
         experts_per_rank: int,
         gradient_slots: int,
+        home_generations: int,
         resources: ExitStack,
     ) -> _WorkspaceAllocations:
         """Allocate the physical chunks before any cross-rank mapping."""
@@ -254,7 +262,7 @@ class _ExpertVMMWorkspace:
         duplicate_gradients: list[tuple[_VMMAllocation, ...]] = []
         for chunk_shape in chunk_shapes:
             duplicate_weights.append(allocate_chunk(chunk_shape))
-            home_weights.append(tuple(allocate_chunk(chunk_shape) for _ in range(2)))
+            home_weights.append(tuple(allocate_chunk(chunk_shape) for _ in range(home_generations)))
             home_gradients.append(allocate_chunk(chunk_shape))
             duplicate_gradients.append(tuple(allocate_chunk(chunk_shape) for _ in range(gradient_slots)))
 
@@ -399,53 +407,79 @@ class _ExpertVMMWorkspace:
     def destroyed(self) -> bool:
         return self._destroyed
 
+    def generation_for(self, execution_ordinal: int) -> int:
+        """Issue the home generation for one physical layer in execution order.
+
+        Adjacent expert-bearing layers alternate over the two-generation home
+        ring, so no consumer ever re-validates ``generation in (0, 1)``.
+        """
+        if self._destroyed:
+            raise RuntimeError("MoonEP workspace has been destroyed")
+        return execution_ordinal % self._home_generations
+
     def landing(self, generation: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return projection-paired FSDP targets, each ``[B, O_p, I_p]``."""
         if self._destroyed:
             raise RuntimeError("MoonEP workspace has been destroyed")
-        if generation not in (0, 1):
-            raise ValueError(f"generation must be 0 or 1, got {generation}")
         return cast(tuple[torch.Tensor, torch.Tensor], self._landings[generation])
 
-    def local_token_counts(self, cu_seqlens: torch.Tensor) -> torch.Tensor:
-        """Convert ``[E+B]`` endpoints to ``[2B]`` home/duplicate counts."""
-        if self._destroyed:
-            raise RuntimeError("MoonEP workspace has been destroyed")
-        if cu_seqlens.dtype != torch.int32 or cu_seqlens.numel() != (self._num_experts + self._experts_per_rank):
-            raise ValueError("cu_seqlens must be int32 with E+B cumulative endpoints")
+    def local_compute_view(
+        self, *, hidden_nvsh: torch.Tensor, cu_seqlens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Turn ``[NvS, H]`` dispatch output and ``[E+B]`` endpoints into a
+        grouped-GEMM-ready ``(hidden, [2B] counts)`` pair.
 
-        # Static device slices select home B and duplicate B.  No route value
-        # reaches the host and activation rows are not repacked.
-        counts = torch.diff(cu_seqlens, prepend=torch.zeros_like(cu_seqlens[:1]))
-        home_start = self._ep_rank * self._experts_per_rank
-        return torch.cat(
-            (
-                counts[home_start : home_start + self._experts_per_rank],
-                counts[self._num_experts : self._num_experts + self._experts_per_rank],
-            )
-        )
-
-    def prefetch_weights(self, *, buffer, plan, generation: int, grad_slot: int):
-        """Prefetch weights and return local weight/gradient-return views.
-
-        The gradient prefixes alias a shared accumulator: callers must stage
-        dW with addition, never pass these views to an overwrite GEMM.
+        Three layout-coupled steps stay in the owning module: fold ``[E+B]``
+        into this rank's home ``B`` and duplicate ``B`` counts; zero the NvS
+        padding tail so uninitialized rows never reach the GEMM; and record
+        ``NvS - sum(counts)`` on the last group so the GEMM still walks the
+        full ``[NvS, H]``. Only small device metadata is computed here.
         """
         if self._destroyed:
             raise RuntimeError("MoonEP workspace has been destroyed")
-        if generation not in (0, 1):
-            raise ValueError(f"generation must be 0 or 1, got {generation}")
-        if not 0 <= grad_slot < self._gradient_slots:
-            raise ValueError(f"gradient slot out of range: {grad_slot}")
+        counts = self._local_token_counts(cu_seqlens)
+        covered = counts.sum()
+        row_is_covered = torch.arange(hidden_nvsh.shape[0], device=hidden_nvsh.device) < covered
+        hidden = hidden_nvsh * row_is_covered.unsqueeze(-1)
+        counts = torch.cat((counts[:-1], counts[-1:] + hidden_nvsh.shape[0] - covered))
+        return hidden, counts
+
+    def prefetch_weights(self, *, buffer, plan, generation: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prefetch the global ``[E+B]`` weights and return this generation's
+        local ``[2B]`` compute aliases."""
+        if self._destroyed:
+            raise RuntimeError("MoonEP workspace has been destroyed")
         buffer.prefetch_weight(
             plan=plan,
             projections=self._global_weights[generation],
             async_finish=False,
         )
-        # A slot is reused sequentially across physical layers.  Each
-        # invocation receives a fresh TensorImpl/version counter over the same
-        # VMM storage, avoiding both payload allocation and AOT version clashes.
-        grad_outputs = tuple(
+        return cast(tuple[torch.Tensor, torch.Tensor], self._local_weights[generation])
+
+    def return_expert_gradients(
+        self, *, buffer, plan, gradients, grad_slot: int, initialize: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Complete the home-expert gradient boundary in the owning module.
+
+        ``gradients`` is the allocation-return ``[2B]`` dW pair. The home
+        prefix aliases one accumulator shared by every Domino microbatch of a
+        single FSDP call, so it is zeroed only on the first producer
+        (``initialize``, a call-local flag owned by the Dispatcher) and added
+        to otherwise; the duplicate suffix is slot-local. ``reduce_grad_bf16``
+        then sums the EP partials without dividing.
+        """
+        if self._destroyed:
+            raise RuntimeError("MoonEP workspace has been destroyed")
+        if not 0 <= grad_slot < self._gradient_slots:
+            raise ValueError(f"gradient slot out of range: {grad_slot}")
+        gradients = tuple(gradients)
+        if len(gradients) != 2:
+            raise ValueError("gradients must contain the two fused projections")
+        b = self._experts_per_rank
+        # A slot is reused sequentially across physical layers.  A fresh
+        # TensorImpl/version counter over the same VMM storage avoids both
+        # payload allocation and AOT version clashes.
+        targets = tuple(
             target.new_empty(0).set_(
                 target.untyped_storage(),
                 target.storage_offset(),
@@ -454,35 +488,30 @@ class _ExpertVMMWorkspace:
             )
             for target in self._local_grad_outputs[grad_slot]
         )
-        return self._local_weights[generation], grad_outputs
-
-    def complete_gradients(self, *, buffer, plan, local_grads, grad_slot: int):
-        """Add this slot's duplicate contributions into shared home
-        prefixes."""
-        if self._destroyed:
-            raise RuntimeError("MoonEP workspace has been destroyed")
-        if not 0 <= grad_slot < self._gradient_slots:
-            raise ValueError(f"gradient slot out of range: {grad_slot}")
-        local_grads = tuple(local_grads)
-        targets = self._local_grad_outputs[grad_slot]
-        if len(local_grads) != 2:
-            raise ValueError("local_grads must contain the two fused projections")
-        for actual, target in zip(local_grads, targets, strict=True):
-            if (
-                actual.dtype != torch.bfloat16
-                or actual.shape != target.shape
-                or actual.data_ptr() != target.data_ptr()
-            ):
-                raise ValueError("local_grads must be the selected workspace gradient slot")
-
+        for target, gradient in zip(targets, gradients, strict=True):
+            if initialize:
+                target[:b].zero_()
+            target[:b].add_(gradient[:b])
+            target[b:].copy_(gradient[b:])
         buffer.reduce_grad_bf16(
             plan=plan,
-            local_grads=local_grads,
+            local_grads=targets,
             distributed_duplicate_grads=self._distributed_duplicate_grads[grad_slot],
             async_finish=False,
         )
-        b = self._experts_per_rank
-        return local_grads[0][:b], local_grads[1][:b]
+        return targets[0][:b], targets[1][:b]
+
+    def _local_token_counts(self, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        if cu_seqlens.dtype != torch.int32 or cu_seqlens.numel() != (self._num_experts + self._experts_per_rank):
+            raise ValueError("cu_seqlens must be int32 with E+B cumulative endpoints")
+        counts = torch.diff(cu_seqlens, prepend=torch.zeros_like(cu_seqlens[:1]))
+        home_start = self._ep_rank * self._experts_per_rank
+        return torch.cat(
+            (
+                counts[home_start : home_start + self._experts_per_rank],
+                counts[self._num_experts : self._num_experts + self._experts_per_rank],
+            )
+        )
 
     def destroy(self) -> None:
         """Release mappings at an explicit, rank-coordinated boundary."""

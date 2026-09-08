@@ -54,28 +54,23 @@ class TestMoonEPOneSegmentWorkspace(DeterministicDDPTestCase):
                 topk_ids = torch.zeros((64, 1), dtype=torch.int32, device=device)
                 tokens_per_expert = torch.bincount(topk_ids.flatten(), minlength=num_experts).to(torch.int32)
                 hidden = torch.randn(64, 128, dtype=torch.bfloat16, device=device)
-                _, _, cu_seqlens, plan = buffer.dispatch(
+                hidden_nvsh, _, cu_seqlens, plan = buffer.dispatch(
                     hidden,
                     topk_experts_sk=topk_ids,
                     tokens_per_expert=tokens_per_expert,
                 )
 
-                local_weights, gradients_0 = workspace.prefetch_weights(
-                    buffer=buffer,
-                    plan=plan,
-                    generation=0,
-                    grad_slot=0,
-                )
-                _, gradients_1 = workspace.prefetch_weights(
-                    buffer=buffer,
-                    plan=plan,
-                    generation=0,
-                    grad_slot=1,
-                )
+                local_weights = workspace.prefetch_weights(buffer=buffer, plan=plan, generation=0)
 
-                # One grouped GEMM receives exactly one contiguous [B+B]
-                # segment.  Its home prefix aliases the current FSDP landing.
-                assert workspace.local_token_counts(cu_seqlens).shape == (2 * experts_per_rank,)
+                # One grouped GEMM receives exactly one contiguous [B+B] segment
+                # plus its device counts; the home prefix aliases the current
+                # FSDP landing.
+                compute_hidden, local_counts = workspace.local_compute_view(
+                    hidden_nvsh=hidden_nvsh, cu_seqlens=cu_seqlens
+                )
+                assert local_counts.shape == (2 * experts_per_rank,)
+                assert compute_hidden.shape == hidden_nvsh.shape
+                assert int(local_counts.sum()) == hidden_nvsh.shape[0]
                 for projection, weight in enumerate(local_weights):
                     assert weight.is_contiguous()
                     assert weight.shape[0] == 2 * experts_per_rank
@@ -84,31 +79,34 @@ class TestMoonEPOneSegmentWorkspace(DeterministicDDPTestCase):
                         workspace.landing(0)[projection],
                     )
 
-                # Home storage is shared, but duplicate slots stay independent.
-                # Verify physical aliasing by writes through different VAs.
-                for gradient in gradients_0:
-                    gradient.zero_()
-                    gradient[experts_per_rank:].fill_(1)
-                for gradient in gradients_1:
-                    gradient[experts_per_rank:].fill_(7)
-                for first, second in zip(gradients_0, gradients_1, strict=True):
-                    first[:experts_per_rank].fill_(3)
-                    assert torch.all(second[:experts_per_rank] == 3)
-                home_grads = workspace.complete_gradients(
-                    buffer=buffer,
-                    plan=plan,
-                    local_grads=gradients_0,
-                    grad_slot=0,
+                # ``return_expert_gradients`` owns the [2B] split, the shared
+                # home accumulator (zero-or-add), and the EP exact sum. The
+                # first producer initializes; a later slot adds into the same
+                # home prefix.
+                def dw(value: float) -> tuple[torch.Tensor, torch.Tensor]:
+                    return tuple(
+                        torch.full((2 * experts_per_rank, *shape), value, dtype=torch.bfloat16, device=device)
+                        for shape in ((512, 1024), (1024, 512))
+                    )
+
+                home_first = workspace.return_expert_gradients(
+                    buffer=buffer, plan=plan, gradients=dw(1.0), grad_slot=0, initialize=True
                 )
-                assert all(torch.count_nonzero(gradient[experts_per_rank:]) == 0 for gradient in gradients_0)
-                assert all(torch.all(gradient[experts_per_rank:] == 7) for gradient in gradients_1)
-                for first, second in zip(home_grads, gradients_1, strict=True):
-                    torch.testing.assert_close(first, second[:experts_per_rank])
+                home_second = workspace.return_expert_gradients(
+                    buffer=buffer, plan=plan, gradients=dw(2.0), grad_slot=1, initialize=False
+                )
+                for first, second in zip(home_first, home_second, strict=True):
+                    assert first.shape[0] == experts_per_rank
+                    assert torch.isfinite(first).all()
+                    # Every slot's home prefix maps the one shared home chunk
+                    # through its own VA; a write is visible through the other.
+                    first.fill_(9.0)
+                    assert torch.all(second == 9.0)
 
                 copied = torch.count_nonzero(plan.experts_to_copy >= 0)
                 dist.all_reduce(copied, group=ep_group)
                 assert copied > 0
-                hot_gradient = home_grads[0][0].float().sum() if ep_rank == 0 else torch.zeros((), device=device)
+                hot_gradient = home_first[0][0].float().sum() if ep_rank == 0 else torch.zeros((), device=device)
                 dist.all_reduce(hot_gradient, group=ep_group)
                 assert hot_gradient > 0
             finally:
