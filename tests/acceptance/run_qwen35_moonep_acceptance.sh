@@ -56,7 +56,10 @@ export MOONEP_ACCEPTANCE_WORK_DIR=$run_dir
 export MOONEP_ACCEPTANCE_MODEL_PATH=${MOONEP_ACCEPTANCE_MODEL_PATH:-/mnt/shared-storage-user/llmrazor-share/model/Qwen3.5-35B-A3B}
 export MOONEP_ACCEPTANCE_DATA_PATH=${MOONEP_ACCEPTANCE_DATA_PATH:-/mnt/shared-storage-user/llmrazor-share/data/alpaca}
 export MODEL_COMPILE=1
-export XTUNER_DETERMINISTIC=true
+export XTUNER_USE_FA3="${XTUNER_USE_FA3:-0}"
+# FA3's Hopper backward has no deterministic path for head_dim 256 (Qwen3.5),
+# so the FA3 comparison runs non-deterministically; keep the default otherwise.
+export XTUNER_DETERMINISTIC="${XTUNER_DETERMINISTIC:-true}"
 export XTUNER_ACTIVATION_OFFLOAD=0
 export XTUNER_COMPILE_NO_INPLACE_BUFFERS=1
 export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0

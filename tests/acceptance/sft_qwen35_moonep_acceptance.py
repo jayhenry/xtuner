@@ -48,10 +48,13 @@ text_cfg.dispatcher = backend
 text_cfg.moonep_staging_reference = False
 text_cfg.router_compute_dtype = "float32"
 text_cfg.router_async_offload = False
-# The installed FlashAttention package metadata has no importable extension in
-# pt212_cu132. Flex attention keeps both dispatcher runs on the same real-model
-# workload instead of depending on that broken optional binary.
-text_cfg.attention.attn_impl = "flex_attention"
+# FA2's package metadata has no importable extension in pt212_cu132, so the
+# default keeps both dispatcher runs on flex attention. Set XTUNER_USE_FA3=1 to
+# compare against FlashAttention 3, whose varlen path skips BlockMask
+# construction entirely (no per-packed-document Dynamo/SymPy mask subgraph).
+text_cfg.attention.attn_impl = (
+    "flash_attention" if os.environ.get("XTUNER_USE_FA3", "0") == "1" else "flex_attention"
+)
 # FlexAttention intentionally compiles behind a graph break so its BlockMask
 # tensors become fixed-layout inputs to the kernel graph. Keep all default
 # Qwen3.5 compile targets, but let MHA form that one required boundary.
