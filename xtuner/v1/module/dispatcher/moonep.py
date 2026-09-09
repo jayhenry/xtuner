@@ -498,42 +498,6 @@ class _MoonEPLayerCallState:
 # plan and gradient slot recorded on the call state.
 
 
-def begin_dispatch(
-    state: _MoonEPLayerCallState,
-    *,
-    hidden_states: torch.Tensor,
-    topk_ids: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-    topk_weights: torch.Tensor,
-    async_op: bool,
-) -> MoonEPDispatchResult:
-    """Create the activation autograd edge and start weight prefetch."""
-    hidden_nvsh, weights_nvs, cu_seqlens = _DispatchAutograd.apply(
-        hidden_states,
-        topk_ids,
-        tokens_per_expert,
-        topk_weights,
-        state,
-        async_op,
-    )
-    return MoonEPDispatchResult(
-        hidden_states=hidden_nvsh,
-        topk_weights=weights_nvs,
-        cu_seqlens=cu_seqlens,
-    )
-
-
-def begin_combine(
-    state: _MoonEPLayerCallState,
-    *,
-    expert_output: torch.Tensor,
-    route_weights: torch.Tensor,
-    async_op: bool,
-) -> torch.Tensor:
-    """Create the fused route-scaled combine autograd edge."""
-    return _CombineAutograd.apply(expert_output, route_weights, state, async_op)
-
-
 def finish_combine(state: _MoonEPLayerCallState, combined: torch.Tensor, *, async_op: bool) -> torch.Tensor:
     """Establish the final device dependency for an async combine."""
     if async_op:
@@ -985,13 +949,19 @@ class MoonEPDispatcher(
     ) -> MoonEPDispatchResult:
         if decoding:
             raise NotImplementedError("MoonEP fixed-S training dispatch does not implement decoding")
-        return begin_dispatch(
+        # Create the activation autograd edge and start weight prefetch.
+        hidden_nvsh, topk_weights_nvs, cu_seqlens = _DispatchAutograd.apply(
+            pre_dispatched["hidden_states"],
+            pre_dispatched["topk_ids"],
+            pre_dispatched["tokens_per_expert"],
+            topk_weights.to(dtype=torch.float32).contiguous(),
             pre_dispatched["_moonep_call"],
-            hidden_states=pre_dispatched["hidden_states"],
-            topk_ids=pre_dispatched["topk_ids"],
-            tokens_per_expert=pre_dispatched["tokens_per_expert"],
-            topk_weights=topk_weights.to(dtype=torch.float32).contiguous(),
-            async_op=async_op,
+            async_op,
+        )
+        return MoonEPDispatchResult(
+            hidden_states=hidden_nvsh,
+            topk_weights=topk_weights_nvs,
+            cu_seqlens=cu_seqlens,
         )
 
     @override
@@ -1031,12 +1001,13 @@ class MoonEPDispatcher(
         decoding: bool = False,
     ) -> MoonEPCombineResult:
         del post_dispatched, decoding
+        # Create the fused route-scaled combine autograd edge.
         return MoonEPCombineResult(
-            hidden_states=begin_combine(
+            hidden_states=_CombineAutograd.apply(
+                pre_combined["hidden_states"],
+                dispatched["topk_weights"],
                 pre_dispatched["_moonep_call"],
-                expert_output=pre_combined["hidden_states"],
-                route_weights=dispatched["topk_weights"],
-                async_op=async_op,
+                async_op,
             )
         )
 
