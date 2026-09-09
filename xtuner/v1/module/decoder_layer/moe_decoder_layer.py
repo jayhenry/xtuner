@@ -28,6 +28,7 @@ from xtuner.v1.module import (
 from xtuner.v1.module.dispatcher import (
     CombineResult,
     DispatchResult,
+    EPExecutionRuntime,
     ExpertWeightLayout,
     PostDispatchResult,
     PreCombineResult,
@@ -241,7 +242,7 @@ class MoEDecoderLayer(nn.Module):
         ep_mesh: DeviceMesh | None = None,
         expert_tp_mesh: DeviceMesh | None = None,
         ep_tp_mesh: DeviceMesh | None = None,
-        ep_runtime=None,
+        ep_runtime: EPExecutionRuntime | None = None,
         layer_fqn: str | None = None,
     ):
         super().__init__()

@@ -63,7 +63,7 @@ from xtuner.v1.module import (
 )
 from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayer
 from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEActFnConfig, MoEBlock, MoEDecoderLayer, MoEGate
-from xtuner.v1.module.dispatcher import build_ep_execution_runtime
+from xtuner.v1.module.dispatcher import EPExecutionRuntime, build_ep_execution_runtime
 from xtuner.v1.module.dispatcher.moonep_capability import check_config, check_fsdp_policy
 from xtuner.v1.module.mtp import MTPBlock, MTPConfig, MTPLayer
 from xtuner.v1.utils import (
@@ -257,7 +257,7 @@ class MoE(BaseModel):
         # Optional model-scoped EP execution runtime (MoonEP today, a no-op
         # Adapter otherwise). Its four lifecycle boundaries are called
         # unconditionally below.
-        self._ep_runtime = build_ep_execution_runtime(config, self.ep_mesh)
+        self._ep_runtime: EPExecutionRuntime = build_ep_execution_runtime(config, self.ep_mesh)
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, type=config.rms_norm_type)
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, bias=False)

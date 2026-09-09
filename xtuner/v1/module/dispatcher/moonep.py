@@ -11,6 +11,7 @@ private VMM workspace remains the deep module for physical expert layout.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -125,9 +126,14 @@ class _MoonEPResources:
         if self._buffer_box and tokens_per_rank != self._buffer_box[0][1]:
             raise RuntimeError(f"MoonEP fixed S changed: {self._buffer_box[0][1]} -> {tokens_per_rank}")
 
-    def enqueue(self, operation, *, inputs: tuple[torch.Tensor | None, ...] = ()):
-        """Run one MoonEP transaction on XTuner's stream and return its
-        event."""
+    def enqueue(
+        self,
+        operation: Callable[[], Any],
+        *,
+        inputs: tuple[torch.Tensor | None, ...] = (),
+    ) -> tuple[Any, torch.cuda.Event]:
+        """Run one MoonEP transaction on XTuner's stream and return ``(result,
+        done event)``."""
         caller_stream = torch.cuda.current_stream()
         self.comm_stream.wait_event(caller_stream.record_event())
         for tensor in inputs:
@@ -173,7 +179,9 @@ class DirectVMMLanding(ExpertLandingAdapter):
         self._fsdp_params: tuple[Any, ...] = ()
 
     @override
-    def install(self, *, fsdp_root, workspace, layers):
+    def install(
+        self, *, fsdp_root: nn.Module, workspace: _ExpertVMMWorkspace, layers: tuple[_MoonEPLayer, ...]
+    ) -> None:
         self._fsdp_params = install_fsdp_vmm_landing(
             fsdp_root=fsdp_root,
             targets=tuple(
@@ -183,7 +191,7 @@ class DirectVMMLanding(ExpertLandingAdapter):
         )
 
     @override
-    def prepare(self, *, layer, generation):
+    def prepare(self, *, layer: _MoonEPLayer, generation: int) -> tuple[nn.Parameter, nn.Parameter]:
         # "Ready" is one check: FSDP has already materialized the weight in
         # the VMM landing, so there is no copy.
         del generation
@@ -209,14 +217,16 @@ class StagingReferenceLanding(ExpertLandingAdapter):
         self._workspace: _ExpertVMMWorkspace | None = None
 
     @override
-    def install(self, *, fsdp_root, workspace, layers):
+    def install(
+        self, *, fsdp_root: nn.Module, workspace: _ExpertVMMWorkspace, layers: tuple[_MoonEPLayer, ...]
+    ) -> None:
         # No FSDP binding is installed: that is what distinguishes the two
         # Adapters. The copy happens in ``prepare``.
         del fsdp_root, layers
         self._workspace = workspace
 
     @override
-    def prepare(self, *, layer, generation):
+    def prepare(self, *, layer: _MoonEPLayer, generation: int) -> tuple[nn.Parameter, nn.Parameter]:
         assert self._workspace is not None
         parameters: list[nn.Parameter] = []
         for linear, landing in zip(layer.projections, self._workspace.landing(generation), strict=True):
@@ -577,7 +587,7 @@ def dispatch_forward(
     resources = state.resources
     buffer = resources.buffer_for(source_hidden.shape[0])
 
-    def dispatch_and_prefetch():
+    def dispatch_and_prefetch() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Landing.prepare makes this generation's home weights ready: a check
         # for the direct Adapter, the staging copy for the reference Adapter.
         # Its call position (before dispatch's device barrier) is part of this
@@ -625,7 +635,7 @@ def dispatch_backward(
     grad_hidden_nvsh = grad_hidden_nvsh.contiguous()
     grad_route_weights_nvs = grad_route_weights_nvs.contiguous()
 
-    def combine_gradients():
+    def combine_gradients() -> tuple[torch.Tensor, torch.Tensor]:
         grad_hidden, grad_route_weights, no_event = buffer.combine(
             plan=state.plan,
             hidden_nvsh=grad_hidden_nvsh,
@@ -656,7 +666,7 @@ def combine_forward(
     resources = state.resources
     buffer = resources.buffer
 
-    def combine_output():
+    def combine_output() -> torch.Tensor:
         output, gathered_weights, no_event = buffer.combine(
             plan=state.plan,
             hidden_nvsh=expert_output,
@@ -684,7 +694,7 @@ def combine_backward(state: _MoonEPLayerCallState, grad_output: torch.Tensor) ->
     buffer = resources.buffer
     grad_output = grad_output.contiguous()
 
-    def dispatch_gradient_and_prefetch():
+    def dispatch_gradient_and_prefetch() -> tuple[torch.Tensor, torch.cuda.Event]:
         # FSDP pre-backward has restored this generation; same Adapter call,
         # same sequence.
         replay_home_parameters = resources.landing.prepare(layer=state.layer, generation=state.generation)
@@ -775,7 +785,9 @@ class _MoonEPExpertGradBridge(torch.autograd.Function):
         return hidden_states, w13, w2
 
     @staticmethod
-    def backward(ctx: Any, grad_hidden: torch.Tensor, dw13: torch.Tensor, dw2: torch.Tensor):
+    def backward(
+        ctx: Any, grad_hidden: torch.Tensor, dw13: torch.Tensor, dw2: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None]:
         start_gradient_completion(cast(_MoonEPLayerCallState, ctx.call_state), (dw13, dw2))
         # dW is now owned by MoonEP; do not also accumulate it on anchor leaves.
         return grad_hidden, None, None, None
@@ -794,14 +806,18 @@ class _MoonEPLayerGradJoin(torch.autograd.Function):
         return layer_inputs
 
     @staticmethod
-    def backward(ctx: Any, *grad_inputs: torch.Tensor):
+    def backward(ctx: Any, *grad_inputs: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
         # Event.wait inserts a dependency into the current CUDA stream; it does
-        # not block the Python host or poll event readiness.
+        # not block the Python host or poll event readiness. Every call state's
+        # returned views alias the same home H, so completing all of them and
+        # publishing the last pair once is correct; publishing each would count
+        # the whole sum repeatedly. Native FSDP consumes it once via copy-in
+        # before upstream calls may reuse H; RS itself may remain asynchronous.
+        home_parameters: tuple[nn.Parameter, nn.Parameter] | None = None
+        home_grads: ProjectionPair | None = None
         for call_state in ctx.call_states:
             home_parameters, home_grads = finish_gradient_completion(call_state)
-        # All return views alias the same H. Publishing each would count the
-        # entire sum repeatedly. Native FSDP consumes this once via copy-in
-        # before upstream calls may reuse H; RS itself may remain asynchronous.
+        assert home_parameters is not None and home_grads is not None
         accumulate_fsdp_unsharded_expert_gradients(home_parameters, home_grads)
         return (None, *grad_inputs)
 

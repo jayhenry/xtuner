@@ -13,7 +13,7 @@ import socket
 import warnings
 from collections.abc import Sequence
 from contextlib import ExitStack
-from typing import TypeAlias, cast
+from typing import Any, TypeAlias, cast
 
 import torch
 import torch.distributed as dist
@@ -444,9 +444,13 @@ class _ExpertVMMWorkspace:
         counts = torch.cat((counts[:-1], counts[-1:] + hidden_nvsh.shape[0] - covered))
         return hidden, counts
 
-    def prefetch_weights(self, *, buffer, plan, generation: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def prefetch_weights(self, *, buffer: Any, plan: Any, generation: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Prefetch the global ``[E+B]`` weights and return this generation's
-        local ``[2B]`` compute aliases."""
+        local ``[2B]`` compute aliases.
+
+        ``buffer`` is the MoonEP ``Buffer`` and ``plan`` its opaque plan
+        object; both stay untyped MoonEP-owned values.
+        """
         buffer.prefetch_weight(
             plan=plan,
             projections=self._views["global_weights"][generation],
@@ -455,7 +459,13 @@ class _ExpertVMMWorkspace:
         return cast(tuple[torch.Tensor, torch.Tensor], self._views["local_weights"][generation])
 
     def return_expert_gradients(
-        self, *, buffer, plan, gradients, grad_slot: int, initialize: bool
+        self,
+        *,
+        buffer: Any,
+        plan: Any,
+        gradients: tuple[torch.Tensor, torch.Tensor],
+        grad_slot: int,
+        initialize: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Complete the home-expert gradient boundary in the owning module.
 
@@ -468,9 +478,6 @@ class _ExpertVMMWorkspace:
         """
         if not 0 <= grad_slot < self._gradient_slots:
             raise ValueError(f"gradient slot out of range: {grad_slot}")
-        gradients = tuple(gradients)
-        if len(gradients) != 2:
-            raise ValueError("gradients must contain the two fused projections")
         b = self._experts_per_rank
         # A slot is reused sequentially across physical layers.  A fresh
         # TensorImpl/version counter over the same VMM storage avoids both

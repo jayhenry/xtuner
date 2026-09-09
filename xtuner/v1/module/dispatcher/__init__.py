@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import os
-from typing import Literal
+from typing import Any, Literal, Protocol
 
 
 XTUNER_DISPATCHER_DEBUG = os.getenv("XTUNER_DISPATCHER_DEBUG", "0") == "1"
@@ -28,6 +30,24 @@ from .torch_all2all import TorchAll2AllDispatcher
 logger = get_logger()
 
 
+class EPExecutionRuntime(Protocol):
+    """Model-scoped EP execution lifecycle: four boundaries ``MoE`` calls
+    unconditionally, with no shared implementation (MoonEP, or the no-op
+    Adapter below).
+
+    ``bind_layer`` returns this backend's per-layer Dispatcher, or ``None`` to
+    let ``build_dispatcher`` fall back to a generic Adapter.
+    """
+
+    def bind_layer(self, *, layer_fqn: str, projections: tuple[nn.Module, nn.Module]) -> Any: ...
+
+    def validate_before_fsdp(self, fsdp_config: object) -> None: ...
+
+    def install_after_fsdp(self, *, fsdp_root: nn.Module, execution_order: list[str]) -> None: ...
+
+    def close(self) -> None: ...
+
+
 class NoEPExecutionRuntime:
     """The "no model-scoped EP execution runtime" Adapter (not ``None``).
 
@@ -36,22 +56,26 @@ class NoEPExecutionRuntime:
     returns ``None`` so ``build_dispatcher`` falls back to a generic Adapter.
     """
 
-    def bind_layer(self, *, layer_fqn: str, projections: tuple[nn.Module, nn.Module]):
+    def bind_layer(self, *, layer_fqn: str, projections: tuple[nn.Module, nn.Module]) -> None:
         del layer_fqn, projections
         return None
 
-    def validate_before_fsdp(self, fsdp_config) -> None:
+    def validate_before_fsdp(self, fsdp_config: object) -> None:
         del fsdp_config
 
-    def install_after_fsdp(self, *, fsdp_root, execution_order) -> None:
+    def install_after_fsdp(self, *, fsdp_root: nn.Module, execution_order: list[str]) -> None:
         del fsdp_root, execution_order
 
     def close(self) -> None:
         return
 
 
-def build_ep_execution_runtime(config, ep_mesh: DeviceMesh | None):
-    """Single place a model-scoped EP execution backend is selected."""
+def build_ep_execution_runtime(config: Any, ep_mesh: DeviceMesh | None) -> EPExecutionRuntime:
+    """Single place a model-scoped EP execution backend is selected.
+
+    ``config`` is a ``MoEConfig``; it is typed loosely to avoid a model-layer
+    import cycle.
+    """
     if config.dispatcher == "moonep":
         from .moonep import MoonEPModelRuntime
 
@@ -78,7 +102,7 @@ def build_dispatcher(
     tp_group: dist.ProcessGroup | None = None,
     ep_tp_group: dist.ProcessGroup | None = None,
     *,
-    ep_runtime=None,
+    ep_runtime: EPExecutionRuntime | None = None,
     layer_fqn: str | None = None,
     projections: tuple[nn.Module, nn.Module] | None = None,
 ) -> DispacherInterface:
@@ -147,6 +171,7 @@ __all__ = [
     "NaiveDispatcher",
     "TorchAll2AllDispatcher",
     "MoEAGRSDispatcher",
+    "EPExecutionRuntime",
     "NoEPExecutionRuntime",
     "build_dispatcher",
     "build_ep_execution_runtime",
