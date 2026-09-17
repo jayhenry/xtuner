@@ -109,7 +109,6 @@ class SequenceContext:
     # moe routed_experts
     rollout_routed_experts: torch.Tensor | None
     offload_rollout_routed_experts: bool
-    dsa_topk_cache: DSATopKCacheState
 
     # Private backing attributes for SP shard reconstruction
     _raw_input_ids: torch.LongTensor | None
@@ -139,7 +138,6 @@ class SequenceContext:
         num_img_tokens: list[list[int]] | None = None,
         rollout_routed_experts: torch.Tensor | None = None,
         offload_rollout_routed_experts: bool = False,
-        dsa_topk_cache: DSATopKCacheState | None = None,
         # SP shard metadata: private, accessed via properties below
         raw_input_ids: torch.LongTensor | None = None,
         raw_inputs_embeds: torch.FloatTensor | None = None,
@@ -181,7 +179,6 @@ class SequenceContext:
         self.num_img_tokens = num_img_tokens
         self.rollout_routed_experts = rollout_routed_experts
         self.offload_rollout_routed_experts = offload_rollout_routed_experts
-        self.dsa_topk_cache = DSATopKCacheState() if dsa_topk_cache is None else dsa_topk_cache
         self._raw_input_ids = raw_input_ids
         self._raw_inputs_embeds = raw_inputs_embeds
         self._shard_start = shard_start
@@ -648,7 +645,6 @@ class SequenceContext:
             offload_rollout_routed_experts=overrides.get(
                 "offload_rollout_routed_experts", self.offload_rollout_routed_experts
             ),
-            dsa_topk_cache=overrides.get("dsa_topk_cache", self.dsa_topk_cache),
             raw_input_ids=overrides.get("raw_input_ids", self._raw_input_ids),
             raw_inputs_embeds=overrides.get("raw_inputs_embeds", self._raw_inputs_embeds),
             shard_start=overrides.get("shard_start", self._shard_start),
@@ -749,5 +745,4 @@ class SequenceContext:
             "num_img_tokens": self.num_img_tokens,
             "rollout_routed_experts": self.rollout_routed_experts,
             "offload_rollout_routed_experts": self.offload_rollout_routed_experts,
-            "dsa_topk_cache": self.dsa_topk_cache,
         }
