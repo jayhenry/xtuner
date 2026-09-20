@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
 
 import torch
@@ -67,14 +67,20 @@ class RolloutWeightUpdateTarget:
     server_url: str
     # Registry lifecycle state value for this endpoint.
     lifecycle_state: str
-
-    @property
-    def is_active(self) -> bool:
-        return self.lifecycle_state == "active"
+    # All rollout ranks belonging to the logical inference engine.
+    inference_engine_ranks: tuple[int, ...]
 
     @property
     def engine_size(self) -> int:
+        return len(self.inference_engine_ranks)
+
+    @property
+    def update_size(self) -> int:
         return len(self.update_ranks)
+
+    @property
+    def inference_engine_rank(self) -> int:
+        return self.inference_engine_ranks.index(self.endpoint_rank)
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,14 @@ class RolloutWeightUpdateInfo:
     checkpoint_engine_timeout: float | None = None
     # Whether to explicitly synchronize after registering checkpoint-engine tensors.
     checkpoint_engine_sync_after_register: bool = True
+    _local_update_target: RolloutWeightUpdateTarget = field(init=False, repr=False)
+    _ipc_update_target: RolloutWeightUpdateTarget = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        local_target = next(target for target in self.weight_update_targets if self.train_rank == target.endpoint_rank)
+        ipc_target = next(target for target in self.weight_update_targets if self.train_rank in target.update_ranks)
+        object.__setattr__(self, "_local_update_target", local_target)
+        object.__setattr__(self, "_ipc_update_target", ipc_target)
 
     @classmethod
     def from_targets(
@@ -135,53 +149,50 @@ class RolloutWeightUpdateInfo:
         )
 
     @property
-    def local_update_target(self) -> RolloutWeightUpdateTarget | None:
-        return next(
-            (target for target in self.weight_update_targets if self.train_rank == target.endpoint_rank),
-            None,
-        )
+    def local_update_target(self) -> RolloutWeightUpdateTarget:
+        return self._local_update_target
 
     @property
-    def rollout_url(self) -> str | None:
-        target = self.local_update_target
-        if target is None or not target.is_active:
-            return None
-        return target.server_url
+    def rollout_url(self) -> str:
+        return self.local_update_target.server_url
 
     @property
     def ipc_rank_mesh(self) -> tuple[tuple[int, ...], ...]:
         return tuple(target.update_ranks for target in self.weight_update_targets)
 
     @property
-    def _ipc_update_target(self) -> RolloutWeightUpdateTarget | None:
-        return next(
-            (target for target in self.weight_update_targets if self.train_rank in target.update_ranks),
-            None,
-        )
-
-    @property
-    def ipc_engine_parallel_rank(self) -> int | None:
+    def inference_engine_parallel_rank(self) -> int:
         target = self._ipc_update_target
         if target is None:
             return None
-        return target.update_ranks.index(self.train_rank)
+        return target.inference_engine_ranks.index(self.train_rank)
 
     @property
-    def ipc_engine_parallel_size(self) -> int | None:
+    def inference_engine_parallel_size(self) -> int:
         target = self._ipc_update_target
-        if target is None:
-            return None
-        return target.engine_size
+        return None if target is None else target.engine_size
 
     @property
-    def active_update_targets(self) -> tuple[RolloutWeightUpdateTarget, ...]:
-        return tuple(target for target in self.weight_update_targets if target.is_active)
+    def update_targets(self) -> tuple[RolloutWeightUpdateTarget, ...]:
+        return tuple(target for target in self.weight_update_targets)
+
+    @property
+    def update_target_infos(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "endpoint_rank": target.endpoint_rank,
+                "server_url": target.server_url,
+                "lifecycle_state": target.lifecycle_state,
+                "update_ranks": target.update_ranks,
+                "update_size": target.update_size,
+                "inference_engine_size": target.engine_size,
+            }
+            for target in self.update_targets
+        ]
 
     @property
     def nccl_engine_infos(self) -> tuple[tuple[int, str, int], ...]:
-        return tuple(
-            (target.endpoint_rank, target.server_url, target.engine_size) for target in self.active_update_targets
-        )
+        return tuple((target.endpoint_rank, target.server_url, target.update_size) for target in self.update_targets)
 
     @property
     def transport_signature(self) -> tuple[Any, ...]:
