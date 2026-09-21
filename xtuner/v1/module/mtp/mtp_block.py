@@ -121,7 +121,7 @@ class MTPBlock(nn.Module):
             token ``i+k+1``. For ``N`` micro-batches, ``outputs[mb_idx][depth_idx]``.
         """
         outputs: list[MTPDepthOutput] | list[list[MTPDepthOutput]]
-        if len(hidden_states) == 1:
+        if not isinstance(hidden_states, list):
             assert isinstance(seq_ctx, SequenceContext), (
                 "seq_ctx should be a SequenceContext instance in single-microbatch mode"
             )
@@ -129,7 +129,7 @@ class MTPBlock(nn.Module):
                 "position_embeddings should be a (cos, sin) tuple in single-microbatch mode"
             )
             outputs = self._forward(
-                hidden_states=hidden_states[0],
+                hidden_states=hidden_states,
                 embed_tokens_fn=embed_tokens_fn,
                 position_embeddings=position_embeddings,
                 seq_ctx=seq_ctx,
