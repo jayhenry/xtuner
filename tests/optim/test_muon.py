@@ -340,6 +340,20 @@ def test_muon_clip_grad_mode_defaults_to_adamw_only():
     assert MuonConfig().clip_grad_mode == "adamw_only"
 
 
+def test_muon_use_triton_defaults_to_false():
+    assert MuonConfig().use_triton is False
+
+
+def test_muon_use_triton_selects_triton_kernel():
+    pytest.importorskip("triton")
+    from xtuner.v1.optim.newton_schulz_triton import newton_schulz_triton
+
+    param = nn.Parameter(torch.empty(2, 2))
+
+    assert Muon([param])._newton_schulz_func is zeropower_via_newtonschulz5
+    assert Muon([param], use_triton=True)._newton_schulz_func is newton_schulz_triton
+
+
 def test_muon_remainder_strategy_validation():
     param = nn.Parameter(torch.empty(2, 2))
 
