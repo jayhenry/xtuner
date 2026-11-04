@@ -8,7 +8,7 @@ pack materialization round-trip. The training worker only holds a
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterator, Literal, cast
+from typing import TYPE_CHECKING, Iterator, Literal, Sequence, cast
 
 import numpy as np
 import ray
@@ -136,6 +136,15 @@ class TrainBatch:
                 )
             else:
                 fields["rollout_logprobs"] = None
+            for name, attribute in (("returns", "returns"), ("old_values", "values")):
+                rows = [getattr(sample, attribute) for sample in samples]
+                if any(row is not None for row in rows) and not all(row is not None for row in rows):
+                    raise ValueError(f"{name} must be all-present or all-absent within a pack")
+                fields[name] = (
+                    torch.cat([cast(torch.Tensor, row) for row in rows], dim=1)
+                    if all(row is not None for row in rows)
+                    else None
+                )
             for key in self.teacher_loss_keys:
                 values = [sample.teacher_targets.get(key) for sample in samples]
                 if not all(value is not None for value in values):
@@ -150,6 +159,8 @@ class TrainBatch:
                 if "rollout_logprobs" in self._loss_keys()
                 else None
             )
+            fields["returns"] = self._padding_loss_input("returns", padding_len) if self.has_targets else None
+            fields["old_values"] = self._padding_loss_input("old_values", padding_len) if self.has_targets else None
             for key in self.teacher_loss_keys:
                 fields[key] = self._padding_loss_input(key, padding_len)
 
@@ -210,25 +221,135 @@ class TrainBatch:
         for sample, row in zip(self._samples, rows):
             sample.advantages = row.masked_fill(sample.shifted_labels.eq(-100), 0.0)
 
-    def require_targets(self, role: Literal["actor"]) -> None:
-        """Fail fast when a role's targets are incomplete.
+    def install_old_values(self, rows: list[torch.Tensor]) -> None:
+        """Install the complete frozen critic values of every sample.
 
         Args:
-            role (Literal["actor"]): Role whose required fields are checked.
+            rows (list[torch.Tensor]): One full token row per sample, in plan order.
 
         Returns:
             None
         """
-        fields = ("advantages",)
+        self._validate_full_rows(rows, "old_values")
+        for sample, row in zip(self._samples, rows):
+            sample.values = row.detach().reshape(1, -1).float().cpu()
+
+    def install_ppo_targets(self, advantages: TokenBatchProto, returns: TokenBatchProto) -> None:
+        """Install paired full-token PPO targets atomically.
+
+        Both payloads are validated before any sample is written. Advantages are
+        masked at ignored positions; returns keep their raw values.
+
+        Args:
+            advantages (TokenBatchProto): One full token row per sample.
+            returns (TokenBatchProto): One full token row per sample.
+
+        Returns:
+            None
+        """
+        adv_rows = advantages.chunk()
+        ret_rows = returns.chunk()
+        self._validate_full_rows(adv_rows, "advantages")
+        self._validate_full_rows(ret_rows, "returns")
+        for sample, adv, ret in zip(self._samples, adv_rows, ret_rows):
+            labels = sample.shifted_labels
+            sample.advantages = adv.reshape_as(labels).masked_fill(labels.eq(-100), 0.0)
+            sample.returns = ret.reshape_as(labels)
+
+    def trajectory_data(self) -> dict[str, torch.Tensor]:
+        """Return complete CPU trajectory data for the numerical estimator.
+
+        No pack padding and no Ray handles are involved; empty local batches
+        still return a valid ``cu_seq_lens`` so every rank can join the global
+        reduction.
+
+        Returns:
+            dict[str, torch.Tensor]: ``values``, ``scores``, ``mask`` and
+            ``cu_seq_lens`` over local samples.
+        """
+        if not self._samples:
+            return {
+                "values": torch.zeros(0, dtype=torch.float32),
+                "scores": torch.zeros(0, dtype=torch.float32),
+                "mask": torch.zeros(0, dtype=torch.bool),
+                "cu_seq_lens": torch.zeros(1, dtype=torch.int32),
+            }
+        values: list[torch.Tensor] = []
+        scores: list[float] = []
+        masks: list[torch.Tensor] = []
+        lengths: list[int] = []
+        for sample in self._samples:
+            if sample.values is None:
+                raise ValueError("trajectory_data requires complete old_values")
+            if sample.reward_score is None:
+                raise ValueError("Segment GAE requires a reward score for every sample")
+            flat_values = sample.values.detach().float().reshape(-1).cpu()
+            flat_labels = sample.shifted_labels.reshape(-1).cpu()
+            if flat_values.numel() != flat_labels.numel():
+                raise ValueError("old_values length does not match shifted labels")
+            values.append(flat_values)
+            scores.append(float(sample.reward_score))
+            masks.append(flat_labels.ne(-100))
+            lengths.append(flat_labels.numel())
+        cu_seq_lens = torch.zeros(len(lengths) + 1, dtype=torch.int32)
+        cu_seq_lens[1:] = torch.tensor(lengths, dtype=torch.int32).cumsum(0)
+        return {
+            "values": torch.cat(values),
+            "scores": torch.tensor(scores, dtype=torch.float32),
+            "mask": torch.cat(masks),
+            "cu_seq_lens": cu_seq_lens,
+        }
+
+    def require_targets(self, role: Literal["actor", "critic"]) -> None:
+        """Fail fast when a role's targets are incomplete.
+
+        Args:
+            role (Literal["actor", "critic"]): Role whose required fields are checked.
+
+        Returns:
+            None
+        """
+        fields = ("advantages",) if role == "actor" else ("old_values", "returns")
         for sample in self._samples:
             for name in fields:
-                if getattr(sample, name) is None:
+                # values are stored as ``values`` on the record; targets keep their public names.
+                attribute = "values" if name == "old_values" else name
+                if getattr(sample, attribute) is None:
                     raise ValueError(f"{role} requires complete {name} rows")
+
+    def _validate_full_rows(self, rows: list[torch.Tensor], field: str) -> None:
+        if len(rows) != len(self._samples):
+            raise ValueError(f"{field} rows {len(rows)} do not match samples {len(self._samples)}")
+        for index, (sample, row) in enumerate(zip(self._samples, rows)):
+            if row.numel() != sample.shifted_labels.numel():
+                raise ValueError(
+                    f"{field} row {index} has {row.numel()} tokens, expected {sample.shifted_labels.numel()}"
+                )
 
     def close(self) -> None:
         """Release the local CPU samples; remote refs are owned by the
         trainer."""
         self._samples.clear()
+
+    @property
+    def has_targets(self) -> bool:
+        """Whether the batch already carries PPO targets (returns/old
+        values)."""
+        return bool(self._samples) and all(
+            sample.returns is not None and sample.values is not None for sample in self._samples
+        )
+
+    def local_masked_token_count(self, packs: list[list[int]]) -> int:
+        """Count trainable tokens of the given local packs before
+        materialization.
+
+        Args:
+            packs (list[list[int]]): Local pack indices.
+
+        Returns:
+            int: Local masked-token count.
+        """
+        return sum(int(self._samples[index].shifted_labels.ne(-100).sum()) for pack in packs for index in pack)
 
     def _loss_keys(self) -> list[str]:
         keys = list(self.attrs["pack_loss_keys"])
@@ -338,7 +459,7 @@ class TrainBatch:
 
 def iter_cpu_packs(
     batch: TrainBatch,
-    indices: tuple[tuple[int, ...], ...],
+    indices: Sequence[Sequence[int]],
     resolve_refs,
 ) -> Iterator[FullPack]:
     """Materialize packs one at a time, resolving each pack's refs before
@@ -346,14 +467,14 @@ def iter_cpu_packs(
 
     Args:
         batch (TrainBatch): Batch holding the CPU samples.
-        indices (tuple[tuple[int, ...], ...]): Local sample indices per pack.
+        indices (Sequence[Sequence[int]]): Local sample indices per pack.
         resolve_refs: Callback that materializes object refs on the pack's ``seq_ctx``.
 
     Yields:
         FullPack: The current pack.
     """
     for pack_indices in indices:
-        pack = batch.materialize(pack_indices)
+        pack = batch.materialize(tuple(pack_indices))
         resolve_refs(pack.full_data["seq_ctx"])
         yield pack
 
@@ -403,6 +524,26 @@ def get_train_seq_ctx(
     return seq_ctx
 
 
+def resolve_mm_inputs(seq_ctx: SequenceContext) -> None:
+    """Materialize multimodal pixel-value object refs into one CPU tensor.
+
+    Args:
+        seq_ctx (SequenceContext): Packed CPU context whose pixel refs are resolved.
+
+    Returns:
+        None
+    """
+    pixel_values = seq_ctx.pixel_values
+    if pixel_values is None:
+        return
+    if isinstance(pixel_values, np.ndarray):
+        raise NotImplementedError("The case where pixel_values is a numpy array is not implemented yet.")
+    assert isinstance(pixel_values, list), f"pixel_values should be list of tensor, got {type(pixel_values)}"
+    pixel_values = ray.get(list(pixel_values))
+    pixel_values = [torch.as_tensor(pixel_value) for pixel_value in pixel_values]
+    seq_ctx.pixel_values = torch.cat(pixel_values, dim=0)
+
+
 def resolve_pack_refs(
     seq_ctx: SequenceContext,
     *,
@@ -422,14 +563,7 @@ def resolve_pack_refs(
     Returns:
         None
     """
-    pixel_values = seq_ctx.pixel_values
-    if pixel_values is not None:
-        if isinstance(pixel_values, np.ndarray):
-            raise NotImplementedError("The case where pixel_values is a numpy array is not implemented yet.")
-        assert isinstance(pixel_values, list), f"pixel_values should be list of tensor, got {type(pixel_values)}"
-        pixel_values = ray.get(list(pixel_values))
-        pixel_values = [torch.as_tensor(pixel_value) for pixel_value in pixel_values]
-        seq_ctx.pixel_values = torch.cat(pixel_values, dim=0)
+    resolve_mm_inputs(seq_ctx)
 
     rollout_routed_experts = seq_ctx.rollout_routed_experts
     if rollout_routed_experts is None:
