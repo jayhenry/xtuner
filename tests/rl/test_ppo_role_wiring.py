@@ -605,6 +605,46 @@ class _DummyRole(RoleWorker):
         return {"train_entropy": 0.0, "train_metrics": []}
 
 
+class TestRoleTrainUpdate(unittest.TestCase):
+    """RoleWorker._train_update owns update counting and scheduler stepping."""
+
+    def test_counts_only_applied_updates(self):
+        role = _DummyRole.__new__(_DummyRole)
+        role.role_name = "actor"
+        role.rank = 0
+        role.device = torch.device("cpu")
+        role.logger = MagicMock()
+        role.loss_cfg = None
+        role._global_train_step = 0
+        role.attempted_updates = 0
+        role.completed_updates = 0
+        role.lr_scheduler = MagicMock()
+        role.engine = SimpleNamespace(
+            train_step=MagicMock(
+                side_effect=lambda **kwargs: {
+                    "logs_info": {},
+                    "extra_info": SimpleNamespace(get=lambda: {}),
+                    "total_loss": 0.0,
+                }
+            ),
+            clip_grad_norm=MagicMock(return_value=torch.tensor(1.0)),
+            step_optimizer=MagicMock(return_value=True),
+        )
+
+        log_item = RoleWorker._train_update(role, [])
+
+        self.assertEqual(role.attempted_updates, 1)
+        self.assertEqual(role.completed_updates, 1)
+        role.lr_scheduler.step.assert_called_once_with()
+        self.assertIn("grad_norm", log_item)
+
+        role.engine.step_optimizer = MagicMock(return_value=False)
+        RoleWorker._train_update(role, [])
+        self.assertEqual(role.attempted_updates, 2)
+        self.assertEqual(role.completed_updates, 1)
+        self.assertEqual(role.lr_scheduler.step.call_count, 1)
+
+
 class TestRoleCheckpoint(unittest.TestCase):
     """Role checkpoint owns counters, scheduler definition and per-rank RNG."""
 

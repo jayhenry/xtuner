@@ -338,7 +338,7 @@ class RoleWorker(ABC):
         reserved_memory = DEVICE_MODULE.max_memory_reserved() / (1024**3)
 
         train_log_item = cast(
-            WorkerTrainLogItem,
+            "WorkerTrainLogItem",
             {
                 **engine_logs_info,
                 **train_step_info,
