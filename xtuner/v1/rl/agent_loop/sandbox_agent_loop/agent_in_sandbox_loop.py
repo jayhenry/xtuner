@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import importlib
 import json
 import traceback
@@ -136,6 +137,89 @@ def _load_train_trace_segments(
     return segments
 
 
+def _trace_message_key(message: dict[str, Any]) -> str:
+    """Compare context, not recorder diagnostics; keep unknown fields
+    conservative.
+
+    This is message comparison only, without applying a chat template/tokenizer. Tool arguments use the same copied
+    normalization as TraceStore rendering.
+    """
+    message = canonicalize_messages_for_chat_template([message])[0]
+    for key in ("finish_reason", "extra", "cache_control"):
+        message.pop(key, None)
+    content = message.get("content")
+    if isinstance(content, list) and all(
+        isinstance(block, dict) and block.get("type") == "text" and set(block) <= {"type", "text", "cache_control"}
+        for block in content
+    ):
+        content = "".join(block.get("text", "") for block in content)
+    if content is None or isinstance(content, str) and not content.strip():
+        message.pop("content", None)
+    else:
+        message["content"] = content
+    # APIs may omit optional null fields when echoing a response into history.
+    message = {key: value for key, value in message.items() if value is not None}
+    return json.dumps(message, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _select_train_trace_segments(
+    segments: list[TraceRecord], *, enabled: bool = False
+) -> tuple[list[TraceRecord], dict[str, Any]]:
+    """Omit uniquely replaced terminal assistant branches before token export.
+
+    Records are in recorder observation order, scoped to one completed Agent.
+    No tree nodes or raw artifacts are changed. Unlike an online Chain manager,
+    this selector has no in-flight ownership information: ambiguous old sibling
+    generations are therefore preserved. Indices refer to validated segments.
+    """
+    retained = list(range(len(segments)))
+    retracted: list[dict[str, int]] = []
+    if enabled:
+        # An old terminal response is indexed by its tools and *preceding* history.
+        terminal_by_prefix: dict[tuple[str, int, str], list[int]] = {}
+        prefixes: list[tuple[str, list[str], list[str]]] = []
+        for index, record in enumerate(segments):
+            messages, tools = record["messages"], record["tools"]
+            tools_key = json.dumps(tools, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+            keys = [_trace_message_key(message) for message in messages]
+            hashes = [""]
+            for key in keys:
+                hashes.append(hashlib.sha256((hashes[-1] + "\0" + key).encode()).hexdigest())
+            prefixes.append((tools_key, hashes, keys))
+            if messages and messages[-1].get("role") == "assistant":
+                terminal_by_prefix.setdefault((tools_key, len(messages) - 1, hashes[-2]), []).append(index)
+
+        removed = set()
+        for new_index, record in enumerate(segments):
+            messages = record["messages"]
+            tools_key, hashes, keys = prefixes[new_index]
+            # The replacement must precede a real subsequent assistant response.
+            for position in range(1, len(messages) - 1):
+                candidates = terminal_by_prefix.get((tools_key, position, hashes[position]), [])
+                if len(candidates) != 1:
+                    continue
+                old_index = candidates[0]
+                if old_index >= new_index or old_index in removed or prefixes[old_index][2][-1] == keys[position]:
+                    continue
+                removed.add(old_index)
+                retracted.append(
+                    {
+                        "segment_index": old_index,
+                        "replacement_segment_index": new_index,
+                        "shared_prefix_messages": position,
+                    }
+                )
+        retained = [index for index in retained if index not in removed]
+
+    summary = {
+        "enabled": enabled,
+        "input_segment_count": len(segments),
+        "retained_segment_indices": retained,
+        "retracted": retracted,
+    }
+    return [segments[index] for index in retained], summary
+
+
 def _load_eval_trace_segment(artifacts: dict[str, Any]) -> tuple[list[dict[str, Any]], Any]:
     trace = _load_messages_artifact(artifacts, required=False)
     if not trace:
@@ -250,6 +334,7 @@ class AgentInSandboxLoopConfig(AgentLoopConfig):
     retire_route_on_completion: bool = False
     # Optional recipe policy; ordinary sandbox filtering keeps upstream semantics.
     min_valid_attempts: int | None = Field(default=None, ge=1)
+    enable_last_assistant_rollback: bool = False
 
     def build_local(
         self, rollout_controller: RolloutController | None = None, judger: Judger | None = None, logger=None
@@ -267,6 +352,7 @@ class AgentInSandboxLoopConfig(AgentLoopConfig):
             require_turn_provenance=self.require_turn_provenance,
             retire_route_on_completion=self.retire_route_on_completion,
             min_valid_attempts=self.min_valid_attempts,
+            enable_last_assistant_rollback=self.enable_last_assistant_rollback,
         )
 
 
@@ -288,6 +374,7 @@ class AgentInSandboxLoop(AgentLoop):
         require_turn_provenance: bool = False,
         retire_route_on_completion: bool = False,
         min_valid_attempts: int | None = None,
+        enable_last_assistant_rollback: bool = False,
     ):
         if hf_checkpoint is None:
             raise ValueError("hf_checkpoint must be provided for AgentInSandboxLoop.")
@@ -302,6 +389,7 @@ class AgentInSandboxLoop(AgentLoop):
         if min_valid_attempts is not None and min_valid_attempts < 1:
             raise ValueError("min_valid_attempts must be positive")
         self.min_valid_attempts = min_valid_attempts
+        self.enable_last_assistant_rollback = enable_last_assistant_rollback
 
     async def generate_group(self, rollout_state: list[RolloutState], **kwargs) -> list[RolloutState]:
         async def generate_one(state: RolloutState) -> list[RolloutState]:
@@ -410,6 +498,7 @@ class AgentInSandboxLoop(AgentLoop):
             return [timeout_state or rollout_state]
 
         segments = _load_train_trace_segments(item.artifacts, require_turn_provenance=self.require_turn_provenance)
+        segments, trace_selection = _select_train_trace_segments(segments, enabled=self.enable_last_assistant_rollback)
         if not segments:
             raise ValueError("Agent artifacts must contain at least one trainable messages trace.")
 
@@ -467,6 +556,7 @@ class AgentInSandboxLoop(AgentLoop):
             rollout_states.append(segment_state)
 
         rollout_states[0].extra_fields["agent_artifacts"] = _to_json_safe(item.artifacts)
+        rollout_states[0].extra_fields["agent_trace_selection"] = trace_selection
         return rollout_states
 
     async def _fill_timeout_rollout_state(self, rollout_state: RolloutState) -> RolloutState:
